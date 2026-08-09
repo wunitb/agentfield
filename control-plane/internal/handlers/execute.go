@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -293,6 +294,14 @@ func (c *executionController) handleSync(ctx *gin.Context) {
 	}
 	defer stopAuthorityGuard()
 	reqCtx = guardedCtx
+
+	if plan.authorityDuplicate {
+		writeExecutionError(ctx, &callError{
+			statusCode: http.StatusConflict,
+			message:    "authority-bound synchronous execution has already been submitted",
+		})
+		return
+	}
 
 	if plan.replayHit != nil {
 		if err := c.completeReplayHit(reqCtx, plan); err != nil {
@@ -737,6 +746,30 @@ func validateExternalARDOperation(req ExecuteRequest, binding *ard.ExternalBindi
 	return &callError{statusCode: http.StatusForbidden, message: fmt.Sprintf("external ARD operation %q is not allowed by binding policy", operation)}
 }
 
+func authorityExecutionID(authority RunAuthorityRef, target *parsedTarget) string {
+	digest := sha256.Sum256([]byte(strings.Join([]string{
+		authority.HomeID, authority.RunID, target.NodeID, target.TargetType, target.TargetName,
+	}, "\x00")))
+	return fmt.Sprintf("exec_authority_%x", digest)
+}
+
+func sameAuthorityExecution(existing, requested *types.Execution) bool {
+	return existing.ExecutionID == requested.ExecutionID &&
+		existing.RunID == requested.RunID &&
+		existing.AgentNodeID == requested.AgentNodeID &&
+		existing.ReasonerID == requested.ReasonerID &&
+		existing.NodeID == requested.NodeID &&
+		sameOptionalString(existing.ParentExecutionID, requested.ParentExecutionID) &&
+		bytes.Equal(existing.InputPayload, requested.InputPayload)
+}
+
+func sameOptionalString(left, right *string) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
 func stringValue(value interface{}) string {
 	switch typed := value.(type) {
 	case nil:
@@ -760,6 +793,24 @@ func (c *executionController) handleAsync(ctx *gin.Context) {
 	if err := c.verifyRunAuthority(reqCtx, plan); err != nil {
 		_ = c.failExecution(reqCtx, plan, err, 0, nil)
 		writeExecutionError(ctx, err)
+		return
+	}
+
+	if plan.authorityDuplicate {
+		createdAt := plan.exec.CreatedAt.UTC().Format(time.RFC3339)
+		ctx.Header("X-Execution-ID", plan.exec.ExecutionID)
+		ctx.Header("X-Run-ID", plan.exec.RunID)
+		ctx.Header("X-AgentField-Authority-Replay", "true")
+		ctx.JSON(http.StatusAccepted, AsyncExecuteResponse{
+			ExecutionID: plan.exec.ExecutionID,
+			RunID:       plan.exec.RunID,
+			WorkflowID:  plan.exec.RunID,
+			Status:      plan.exec.Status,
+			Target:      fmt.Sprintf("%s.%s", plan.target.NodeID, plan.target.TargetName),
+			Type:        plan.targetType,
+			CreatedAt:   createdAt,
+			EnqueuedAt:  createdAt,
+		})
 		return
 	}
 
@@ -1529,6 +1580,7 @@ type preparedExecution struct {
 	replayBeforeExecutionID string
 	replayMode              string
 	replayHit               *replayHit
+	authorityDuplicate      bool
 	runAuthority            *RunAuthorityRef
 }
 
@@ -1630,6 +1682,9 @@ func (c *executionController) prepareExecutionForTarget(ctx context.Context, tar
 	}
 
 	executionID := utils.GenerateExecutionID()
+	if req.Authority != nil {
+		executionID = authorityExecutionID(*req.Authority, target)
+	}
 	now := time.Now().UTC()
 
 	clientPayload := map[string]interface{}{
@@ -1673,9 +1728,6 @@ func (c *executionController) prepareExecutionForTarget(ctx context.Context, tar
 		return nil, fmt.Errorf("encode agent payload: %w", err)
 	}
 
-	inputURI := c.savePayload(ctx, storedPayload)
-	exec.InputURI = inputURI
-
 	if headers.sessionID != nil {
 		exec.SessionID = headers.sessionID
 	}
@@ -1683,7 +1735,45 @@ func (c *executionController) prepareExecutionForTarget(ctx context.Context, tar
 		exec.ActorID = headers.actorID
 	}
 
+	authorityDuplicatePlan := func(existing *types.Execution) (*preparedExecution, error) {
+		if !sameAuthorityExecution(existing, exec) {
+			return nil, &callError{
+				statusCode: http.StatusConflict,
+				message:    "authority tuple is already bound to a different execution request",
+			}
+		}
+		return &preparedExecution{
+			exec:                    existing,
+			requestBody:             agentPayloadBytes,
+			agent:                   agent,
+			target:                  target,
+			targetType:              targetType,
+			llmEndpoint:             extractRequestedLLMEndpoint(req),
+			callerDID:               callerDID,
+			targetDID:               targetDID,
+			routedVersion:           routedVersion,
+			replaySourceRunID:       headers.replaySourceRunID,
+			replayBeforeExecutionID: headers.replayBeforeExecutionID,
+			replayMode:              headers.replayMode,
+			authorityDuplicate:      true,
+			runAuthority:            req.Authority,
+		}, nil
+	}
+	if req.Authority != nil {
+		if existing, lookupErr := c.store.GetExecutionRecord(ctx, executionID); lookupErr == nil && existing != nil {
+			return authorityDuplicatePlan(existing)
+		}
+	}
+
+	inputURI := c.savePayload(ctx, storedPayload)
+	exec.InputURI = inputURI
+
 	if err := c.store.CreateExecutionRecord(ctx, exec); err != nil {
+		if req.Authority != nil {
+			if existing, lookupErr := c.store.GetExecutionRecord(ctx, executionID); lookupErr == nil && existing != nil {
+				return authorityDuplicatePlan(existing)
+			}
+		}
 		return nil, fmt.Errorf("create execution record: %w", err)
 	}
 

@@ -293,6 +293,61 @@ func TestExecuteAsyncMonitorsAuthorityAfterAgentAcceptance(t *testing.T) {
 	}
 }
 
+func TestExecuteAsyncIsIdempotentForOneOuterAuthorityRun(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	var agentCalls atomic.Int32
+	agentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		agentCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"ok":true}`)
+	}))
+	defer agentServer.Close()
+	authorityServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, authorityView("running", true, "home-a", "run-1", "worker-a"))
+	}))
+	defer authorityServer.Close()
+
+	store := newTestExecutionStorage(&types.AgentNode{
+		ID: "node-1", BaseURL: agentServer.URL, Reasoners: []types.ReasonerDefinition{{ID: "reasoner-a"}},
+	})
+	router := gin.New()
+	router.POST("/execute/async/:target", ExecuteAsyncHandlerWithRunAuthority(
+		store, services.NewFilePayloadStore(t.TempDir()), nil, time.Second, "",
+		mustRunAuthorityVerifier(t, authorityServer.URL, 20*time.Millisecond),
+	))
+
+	responses := make([]*httptest.ResponseRecorder, 2)
+	for index := range responses {
+		req := httptest.NewRequest(http.MethodPost, "/execute/async/node-1.reasoner-a", strings.NewReader(
+			`{"input":{"value":1},"authority":{"home_id":"home-a","run_id":"run-1","lease_owner":"worker-a"}}`,
+		))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Run-ID", "run-1")
+		responses[index] = httptest.NewRecorder()
+		router.ServeHTTP(responses[index], req)
+		if responses[index].Code != http.StatusAccepted {
+			t.Fatalf("request %d was not accepted: %d %s", index+1, responses[index].Code, responses[index].Body.String())
+		}
+	}
+
+	firstID := responses[0].Header().Get("X-Execution-ID")
+	if firstID == "" || responses[1].Header().Get("X-Execution-ID") != firstID {
+		t.Fatalf("authority replay changed execution identity: %q then %q", firstID, responses[1].Header().Get("X-Execution-ID"))
+	}
+	if responses[1].Header().Get("X-AgentField-Authority-Replay") != "true" {
+		t.Fatalf("second response did not identify the authority replay")
+	}
+	deadline := time.Now().Add(time.Second)
+	for agentCalls.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	time.Sleep(25 * time.Millisecond)
+	if agentCalls.Load() != 1 {
+		t.Fatalf("expected exactly one AgentField effect, got %d", agentCalls.Load())
+	}
+}
+
 func mustRunAuthorityVerifier(t *testing.T, baseURL string, pollInterval time.Duration) *RunAuthorityVerifier {
 	t.Helper()
 	verifier, err := NewRunAuthorityVerifier(config.RunAuthorityConfig{
