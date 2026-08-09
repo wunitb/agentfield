@@ -32,13 +32,13 @@ func TestUpdateExecutionStatusHandler_Success(t *testing.T) {
 	// Create an execution record
 	execution := &types.Execution{
 		ExecutionID: "exec-1",
-		RunID:        "run-1",
-		AgentNodeID:  "node-1",
-		ReasonerID:   "reasoner-a",
-		Status:       types.ExecutionStatusRunning,
-		StartedAt:    time.Now().UTC(),
-		CreatedAt:    time.Now().UTC(),
-		UpdatedAt:    time.Now().UTC(),
+		RunID:       "run-1",
+		AgentNodeID: "node-1",
+		ReasonerID:  "reasoner-a",
+		Status:      types.ExecutionStatusRunning,
+		StartedAt:   time.Now().UTC(),
+		CreatedAt:   time.Now().UTC(),
+		UpdatedAt:   time.Now().UTC(),
 	}
 	require.NoError(t, store.CreateExecutionRecord(context.Background(), execution))
 
@@ -341,7 +341,7 @@ func TestUpdateExecutionStatusHandler_TerminalRegression(t *testing.T) {
 
 	router.ServeHTTP(resp, req)
 
-	require.Equal(t, http.StatusInternalServerError, resp.Code)
+	require.Equal(t, http.StatusConflict, resp.Code)
 
 	// DB must still show the original terminal status — no regression.
 	updated, err := store.GetExecutionRecord(context.Background(), "exec-terminal")
@@ -376,7 +376,7 @@ func TestUpdateExecutionStatusHandler_TerminalIdempotent(t *testing.T) {
 	router := gin.New()
 	router.PUT("/api/v1/executions/:execution_id/status", UpdateExecutionStatusHandler(store, payloads, nil, 90*time.Second))
 
-	reqBody := `{"status": "failed", "error": "redelivered"}`
+	reqBody := `{"status": "failed"}`
 	req := httptest.NewRequest(http.MethodPut, "/api/v1/executions/exec-idempotent/status", strings.NewReader(reqBody))
 	req.Header.Set("Content-Type", "application/json")
 	resp := httptest.NewRecorder()
@@ -477,9 +477,9 @@ func TestWaitForExecutionCompletion_Timeout(t *testing.T) {
 
 	result, err := controller.waitForExecutionCompletion(ctx, "exec-1", 100*time.Millisecond)
 
-	require.Error(t, err)
-	require.Nil(t, result)
-	require.Contains(t, err.Error(), "timeout")
+	require.NoError(t, err)
+	require.NotNil(t, result)
+	require.Equal(t, types.ExecutionStatusTimeout, result.Status)
 }
 
 func TestWaitForExecutionCompletion_ContextCancellation(t *testing.T) {

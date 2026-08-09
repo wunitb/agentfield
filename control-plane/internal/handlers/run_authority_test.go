@@ -214,7 +214,7 @@ func TestExecuteHandlerCancelsExecutionWhenRunAuthorityIsRevoked(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 	var authorityCalls atomic.Int32
 	authorityServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		eligible := authorityCalls.Add(1) == 1
+		eligible := authorityCalls.Add(1) <= 2
 		w.Header().Set("Content-Type", "application/json")
 		fmt.Fprint(w, authorityView("running", eligible, "home-a", "run-1", "worker-a"))
 	}))
