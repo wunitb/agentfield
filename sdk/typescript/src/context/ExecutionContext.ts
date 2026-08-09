@@ -4,6 +4,12 @@ import type { Agent } from '../agent/Agent.js';
 import type { ExecutionLogger } from '../observability/ExecutionLogger.js';
 import { CostTracker } from '../usage/costTracker.js';
 
+export interface RunAuthorityContext {
+  homeId: string;
+  runId: string;
+  leaseOwner: string;
+}
+
 export interface ExecutionMetadata {
   executionId: string;
   runId?: string;
@@ -19,6 +25,7 @@ export interface ExecutionMetadata {
   replaySourceRunId?: string;
   replayBeforeExecutionId?: string;
   replayMode?: string;
+  runAuthority?: RunAuthorityContext;
 }
 
 const store = new AsyncLocalStorage<ExecutionContext>();

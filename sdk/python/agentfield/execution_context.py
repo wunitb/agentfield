@@ -24,6 +24,9 @@ _PARENT_VC_HEADER = "X-Parent-VC-ID"
 _REPLAY_SOURCE_RUN_HEADER = "X-AgentField-Replay-Source-Run-ID"
 _REPLAY_BEFORE_EXECUTION_HEADER = "X-AgentField-Replay-Before-Execution-ID"
 _REPLAY_MODE_HEADER = "X-AgentField-Replay-Mode"
+_AUTHORITY_HOME_HEADER = "X-AgentField-Authority-Home-ID"
+_AUTHORITY_RUN_HEADER = "X-AgentField-Authority-Run-ID"
+_AUTHORITY_LEASE_OWNER_HEADER = "X-AgentField-Authority-Lease-Owner"
 
 
 @dataclass
@@ -47,6 +50,9 @@ class ExecutionContext:
     replay_source_run_id: Optional[str] = None
     replay_before_execution_id: Optional[str] = None
     replay_mode: Optional[str] = None
+    authority_home_id: Optional[str] = None
+    authority_run_id: Optional[str] = None
+    authority_lease_owner: Optional[str] = None
     trigger: Optional["TriggerContext"] = None
     # Compatibility fields retained for existing integrations
     workflow_id: Optional[str] = None
@@ -107,6 +113,12 @@ class ExecutionContext:
             headers[_REPLAY_BEFORE_EXECUTION_HEADER] = self.replay_before_execution_id
         if self.replay_mode:
             headers[_REPLAY_MODE_HEADER] = self.replay_mode
+        if self.authority_home_id:
+            headers[_AUTHORITY_HOME_HEADER] = self.authority_home_id
+        if self.authority_run_id:
+            headers[_AUTHORITY_RUN_HEADER] = self.authority_run_id
+        if self.authority_lease_owner:
+            headers[_AUTHORITY_LEASE_OWNER_HEADER] = self.authority_lease_owner
         agent_instance = getattr(self, "agent_instance", None)
         agent_node_id = self.agent_node_id or getattr(agent_instance, "node_id", None)
         if agent_node_id:
@@ -183,6 +195,9 @@ class ExecutionContext:
             replay_source_run_id=self.replay_source_run_id,
             replay_before_execution_id=self.replay_before_execution_id,
             replay_mode=self.replay_mode,
+            authority_home_id=self.authority_home_id,
+            authority_run_id=self.authority_run_id,
+            authority_lease_owner=self.authority_lease_owner,
             trigger=self.trigger,
             workflow_id=self.workflow_id,
             parent_workflow_id=self.workflow_id,
@@ -229,6 +244,9 @@ class ExecutionContext:
         replay_source_run_id = _read(_REPLAY_SOURCE_RUN_HEADER)
         replay_before_execution_id = _read(_REPLAY_BEFORE_EXECUTION_HEADER)
         replay_mode = _read(_REPLAY_MODE_HEADER)
+        authority_home_id = _read(_AUTHORITY_HOME_HEADER)
+        authority_run_id = _read(_AUTHORITY_RUN_HEADER)
+        authority_lease_owner = _read(_AUTHORITY_LEASE_OWNER_HEADER)
         parent_workflow_id = _read("X-Parent-Workflow-ID")
         root_workflow_id = _read("X-Root-Workflow-ID")
 
@@ -250,6 +268,9 @@ class ExecutionContext:
             replay_source_run_id=replay_source_run_id,
             replay_before_execution_id=replay_before_execution_id,
             replay_mode=replay_mode,
+            authority_home_id=authority_home_id,
+            authority_run_id=authority_run_id,
+            authority_lease_owner=authority_lease_owner,
             workflow_id=workflow_id,
             parent_workflow_id=parent_workflow_id,
             root_workflow_id=root_workflow_id,

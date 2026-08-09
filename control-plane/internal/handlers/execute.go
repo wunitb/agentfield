@@ -49,9 +49,10 @@ type ExecutionStore interface {
 
 // ExecuteRequest represents an execution request from an agent client.
 type ExecuteRequest struct {
-	Input   map[string]interface{} `json:"input"`
-	Context map[string]interface{} `json:"context,omitempty"`
-	Webhook *WebhookRequest        `json:"webhook,omitempty"`
+	Input     map[string]interface{} `json:"input"`
+	Context   map[string]interface{} `json:"context,omitempty"`
+	Webhook   *WebhookRequest        `json:"webhook,omitempty"`
+	Authority *RunAuthorityRef       `json:"authority,omitempty"`
 }
 
 // WebhookRequest represents webhook registration parameters supplied by the client.
@@ -145,6 +146,7 @@ type executionController struct {
 	timeout        time.Duration
 	internalToken  string // sent as Authorization header when forwarding to agents
 	readARDConfig  func() config.ARDConfig
+	runAuthority   *RunAuthorityVerifier
 	redactPayloads bool
 }
 
@@ -204,13 +206,23 @@ func ExecuteHandler(store ExecutionStore, payloads services.PayloadStore, webhoo
 // ExecuteHandlerWithARD handles synchronous execution requests and can route
 // explicitly-callable imported ARD resources through the same SDK app.call path.
 func ExecuteHandlerWithARD(store ExecutionStore, payloads services.PayloadStore, webhooks services.WebhookDispatcher, timeout time.Duration, internalToken string, readARDConfig func() config.ARDConfig) gin.HandlerFunc {
-	controller := newExecutionController(store, payloads, webhooks, timeout, internalToken, readARDConfig)
+	return ExecuteHandlerWithARDAndRunAuthority(store, payloads, webhooks, timeout, internalToken, readARDConfig, nil)
+}
+
+// ExecuteHandlerWithARDAndRunAuthority additionally enforces an optional outer lifecycle authority.
+func ExecuteHandlerWithARDAndRunAuthority(store ExecutionStore, payloads services.PayloadStore, webhooks services.WebhookDispatcher, timeout time.Duration, internalToken string, readARDConfig func() config.ARDConfig, authority *RunAuthorityVerifier) gin.HandlerFunc {
+	controller := newExecutionControllerWithRunAuthority(store, payloads, webhooks, timeout, internalToken, readARDConfig, authority)
 	return controller.handleSync
 }
 
 // ExecuteAsyncHandler handles asynchronous execution requests.
 func ExecuteAsyncHandler(store ExecutionStore, payloads services.PayloadStore, webhooks services.WebhookDispatcher, timeout time.Duration, internalToken string) gin.HandlerFunc {
-	controller := newExecutionController(store, payloads, webhooks, timeout, internalToken, nil)
+	return ExecuteAsyncHandlerWithRunAuthority(store, payloads, webhooks, timeout, internalToken, nil)
+}
+
+// ExecuteAsyncHandlerWithRunAuthority enforces an optional outer lifecycle authority for queued work.
+func ExecuteAsyncHandlerWithRunAuthority(store ExecutionStore, payloads services.PayloadStore, webhooks services.WebhookDispatcher, timeout time.Duration, internalToken string, authority *RunAuthorityVerifier) gin.HandlerFunc {
+	controller := newExecutionControllerWithRunAuthority(store, payloads, webhooks, timeout, internalToken, nil, authority)
 	return controller.handleAsync
 }
 
@@ -233,13 +245,16 @@ func UpdateExecutionStatusHandler(store ExecutionStore, payloads services.Payloa
 }
 
 func newExecutionController(store ExecutionStore, payloads services.PayloadStore, webhooks services.WebhookDispatcher, timeout time.Duration, internalToken string, readARDConfig ...func() config.ARDConfig) *executionController {
-	// Use default timeout if not provided (0 or negative)
-	if timeout <= 0 {
-		timeout = 90 * time.Second
-	}
 	var ardConfigReader func() config.ARDConfig
 	if len(readARDConfig) > 0 {
 		ardConfigReader = readARDConfig[0]
+	}
+	return newExecutionControllerWithRunAuthority(store, payloads, webhooks, timeout, internalToken, ardConfigReader, nil)
+}
+
+func newExecutionControllerWithRunAuthority(store ExecutionStore, payloads services.PayloadStore, webhooks services.WebhookDispatcher, timeout time.Duration, internalToken string, readARDConfig func() config.ARDConfig, authority *RunAuthorityVerifier) *executionController {
+	if timeout <= 0 {
+		timeout = 90 * time.Second
 	}
 	return &executionController{
 		store: store,
@@ -251,7 +266,8 @@ func newExecutionController(store ExecutionStore, payloads services.PayloadStore
 		eventBus:       store.GetExecutionEventBus(),
 		timeout:        timeout,
 		internalToken:  internalToken,
-		readARDConfig:  ardConfigReader,
+		readARDConfig:  readARDConfig,
+		runAuthority:   authority,
 		redactPayloads: defaultRedactPayloads,
 	}
 }
@@ -268,6 +284,15 @@ func (c *executionController) handleSync(ctx *gin.Context) {
 		return
 	}
 	plan.executionMode = "sync"
+
+	guardedCtx, stopAuthorityGuard, err := c.guardRunAuthority(reqCtx, plan)
+	if err != nil {
+		_ = c.failExecution(reqCtx, plan, err, 0, nil)
+		writeExecutionError(ctx, err)
+		return
+	}
+	defer stopAuthorityGuard()
+	reqCtx = guardedCtx
 
 	if plan.replayHit != nil {
 		if err := c.completeReplayHit(reqCtx, plan); err != nil {
@@ -301,6 +326,10 @@ func (c *executionController) handleSync(ctx *gin.Context) {
 	c.publishExecutionStartedEvent(plan)
 
 	resultBody, elapsed, asyncAccepted, callErr := c.callAgent(reqCtx, plan)
+	if authorityErr := c.runAuthorityRevocationError(reqCtx, plan, elapsed); authorityErr != nil {
+		writeExecutionError(ctx, authorityErr)
+		return
+	}
 
 	// If agent returned HTTP 202 (async acknowledgment), wait for callback completion
 	if callErr == nil && asyncAccepted {
@@ -314,6 +343,10 @@ func (c *executionController) handleSync(ctx *gin.Context) {
 		// Use configured timeout to match the HTTP client timeout
 		exec, waitErr := c.waitForExecutionCompletion(reqCtx, plan.exec.ExecutionID, c.timeout)
 		if waitErr != nil {
+			if authorityErr := c.runAuthorityRevocationError(reqCtx, plan, time.Since(plan.exec.StartedAt)); authorityErr != nil {
+				writeExecutionError(ctx, authorityErr)
+				return
+			}
 			logger.Logger.Error().
 				Err(waitErr).
 				Str("execution_id", plan.exec.ExecutionID).
@@ -518,11 +551,27 @@ func (c *executionController) tryHandleExternalARDCall(ctx *gin.Context) bool {
 		writeExecutionError(ctx, fmt.Errorf("create external ARD execution record: %w", err))
 		return true
 	}
-
-	result, err := c.callExternalARD(ctx.Request.Context(), req, entry, binding, runID, executionID)
+	plan := &preparedExecution{exec: exec, runAuthority: req.Authority}
+	guardedCtx, stopAuthorityGuard, err := c.guardRunAuthority(ctx.Request.Context(), plan)
 	if err != nil {
 		_ = c.finishExternalARDExecution(ctx.Request.Context(), executionID, types.ExecutionStatusFailed, time.Since(start), nil, err)
 		writeExecutionError(ctx, err)
+		return true
+	}
+	defer stopAuthorityGuard()
+
+	result, err := c.callExternalARD(guardedCtx, req, entry, binding, runID, executionID)
+	if err != nil {
+		if authorityErr := c.runAuthorityRevocationError(guardedCtx, plan, time.Since(start)); authorityErr != nil {
+			writeExecutionError(ctx, authorityErr)
+			return true
+		}
+		_ = c.finishExternalARDExecution(ctx.Request.Context(), executionID, types.ExecutionStatusFailed, time.Since(start), nil, err)
+		writeExecutionError(ctx, err)
+		return true
+	}
+	if authorityErr := c.runAuthorityRevocationError(guardedCtx, plan, time.Since(start)); authorityErr != nil {
+		writeExecutionError(ctx, authorityErr)
 		return true
 	}
 	resultBytes, err := json.Marshal(result)
@@ -563,6 +612,9 @@ func (c *executionController) callExternalARD(ctx context.Context, req ExecuteRe
 	}
 
 	payload := map[string]interface{}{"input": req.Input}
+	if req.Authority != nil {
+		payload["authority"] = req.Authority
+	}
 	if len(req.Context) > 0 {
 		payload["context"] = req.Context
 	}
@@ -585,6 +637,11 @@ func (c *executionController) callExternalARD(ctx context.Context, req ExecuteRe
 	httpReq.Header.Set("X-Execution-ID", executionID)
 	httpReq.Header.Set("X-AgentField-ARD-Target", binding.LocalTarget)
 	httpReq.Header.Set("X-AgentField-ARD-Adapter", binding.Adapter)
+	if req.Authority != nil {
+		httpReq.Header.Set("X-AgentField-Authority-Home-ID", req.Authority.HomeID)
+		httpReq.Header.Set("X-AgentField-Authority-Run-ID", req.Authority.RunID)
+		httpReq.Header.Set("X-AgentField-Authority-Lease-Owner", req.Authority.LeaseOwner)
+	}
 
 	resp, err := client.Do(httpReq)
 	if err != nil {
@@ -699,6 +756,12 @@ func (c *executionController) handleAsync(ctx *gin.Context) {
 		return
 	}
 	plan.executionMode = "async"
+
+	if err := c.verifyRunAuthority(reqCtx, plan); err != nil {
+		_ = c.failExecution(reqCtx, plan, err, 0, nil)
+		writeExecutionError(ctx, err)
+		return
+	}
 
 	if plan.replayHit != nil {
 		if err := c.completeReplayHit(reqCtx, plan); err != nil {
@@ -922,14 +985,12 @@ func (c *executionController) handleStatusUpdate(ctx *gin.Context) {
 			}
 		}
 
-		// Terminal-state regression guard. Once an execution has reached
-		// a terminal state, reject any non-terminal write — otherwise a
-		// late /status callback (e.g. from a retried fire-and-forget update)
-		// can stomp the terminal status back to "running" and strand the
-		// caller's poll loop. Idempotent terminal→same-terminal updates
-		// are allowed so callers can retry their own callback safely.
+		// Terminal-state immutability guard. Once an execution has reached a
+		// terminal state, only an exact same-status retry is allowed. This
+		// prevents late callbacks from replacing cancellation or another
+		// terminal decision while preserving idempotent delivery retries.
 		if types.IsTerminalExecutionStatus(string(current.Status)) {
-			if !types.IsTerminalExecutionStatus(normalizedStatus) {
+			if normalizedStatus != string(current.Status) {
 				logger.Logger.Warn().
 					Str("execution_id", executionID).
 					Str("current_status", string(current.Status)).
@@ -1468,6 +1529,7 @@ type preparedExecution struct {
 	replayBeforeExecutionID string
 	replayMode              string
 	replayHit               *replayHit
+	runAuthority            *RunAuthorityRef
 }
 
 func (c *executionController) prepareExecution(ctx context.Context, ginCtx *gin.Context) (*preparedExecution, error) {
@@ -1603,7 +1665,7 @@ func (c *executionController) prepareExecutionForTarget(ctx context.Context, tar
 
 	var agentPayloadBytes []byte
 	if agent.DeploymentType == "serverless" {
-		agentPayloadBytes, err = json.Marshal(buildServerlessPayload(target, exec, headers, agentPayload))
+		agentPayloadBytes, err = json.Marshal(buildServerlessPayload(target, exec, headers, agentPayload, req.Authority))
 	} else {
 		agentPayloadBytes, err = json.Marshal(agentPayload)
 	}
@@ -1675,6 +1737,7 @@ func (c *executionController) prepareExecutionForTarget(ctx context.Context, tar
 		replayBeforeExecutionID: headers.replayBeforeExecutionID,
 		replayMode:              headers.replayMode,
 		replayHit:               hit,
+		runAuthority:            req.Authority,
 	}, nil
 }
 
@@ -1881,6 +1944,11 @@ func (c *executionController) callAgent(ctx context.Context, plan *preparedExecu
 	req.Header.Set("X-Run-ID", plan.exec.RunID)
 	req.Header.Set("X-Execution-ID", plan.exec.ExecutionID)
 	req.Header.Set("X-Workflow-ID", plan.exec.RunID)
+	if plan.runAuthority != nil {
+		req.Header.Set("X-AgentField-Authority-Home-ID", plan.runAuthority.HomeID)
+		req.Header.Set("X-AgentField-Authority-Run-ID", plan.runAuthority.RunID)
+		req.Header.Set("X-AgentField-Authority-Lease-Owner", plan.runAuthority.LeaseOwner)
+	}
 	if plan.exec.ParentExecutionID != nil {
 		req.Header.Set("X-Parent-Execution-ID", *plan.exec.ParentExecutionID)
 	}
@@ -2295,7 +2363,7 @@ func selectVersionedAgent(versions []*types.AgentNode) (*types.AgentNode, string
 	return healthy[0], healthy[0].Version
 }
 
-func buildServerlessPayload(target *parsedTarget, exec *types.Execution, headers executionHeaders, input map[string]interface{}) map[string]interface{} {
+func buildServerlessPayload(target *parsedTarget, exec *types.Execution, headers executionHeaders, input map[string]interface{}, authority *RunAuthorityRef) map[string]interface{} {
 	if target == nil || exec == nil {
 		return map[string]interface{}{
 			"input": input,
@@ -2316,6 +2384,13 @@ func buildServerlessPayload(target *parsedTarget, exec *types.Execution, headers
 	}
 	if headers.actorID != nil && *headers.actorID != "" {
 		execCtx["actor_id"] = *headers.actorID
+	}
+	if authority != nil {
+		execCtx["run_authority"] = map[string]interface{}{
+			"home_id":     authority.HomeID,
+			"run_id":      authority.RunID,
+			"lease_owner": authority.LeaseOwner,
+		}
 	}
 
 	payload := map[string]interface{}{
@@ -2814,11 +2889,22 @@ func (j asyncExecutionJob) process() {
 		}
 	}
 
-	resultBody, elapsed, asyncAccepted, callErr := j.controller.callAgent(bgCtx, &j.plan)
+	guardedCtx, stopAuthorityGuard, err := j.controller.guardRunAuthority(bgCtx, &j.plan)
+	if err != nil {
+		_ = j.controller.failExecution(bgCtx, &j.plan, err, 0, nil)
+		return
+	}
+	defer stopAuthorityGuard()
+
+	resultBody, elapsed, asyncAccepted, callErr := j.controller.callAgent(guardedCtx, &j.plan)
+	if authorityErr := j.controller.runAuthorityRevocationError(guardedCtx, &j.plan, elapsed); authorityErr != nil {
+		return
+	}
 	if callErr == nil && asyncAccepted {
 		logger.Logger.Info().
 			Str("execution_id", j.plan.exec.ExecutionID).
 			Msg("agent accepted execution for async processing")
+		j.controller.monitorAcceptedRunAuthority(j.plan)
 		return
 	}
 

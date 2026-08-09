@@ -1,3 +1,5 @@
+from types import SimpleNamespace
+
 import pytest
 
 from agentfield.execution_context import (
@@ -22,6 +24,9 @@ def test_to_headers_includes_optional_fields():
         target_did="did:target",
         agent_node_did="did:agent",
         run_id="run-1",
+        authority_home_id="home-a",
+        authority_run_id="run-1",
+        authority_lease_owner="worker-a",
     )
 
     headers = ctx.to_headers()
@@ -35,6 +40,9 @@ def test_to_headers_includes_optional_fields():
     assert headers["X-Target-DID"] == "did:target"
     assert headers["X-Agent-Node-DID"] == "did:agent"
     assert headers["X-Workflow-Run-ID"] == "run-1"
+    assert headers["X-AgentField-Authority-Home-ID"] == "home-a"
+    assert headers["X-AgentField-Authority-Run-ID"] == "run-1"
+    assert headers["X-AgentField-Authority-Lease-Owner"] == "worker-a"
 
 
 @pytest.mark.unit
@@ -55,6 +63,25 @@ def test_to_headers_includes_replay_fields():
     assert headers["X-AgentField-Replay-Source-Run-ID"] == "run-source"
     assert headers["X-AgentField-Replay-Before-Execution-ID"] == "exec-before"
     assert headers["X-AgentField-Replay-Mode"] == "succeeded-before"
+
+
+@pytest.mark.unit
+def test_from_request_reads_outer_run_authority():
+    request = SimpleNamespace(
+        headers={
+            "X-Run-ID": "run-1",
+            "X-Execution-ID": "exec-1",
+            "X-AgentField-Authority-Home-ID": "home-a",
+            "X-AgentField-Authority-Run-ID": "run-1",
+            "X-AgentField-Authority-Lease-Owner": "worker-a",
+        }
+    )
+
+    ctx = ExecutionContext.from_request(request, agent_node_id="node-1")
+
+    assert ctx.authority_home_id == "home-a"
+    assert ctx.authority_run_id == "run-1"
+    assert ctx.authority_lease_owner == "worker-a"
 
 
 @pytest.mark.unit
@@ -111,6 +138,9 @@ def test_nested_child_context_preserves_replay_headers():
         replay_source_run_id="run-source",
         replay_before_execution_id="exec-before",
         replay_mode="succeeded-before",
+        authority_home_id="home-a",
+        authority_run_id="run-1",
+        authority_lease_owner="worker-a",
     )
 
     child = root.create_child_context()
@@ -123,6 +153,9 @@ def test_nested_child_context_preserves_replay_headers():
     assert headers["X-AgentField-Replay-Source-Run-ID"] == "run-source"
     assert headers["X-AgentField-Replay-Before-Execution-ID"] == "exec-before"
     assert headers["X-AgentField-Replay-Mode"] == "succeeded-before"
+    assert headers["X-AgentField-Authority-Home-ID"] == "home-a"
+    assert headers["X-AgentField-Authority-Run-ID"] == "run-1"
+    assert headers["X-AgentField-Authority-Lease-Owner"] == "worker-a"
 
 
 @pytest.mark.unit

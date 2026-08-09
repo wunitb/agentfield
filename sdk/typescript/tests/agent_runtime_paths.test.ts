@@ -455,7 +455,8 @@ describe('Agent runtime paths', () => {
         rootWorkflowId: 'root-remote',
         callerDid: 'did:caller:remote',
         targetDid: 'did:target:remote',
-        agentNodeDid: 'did:agent:remote'
+        agentNodeDid: 'did:agent:remote',
+        runAuthority: { homeId: 'home-a', runId: 'run-remote', leaseOwner: 'worker-a' }
       },
       req: {} as express.Request,
       res: {} as express.Response,
@@ -476,7 +477,8 @@ describe('Agent runtime paths', () => {
       callerDid: 'did:caller:remote',
       targetDid: 'did:target:remote',
       agentNodeDid: 'did:agent:remote',
-      agentNodeId: 'agent-1'
+      agentNodeId: 'agent-1',
+      runAuthority: { homeId: 'home-a', runId: 'run-remote', leaseOwner: 'worker-a' }
     }));
     expect(sendNote).toHaveBeenCalledTimes(1);
     expect(sendNote).toHaveBeenCalledWith(

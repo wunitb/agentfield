@@ -78,6 +78,7 @@ type AgentFieldConfig struct {
 	LLMHealth        LLMHealthConfig        `yaml:"llm_health" mapstructure:"llm_health"`
 	ExecutionCleanup ExecutionCleanupConfig `yaml:"execution_cleanup" mapstructure:"execution_cleanup"`
 	ExecutionQueue   ExecutionQueueConfig   `yaml:"execution_queue" mapstructure:"execution_queue"`
+	RunAuthority     RunAuthorityConfig     `yaml:"run_authority" mapstructure:"run_authority"`
 	Approval         ApprovalConfig         `yaml:"approval" mapstructure:"approval"`
 	NodeLogProxy     NodeLogProxyConfig     `yaml:"node_log_proxy" mapstructure:"node_log_proxy"`
 	ExecutionLogs    ExecutionLogsConfig    `yaml:"execution_logs" mapstructure:"execution_logs"`
@@ -224,6 +225,18 @@ type ExecutionQueueConfig struct {
 	WebhookMaxAttempts     int           `yaml:"webhook_max_attempts" mapstructure:"webhook_max_attempts"`
 	WebhookRetryBackoff    time.Duration `yaml:"webhook_retry_backoff" mapstructure:"webhook_retry_backoff"`
 	WebhookMaxRetryBackoff time.Duration `yaml:"webhook_max_retry_backoff" mapstructure:"webhook_max_retry_backoff"`
+}
+
+// RunAuthorityConfig optionally requires an authenticated outer lifecycle authority before execution.
+type RunAuthorityConfig struct {
+	Enabled         bool          `yaml:"enabled" mapstructure:"enabled"`
+	BaseURL         string        `yaml:"base_url" mapstructure:"base_url"`
+	BearerToken     string        `yaml:"bearer_token" mapstructure:"bearer_token"`
+	ExpectedHomeID  string        `yaml:"expected_home_id" mapstructure:"expected_home_id"`
+	RequestTimeout  time.Duration `yaml:"request_timeout" mapstructure:"request_timeout"`
+	PollInterval    time.Duration `yaml:"poll_interval" mapstructure:"poll_interval"`
+	HeartbeatMaxAge time.Duration `yaml:"heartbeat_max_age" mapstructure:"heartbeat_max_age"`
+	ClockSkew       time.Duration `yaml:"clock_skew" mapstructure:"clock_skew"`
 }
 
 // LLMHealthConfig configures LLM backend health monitoring with circuit breaker.
@@ -508,6 +521,18 @@ func ApplyDefaults(cfg *Config) {
 	if cfg.AgentField.ShutdownTimeout <= 0 {
 		cfg.AgentField.ShutdownTimeout = 30 * time.Second
 	}
+	if cfg.AgentField.RunAuthority.RequestTimeout <= 0 {
+		cfg.AgentField.RunAuthority.RequestTimeout = 2 * time.Second
+	}
+	if cfg.AgentField.RunAuthority.PollInterval <= 0 {
+		cfg.AgentField.RunAuthority.PollInterval = 5 * time.Second
+	}
+	if cfg.AgentField.RunAuthority.HeartbeatMaxAge <= 0 {
+		cfg.AgentField.RunAuthority.HeartbeatMaxAge = 30 * time.Second
+	}
+	if cfg.AgentField.RunAuthority.ClockSkew <= 0 {
+		cfg.AgentField.RunAuthority.ClockSkew = 5 * time.Second
+	}
 	if cfg.Logging.Level == "" {
 		cfg.Logging.Level = "info"
 	}
@@ -671,6 +696,40 @@ func ApplyEnvOverrides(cfg *Config) {
 			Name: name,
 			URL:  val,
 		})
+	}
+
+	// External run authority overrides
+	if val := os.Getenv("AGENTFIELD_RUN_AUTHORITY_ENABLED"); val != "" {
+		cfg.AgentField.RunAuthority.Enabled = val == "true" || val == "1"
+	}
+	if val := os.Getenv("AGENTFIELD_RUN_AUTHORITY_BASE_URL"); val != "" {
+		cfg.AgentField.RunAuthority.BaseURL = strings.TrimSpace(val)
+	}
+	if val := os.Getenv("AGENTFIELD_RUN_AUTHORITY_BEARER_TOKEN"); val != "" {
+		cfg.AgentField.RunAuthority.BearerToken = strings.TrimSpace(val)
+	}
+	if val := os.Getenv("AGENTFIELD_RUN_AUTHORITY_EXPECTED_HOME_ID"); val != "" {
+		cfg.AgentField.RunAuthority.ExpectedHomeID = strings.TrimSpace(val)
+	}
+	if val := os.Getenv("AGENTFIELD_RUN_AUTHORITY_REQUEST_TIMEOUT"); val != "" {
+		if d, err := time.ParseDuration(val); err == nil {
+			cfg.AgentField.RunAuthority.RequestTimeout = d
+		}
+	}
+	if val := os.Getenv("AGENTFIELD_RUN_AUTHORITY_POLL_INTERVAL"); val != "" {
+		if d, err := time.ParseDuration(val); err == nil {
+			cfg.AgentField.RunAuthority.PollInterval = d
+		}
+	}
+	if val := os.Getenv("AGENTFIELD_RUN_AUTHORITY_HEARTBEAT_MAX_AGE"); val != "" {
+		if d, err := time.ParseDuration(val); err == nil {
+			cfg.AgentField.RunAuthority.HeartbeatMaxAge = d
+		}
+	}
+	if val := os.Getenv("AGENTFIELD_RUN_AUTHORITY_CLOCK_SKEW"); val != "" {
+		if d, err := time.ParseDuration(val); err == nil {
+			cfg.AgentField.RunAuthority.ClockSkew = d
+		}
 	}
 
 	// Execution queue overrides

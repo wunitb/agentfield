@@ -52,10 +52,16 @@ describe('AgentFieldClient.executeAsync', () => {
     const { base, recs } = await startServer((req, res) => {
       res.status(202).json({ execution_id: 'exec-xyz' });
     });
-    const id = await makeClient(base).executeAsync('node.reasoner', { a: 1 }, { runId: 'run-1' });
+    const id = await makeClient(base).executeAsync('node.reasoner', { a: 1 }, {
+      runId: 'run-1',
+      runAuthority: { homeId: 'home-a', runId: 'outer-run-1', leaseOwner: 'worker-a' }
+    });
     expect(id).toBe('exec-xyz');
     expect(recs[0].path).toBe('/api/v1/execute/async/node.reasoner');
-    expect(recs[0].body).toEqual({ input: { a: 1 } });
+    expect(recs[0].body).toEqual({
+      input: { a: 1 },
+      authority: { home_id: 'home-a', run_id: 'outer-run-1', lease_owner: 'worker-a' }
+    });
   });
 
   it('falls back to the X-Execution-ID response header', async () => {

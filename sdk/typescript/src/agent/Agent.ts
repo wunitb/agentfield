@@ -98,6 +98,14 @@ function normalizeAcceptsWebhook(value: unknown): 'true' | 'false' | 'warn' {
   return 'warn';
 }
 
+function normalizeRunAuthority(ctx: RawExecutionContext): ExecutionMetadata['runAuthority'] {
+  const raw = ctx.runAuthority ?? ctx.run_authority;
+  const homeId = raw?.homeId ?? raw?.home_id;
+  const runId = raw?.runId ?? raw?.run_id;
+  const leaseOwner = raw?.leaseOwner ?? raw?.lease_owner;
+  return homeId && runId && leaseOwner ? { homeId, runId, leaseOwner } : undefined;
+}
+
 function normalizeExecutionContext(
   ctx: RawExecutionContext
 ): Partial<ExecutionMetadata> {
@@ -112,7 +120,8 @@ function normalizeExecutionContext(
     actorId: ctx.actorId ?? ctx.actor_id,
     callerDid: ctx.callerDid ?? ctx.caller_did,
     targetDid: ctx.targetDid ?? ctx.target_did,
-    agentNodeDid: ctx.agentNodeDid ?? ctx.agent_node_did
+    agentNodeDid: ctx.agentNodeDid ?? ctx.agent_node_did,
+    runAuthority: normalizeRunAuthority(ctx)
   };
 }
 
@@ -903,7 +912,8 @@ export class Agent {
       agentNodeId: this.config.nodeId,
       replaySourceRunId: parentMetadata?.replaySourceRunId,
       replayBeforeExecutionId: parentMetadata?.replayBeforeExecutionId,
-      replayMode: parentMetadata?.replayMode
+      replayMode: parentMetadata?.replayMode,
+      runAuthority: parentMetadata?.runAuthority
     };
 
     try {
@@ -1295,6 +1305,14 @@ export class Agent {
     const workflowId = overrides?.workflowId ?? normalized['x-workflow-id'] ?? runId;
     const rootWorkflowId =
       overrides?.rootWorkflowId ?? normalized['x-root-workflow-id'] ?? workflowId;
+    const authorityHomeId = normalized['x-agentfield-authority-home-id'];
+    const authorityRunId = normalized['x-agentfield-authority-run-id'];
+    const authorityLeaseOwner = normalized['x-agentfield-authority-lease-owner'];
+    const runAuthority = overrides?.runAuthority ?? (
+      authorityHomeId && authorityRunId && authorityLeaseOwner
+        ? { homeId: authorityHomeId, runId: authorityRunId, leaseOwner: authorityLeaseOwner }
+        : undefined
+    );
 
     return {
       executionId,
@@ -1313,7 +1331,8 @@ export class Agent {
         overrides?.replaySourceRunId ?? normalized['x-agentfield-replay-source-run-id'],
       replayBeforeExecutionId:
         overrides?.replayBeforeExecutionId ?? normalized['x-agentfield-replay-before-execution-id'],
-      replayMode: overrides?.replayMode ?? normalized['x-agentfield-replay-mode']
+      replayMode: overrides?.replayMode ?? normalized['x-agentfield-replay-mode'],
+      runAuthority
     };
   }
 

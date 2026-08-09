@@ -45,9 +45,12 @@ type ExecutionContext struct {
 	StartedAt         time.Time
 
 	// DID fields — populated when DID authentication is enabled.
-	CallerDID    string
-	TargetDID    string
-	AgentNodeDID string
+	CallerDID           string
+	TargetDID           string
+	AgentNodeDID        string
+	AuthorityHomeID     string
+	AuthorityRunID      string
+	AuthorityLeaseOwner string
 }
 
 func init() {
@@ -1287,18 +1290,21 @@ func extractInputFromServerless(payload map[string]any) map[string]any {
 
 func (a *Agent) buildExecutionContextFromServerless(r *http.Request, payload map[string]any, reasonerName string) ExecutionContext {
 	execCtx := ExecutionContext{
-		RunID:             strings.TrimSpace(r.Header.Get("X-Run-ID")),
-		ExecutionID:       strings.TrimSpace(r.Header.Get("X-Execution-ID")),
-		ParentExecutionID: strings.TrimSpace(r.Header.Get("X-Parent-Execution-ID")),
-		SessionID:         strings.TrimSpace(r.Header.Get("X-Session-ID")),
-		ActorID:           strings.TrimSpace(r.Header.Get("X-Actor-ID")),
-		WorkflowID:        strings.TrimSpace(r.Header.Get("X-Workflow-ID")),
-		AgentNodeID:       a.cfg.NodeID,
-		ReasonerName:      reasonerName,
-		StartedAt:         time.Now(),
-		CallerDID:         strings.TrimSpace(r.Header.Get("X-Caller-DID")),
-		TargetDID:         strings.TrimSpace(r.Header.Get("X-Target-DID")),
-		AgentNodeDID:      strings.TrimSpace(r.Header.Get("X-Agent-Node-DID")),
+		RunID:               strings.TrimSpace(r.Header.Get("X-Run-ID")),
+		ExecutionID:         strings.TrimSpace(r.Header.Get("X-Execution-ID")),
+		ParentExecutionID:   strings.TrimSpace(r.Header.Get("X-Parent-Execution-ID")),
+		SessionID:           strings.TrimSpace(r.Header.Get("X-Session-ID")),
+		ActorID:             strings.TrimSpace(r.Header.Get("X-Actor-ID")),
+		WorkflowID:          strings.TrimSpace(r.Header.Get("X-Workflow-ID")),
+		AgentNodeID:         a.cfg.NodeID,
+		ReasonerName:        reasonerName,
+		StartedAt:           time.Now(),
+		CallerDID:           strings.TrimSpace(r.Header.Get("X-Caller-DID")),
+		TargetDID:           strings.TrimSpace(r.Header.Get("X-Target-DID")),
+		AgentNodeDID:        strings.TrimSpace(r.Header.Get("X-Agent-Node-DID")),
+		AuthorityHomeID:     strings.TrimSpace(r.Header.Get("X-AgentField-Authority-Home-ID")),
+		AuthorityRunID:      strings.TrimSpace(r.Header.Get("X-AgentField-Authority-Run-ID")),
+		AuthorityLeaseOwner: strings.TrimSpace(r.Header.Get("X-AgentField-Authority-Lease-Owner")),
 	}
 
 	if ctxMap, ok := payload["execution_context"].(map[string]any); ok {
@@ -1319,6 +1325,21 @@ func (a *Agent) buildExecutionContextFromServerless(r *http.Request, payload map
 		}
 		if execCtx.ActorID == "" {
 			execCtx.ActorID = stringFromMap(ctxMap, "actor_id", "actorId")
+		}
+		authorityMap, _ := ctxMap["run_authority"].(map[string]any)
+		if authorityMap == nil {
+			authorityMap, _ = ctxMap["runAuthority"].(map[string]any)
+		}
+		if authorityMap != nil {
+			if execCtx.AuthorityHomeID == "" {
+				execCtx.AuthorityHomeID = stringFromMap(authorityMap, "home_id", "homeId")
+			}
+			if execCtx.AuthorityRunID == "" {
+				execCtx.AuthorityRunID = stringFromMap(authorityMap, "run_id", "runId")
+			}
+			if execCtx.AuthorityLeaseOwner == "" {
+				execCtx.AuthorityLeaseOwner = stringFromMap(authorityMap, "lease_owner", "leaseOwner")
+			}
 		}
 	}
 
@@ -1367,18 +1388,21 @@ func (a *Agent) handleReasoner(w http.ResponseWriter, r *http.Request) {
 	}
 
 	execCtx := ExecutionContext{
-		RunID:             r.Header.Get("X-Run-ID"),
-		ExecutionID:       r.Header.Get("X-Execution-ID"),
-		ParentExecutionID: r.Header.Get("X-Parent-Execution-ID"),
-		SessionID:         r.Header.Get("X-Session-ID"),
-		ActorID:           r.Header.Get("X-Actor-ID"),
-		WorkflowID:        r.Header.Get("X-Workflow-ID"),
-		AgentNodeID:       a.cfg.NodeID,
-		ReasonerName:      name,
-		StartedAt:         time.Now(),
-		CallerDID:         r.Header.Get("X-Caller-DID"),
-		TargetDID:         r.Header.Get("X-Target-DID"),
-		AgentNodeDID:      r.Header.Get("X-Agent-Node-DID"),
+		RunID:               r.Header.Get("X-Run-ID"),
+		ExecutionID:         r.Header.Get("X-Execution-ID"),
+		ParentExecutionID:   r.Header.Get("X-Parent-Execution-ID"),
+		SessionID:           r.Header.Get("X-Session-ID"),
+		ActorID:             r.Header.Get("X-Actor-ID"),
+		WorkflowID:          r.Header.Get("X-Workflow-ID"),
+		AgentNodeID:         a.cfg.NodeID,
+		ReasonerName:        name,
+		StartedAt:           time.Now(),
+		CallerDID:           r.Header.Get("X-Caller-DID"),
+		TargetDID:           r.Header.Get("X-Target-DID"),
+		AgentNodeDID:        r.Header.Get("X-Agent-Node-DID"),
+		AuthorityHomeID:     r.Header.Get("X-AgentField-Authority-Home-ID"),
+		AuthorityRunID:      r.Header.Get("X-AgentField-Authority-Run-ID"),
+		AuthorityLeaseOwner: r.Header.Get("X-AgentField-Authority-Lease-Owner"),
 	}
 	if execCtx.WorkflowID == "" {
 		execCtx.WorkflowID = execCtx.RunID
@@ -1899,6 +1923,11 @@ func (a *Agent) Call(ctx context.Context, target string, input map[string]any) (
 	}
 
 	payload := map[string]any{"input": input}
+	if execCtx.AuthorityHomeID != "" && execCtx.AuthorityRunID != "" && execCtx.AuthorityLeaseOwner != "" {
+		payload["authority"] = map[string]any{
+			"home_id": execCtx.AuthorityHomeID, "run_id": execCtx.AuthorityRunID, "lease_owner": execCtx.AuthorityLeaseOwner,
+		}
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("marshal call payload: %w", err)

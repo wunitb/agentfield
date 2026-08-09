@@ -94,6 +94,7 @@ type AgentFieldServer struct {
 	// workers so they can cooperatively short-circuit in-flight reasoner
 	// code (raise CancelledError / abort signals / cancel contexts).
 	cancelDispatcher *services.CancelDispatcher
+	runAuthority     *handlers.RunAuthorityVerifier
 	// Agentic API
 	apiCatalog *apicatalog.Catalog
 	kb         *knowledgebase.KB
@@ -107,6 +108,11 @@ type AgentFieldServer struct {
 
 // NewAgentFieldServer creates a new instance of the AgentFieldServer.
 func NewAgentFieldServer(cfg *config.Config) (*AgentFieldServer, error) {
+	runAuthority, err := handlers.NewRunAuthorityVerifier(cfg.AgentField.RunAuthority)
+	if err != nil {
+		return nil, fmt.Errorf("invalid run authority configuration: %w", err)
+	}
+
 	// Define agentfieldHome at the very top
 	agentfieldHome := os.Getenv("AGENTFIELD_HOME")
 	if agentfieldHome == "" {
@@ -486,6 +492,9 @@ func NewAgentFieldServer(cfg *config.Config) (*AgentFieldServer, error) {
 	}
 
 	triggerDispatcher := services.NewTriggerDispatcher(storageProvider, vcService)
+	if runAuthority != nil {
+		triggerDispatcher.RequireRunAuthority()
+	}
 	sourceManager := services.NewSourceManager(storageProvider, triggerDispatcher)
 	triggerHandlers := handlers.NewTriggerHandlers(storageProvider, triggerDispatcher, sourceManager)
 	handlers.SetTriggerSourceManager(sourceManager)
@@ -543,6 +552,7 @@ func NewAgentFieldServer(cfg *config.Config) (*AgentFieldServer, error) {
 		sourceManager:          sourceManager,
 		triggerHandlers:        triggerHandlers,
 		cancelDispatcher:       cancelDispatcher,
+		runAuthority:           runAuthority,
 		apiCatalog:             initAPICatalog(),
 		kb:                     initKnowledgeBase(),
 		knowledgeService:       knowledgeService,
@@ -785,6 +795,9 @@ func (s *AgentFieldServer) Stop() error {
 	s.httpServerMu.Unlock()
 
 	httpShutdownErr := s.shutdownHTTPServer()
+	if s.runAuthority != nil {
+		s.runAuthority.Close()
+	}
 
 	if s.adminGRPCServer != nil {
 		s.adminGRPCServer.GracefulStop()

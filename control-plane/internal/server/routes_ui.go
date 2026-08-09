@@ -196,7 +196,11 @@ func (s *AgentFieldServer) registerUIAPI() {
 			executions.POST("/:execution_id/cancel", handlers.CancelExecutionHandler(s.storage))
 			executions.POST("/:execution_id/pause", handlers.PauseExecutionHandler(s.storage))
 			executions.POST("/:execution_id/resume", handlers.ResumeExecutionHandler(s.storage))
-			executions.POST("/:execution_id/restart", handlers.RestartExecutionHandler(s.storage, s.payloadStore, s.webhookDispatcher, s.config.AgentField.ExecutionQueue.AgentCallTimeout, s.config.Features.DID.Authorization.InternalToken))
+			restartHandler := handlers.RestartExecutionHandler(s.storage, s.payloadStore, s.webhookDispatcher, s.config.AgentField.ExecutionQueue.AgentCallTimeout, s.config.Features.DID.Authorization.InternalToken)
+			if s.runAuthority != nil {
+				restartHandler = handlers.RunAuthorityUnsupportedHandler("restart")
+			}
+			executions.POST("/:execution_id/restart", restartHandler)
 
 			// Execution notes endpoints for UI
 			executions.POST("/note", handlers.AddExecutionNoteHandler(s.storage, s.noteOwnershipEnforced()))

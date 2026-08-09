@@ -1358,6 +1358,7 @@ class Agent(FastAPI):
         if not run_id:
             run_id = f"wf_{int(time.time() * 1000)}"
         workflow_id = execution_context_data.get("workflow_id", run_id)
+        authority = execution_context_data.get("run_authority") or execution_context_data.get("runAuthority") or {}
 
         execution_context = ExecutionContext(
             run_id=run_id,
@@ -1376,6 +1377,9 @@ class Agent(FastAPI):
             workflow_id=workflow_id,
             parent_workflow_id=execution_context_data.get("parent_workflow_id"),
             root_workflow_id=execution_context_data.get("root_workflow_id"),
+            authority_home_id=authority.get("home_id") or authority.get("homeId"),
+            authority_run_id=authority.get("run_id") or authority.get("runId"),
+            authority_lease_owner=authority.get("lease_owner") or authority.get("leaseOwner"),
         )
 
         # Set execution context

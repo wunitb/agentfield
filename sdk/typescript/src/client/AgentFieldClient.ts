@@ -26,7 +26,14 @@ export interface ExecutionStatusUpdate {
   statusReason?: string;
 }
 
-/** Metadata forwarded as `X-*` headers on execute / executeAsync dispatch. */
+/** Reference to the authoritative outer run that permits this dispatch. */
+export interface RunAuthorityReference {
+  homeId: string;
+  runId: string;
+  leaseOwner: string;
+}
+
+/** Metadata forwarded on execute / executeAsync dispatch. */
 export interface ExecuteMetadata {
   runId?: string;
   workflowId?: string;
@@ -42,6 +49,20 @@ export interface ExecuteMetadata {
   replaySourceRunId?: string;
   replayBeforeExecutionId?: string;
   replayMode?: string;
+  runAuthority?: RunAuthorityReference;
+}
+
+function buildExecutePayload(input: any, metadata?: ExecuteMetadata): Record<string, unknown> {
+  const authority = metadata?.runAuthority;
+  if (!authority) return { input };
+  return {
+    input,
+    authority: {
+      home_id: authority.homeId,
+      run_id: authority.runId,
+      lease_owner: authority.leaseOwner
+    }
+  };
 }
 
 /** Terminal (or in-flight) status snapshot from `GET /executions/{id}`. */
@@ -199,26 +220,11 @@ this.http = axios.create({
   async execute<T = any>(
     target: string,
     input: any,
-    metadata?: {
-      runId?: string;
-      workflowId?: string;
-      rootWorkflowId?: string;
-      parentExecutionId?: string;
-      reasonerId?: string;
-      sessionId?: string;
-      actorId?: string;
-      callerDid?: string;
-      targetDid?: string;
-      agentNodeDid?: string;
-      agentNodeId?: string;
-      replaySourceRunId?: string;
-      replayBeforeExecutionId?: string;
-      replayMode?: string;
-    }
+    metadata?: ExecuteMetadata
   ): Promise<T> {
     const headers = this.buildExecuteHeaders(metadata);
 
-    const bodyStr = JSON.stringify({ input });
+    const bodyStr = JSON.stringify(buildExecutePayload(input, metadata));
     const authHeaders = this.didAuthenticator.signRequest(Buffer.from(bodyStr));
     try {
       const res = await this.http.post(
@@ -414,7 +420,7 @@ this.http = axios.create({
     metadata?: ExecuteMetadata
   ): Promise<string> {
     const headers = this.buildExecuteHeaders(metadata);
-    const bodyStr = JSON.stringify({ input });
+    const bodyStr = JSON.stringify(buildExecutePayload(input, metadata));
     const authHeaders = this.didAuthenticator.signRequest(Buffer.from(bodyStr));
     try {
       const res = await this.http.post(

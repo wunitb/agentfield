@@ -718,6 +718,9 @@ func TestCall(t *testing.T) {
 			var reqBody map[string]any
 			json.NewDecoder(r.Body).Decode(&reqBody)
 			assert.Equal(t, map[string]any{"value": float64(42)}, reqBody["input"])
+			assert.Equal(t, map[string]any{
+				"home_id": "home-a", "run_id": "run-1", "lease_owner": "worker-a",
+			}, reqBody["authority"])
 
 			w.WriteHeader(http.StatusAccepted)
 			_ = json.NewEncoder(w).Encode(map[string]any{
@@ -768,10 +771,13 @@ func TestCall(t *testing.T) {
 
 	// Create context with execution context
 	ctx := contextWithExecution(context.Background(), ExecutionContext{
-		RunID:       "run-1",
-		ExecutionID: "parent-exec",
-		SessionID:   "session-1",
-		ActorID:     "actor-1",
+		RunID:               "run-1",
+		ExecutionID:         "parent-exec",
+		SessionID:           "session-1",
+		ActorID:             "actor-1",
+		AuthorityHomeID:     "home-a",
+		AuthorityRunID:      "run-1",
+		AuthorityLeaseOwner: "worker-a",
 	})
 
 	result, err := agent.Call(ctx, "target.node", map[string]any{"value": 42})

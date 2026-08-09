@@ -16,6 +16,18 @@ agentfield:
     webhook_max_attempts: 3       # Number of attempts before marking the webhook as failed
     webhook_retry_backoff: 1s     # Initial backoff between webhook retries (exponential)
     webhook_max_retry_backoff: 5s # Upper bound for webhook retry backoff
+  # Optional outer-lifecycle admission and cancellation hook. When enabled, every
+  # execution must carry authority {home_id, run_id, lease_owner}; the control
+  # plane verifies it before dispatch and while the execution remains active.
+  run_authority:
+    enabled: false
+    base_url: ""
+    bearer_token: ""
+    expected_home_id: ""
+    request_timeout: 2s
+    poll_interval: 5s
+    heartbeat_max_age: 30s
+    clock_skew: 5s
   approval:
     webhook_secret: ""                 # Required for HMAC auth on approval webhook callbacks; empty disables the endpoint
     default_expiry_hours: 72           # Default approval expiry (hours)

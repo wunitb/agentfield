@@ -27,9 +27,10 @@ import (
 // failures are best-effort — they're logged but never block the 200 response
 // already returned to the provider.
 type TriggerDispatcher struct {
-	storage    storage.StorageProvider
-	vcService  *VCService
-	httpClient *http.Client
+	storage              storage.StorageProvider
+	vcService            *VCService
+	httpClient           *http.Client
+	runAuthorityRequired bool
 }
 
 // NewTriggerDispatcher returns a dispatcher with sensible defaults.
@@ -45,6 +46,13 @@ func NewTriggerDispatcher(storage storage.StorageProvider, vcService *VCService)
 	}
 }
 
+// RequireRunAuthority disables trigger dispatch because inbound events do not carry an outer lease.
+func (d *TriggerDispatcher) RequireRunAuthority() {
+	if d != nil {
+		d.runAuthorityRequired = true
+	}
+}
+
 // DispatchEvent invokes the trigger's target reasoner with the event payload.
 // It is fire-and-forget from the ingest handler's perspective: the caller has
 // already persisted the InboundEvent and returned 200 to the provider before
@@ -55,6 +63,10 @@ func NewTriggerDispatcher(storage storage.StorageProvider, vcService *VCService)
 // route on those when they fan in multiple sources.
 func (d *TriggerDispatcher) DispatchEvent(ctx context.Context, trig *types.Trigger, ev *types.InboundEvent) {
 	if trig == nil || ev == nil {
+		return
+	}
+	if d.runAuthorityRequired {
+		d.markFailed(ctx, ev.ID, "trigger dispatch is disabled while outer run authority is required")
 		return
 	}
 

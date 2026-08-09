@@ -62,7 +62,14 @@ func (s *AgentFieldServer) registerCoreRoutes(agentAPI *gin.RouterGroup) {
 
 	// TODO: Add other node routes (DeleteNode)
 
-	// Reasoner and skill execution endpoints (legacy)
+	// Reasoner and skill execution endpoints (legacy). These routes cannot carry
+	// an outer lifecycle lease, so authority-enabled deployments fail closed.
+	legacyReasonerHandler := handlers.ExecuteReasonerHandler(s.storage)
+	legacySkillHandler := handlers.ExecuteSkillHandler(s.storage)
+	if s.runAuthority != nil {
+		legacyReasonerHandler = handlers.RunAuthorityUnsupportedHandler("legacy reasoner")
+		legacySkillHandler = handlers.RunAuthorityUnsupportedHandler("legacy skill")
+	}
 	// When authorization is enabled, these require the same permission middleware
 	// as the unified execute endpoints to prevent policy bypass.
 	if s.config.Features.DID.Authorization.Enabled && s.accessPolicyService != nil && s.didWebService != nil {
@@ -81,12 +88,12 @@ func (s *AgentFieldServer) registerCoreRoutes(agentAPI *gin.RouterGroup) {
 		)
 		legacyReasonerGroup.Use(legacyMiddleware)
 		legacySkillGroup.Use(legacyMiddleware)
-		legacyReasonerGroup.POST("/:reasoner_id", handlers.ExecuteReasonerHandler(s.storage))
-		legacySkillGroup.POST("/:skill_id", handlers.ExecuteSkillHandler(s.storage))
+		legacyReasonerGroup.POST("/:reasoner_id", legacyReasonerHandler)
+		legacySkillGroup.POST("/:skill_id", legacySkillHandler)
 		logger.Logger.Info().Msg("🔒 Permission checking enabled on legacy reasoner/skill endpoints")
 	} else {
-		agentAPI.POST("/reasoners/:reasoner_id", handlers.ExecuteReasonerHandler(s.storage))
-		agentAPI.POST("/skills/:skill_id", handlers.ExecuteSkillHandler(s.storage))
+		agentAPI.POST("/reasoners/:reasoner_id", legacyReasonerHandler)
+		agentAPI.POST("/skills/:skill_id", legacySkillHandler)
 	}
 
 	// Unified execution endpoints (path-based)
@@ -108,12 +115,12 @@ func (s *AgentFieldServer) registerCoreRoutes(agentAPI *gin.RouterGroup) {
 			logger.Logger.Info().Msg("🔒 Permission checking enabled on execute endpoints")
 		}
 
-		executeGroup.POST("/:target", handlers.ExecuteHandlerWithARD(s.storage, s.payloadStore, s.webhookDispatcher, s.config.AgentField.ExecutionQueue.AgentCallTimeout, s.config.Features.DID.Authorization.InternalToken, func() config.ARDConfig {
+		executeGroup.POST("/:target", handlers.ExecuteHandlerWithARDAndRunAuthority(s.storage, s.payloadStore, s.webhookDispatcher, s.config.AgentField.ExecutionQueue.AgentCallTimeout, s.config.Features.DID.Authorization.InternalToken, func() config.ARDConfig {
 			s.configMu.RLock()
 			defer s.configMu.RUnlock()
 			return s.config.AgentField.ARD
-		}))
-		executeGroup.POST("/async/:target", handlers.ExecuteAsyncHandler(s.storage, s.payloadStore, s.webhookDispatcher, s.config.AgentField.ExecutionQueue.AgentCallTimeout, s.config.Features.DID.Authorization.InternalToken))
+		}, s.runAuthority))
+		executeGroup.POST("/async/:target", handlers.ExecuteAsyncHandlerWithRunAuthority(s.storage, s.payloadStore, s.webhookDispatcher, s.config.AgentField.ExecutionQueue.AgentCallTimeout, s.config.Features.DID.Authorization.InternalToken, s.runAuthority))
 	}
 	// Static "active" coexists with the :execution_id param route (same
 	// pattern as POST /executions/batch-status); gin matches static first.
@@ -128,7 +135,11 @@ func (s *AgentFieldServer) registerCoreRoutes(agentAPI *gin.RouterGroup) {
 	agentAPI.POST("/executions/:execution_id/cancel", handlers.CancelExecutionHandler(s.storage))
 	agentAPI.POST("/executions/:execution_id/pause", handlers.PauseExecutionHandler(s.storage))
 	agentAPI.POST("/executions/:execution_id/resume", handlers.ResumeExecutionHandler(s.storage))
-	agentAPI.POST("/executions/:execution_id/restart", handlers.RestartExecutionHandler(s.storage, s.payloadStore, s.webhookDispatcher, s.config.AgentField.ExecutionQueue.AgentCallTimeout, s.config.Features.DID.Authorization.InternalToken))
+	restartHandler := handlers.RestartExecutionHandler(s.storage, s.payloadStore, s.webhookDispatcher, s.config.AgentField.ExecutionQueue.AgentCallTimeout, s.config.Features.DID.Authorization.InternalToken)
+	if s.runAuthority != nil {
+		restartHandler = handlers.RunAuthorityUnsupportedHandler("restart")
+	}
+	agentAPI.POST("/executions/:execution_id/restart", restartHandler)
 	agentAPI.POST("/workflows/:workflowId/cancel-tree", handlers.CancelWorkflowTreeHandler(s.storage))
 
 	// Approval workflow endpoints — CP manages execution state only;

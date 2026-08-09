@@ -222,6 +222,15 @@ export type AgentHandler = (
 
 export type Awaitable<T> = T | Promise<T>;
 
+interface RawRunAuthorityContext {
+  homeId?: string;
+  runId?: string;
+  leaseOwner?: string;
+  home_id?: string;
+  run_id?: string;
+  lease_owner?: string;
+}
+
 export interface RawExecutionContext {
   executionId?: string;
   runId?: string;
@@ -234,6 +243,7 @@ export interface RawExecutionContext {
   callerDid?: string;
   targetDid?: string;
   agentNodeDid?: string;
+  runAuthority?: RawRunAuthorityContext;
 
   // snake_case variants
   execution_id?: string;
@@ -247,4 +257,5 @@ export interface RawExecutionContext {
   caller_did?: string;
   target_did?: string;
   agent_node_did?: string;
+  run_authority?: RawRunAuthorityContext;
 }

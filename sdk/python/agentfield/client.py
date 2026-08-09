@@ -863,6 +863,23 @@ class AgentFieldClient:
         self._maybe_update_event_stream_headers(sanitized_headers)
         return sanitized_headers
 
+    @staticmethod
+    def _execution_payload(input_data: Dict[str, Any], headers: Dict[str, str]) -> Dict[str, Any]:
+        def value(name: str) -> Optional[str]:
+            return headers.get(name) or headers.get(name.lower())
+
+        home_id = value("X-AgentField-Authority-Home-ID")
+        run_id = value("X-AgentField-Authority-Run-ID")
+        lease_owner = value("X-AgentField-Authority-Lease-Owner")
+        payload: Dict[str, Any] = {"input": input_data}
+        if home_id and run_id and lease_owner:
+            payload["authority"] = {
+                "home_id": home_id,
+                "run_id": run_id,
+                "lease_owner": lease_owner,
+            }
+        return payload
+
     def _submit_execution_sync(
         self,
         target: str,
@@ -871,7 +888,7 @@ class AgentFieldClient:
     ) -> _Submission:
         import json as json_module
 
-        payload = {"input": input_data}
+        payload = self._execution_payload(input_data, headers)
         # Serialize once so the signed bytes are exactly what gets sent.
         body_bytes = json_module.dumps(payload, separators=(",", ":")).encode("utf-8")
 
@@ -912,7 +929,7 @@ class AgentFieldClient:
     ) -> _Submission:
         import json as json_module
 
-        payload = {"input": input_data}
+        payload = self._execution_payload(input_data, headers)
         # Serialize once so the signed bytes are exactly what gets sent.
         # httpx uses compact separators (',', ':') which differ from
         # json.dumps() defaults (', ', ': '), causing signature mismatch.
