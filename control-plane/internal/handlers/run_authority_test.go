@@ -26,6 +26,7 @@ func TestNewRunAuthorityVerifierFailsClosedOnInvalidConfig(t *testing.T) {
 		{Enabled: true, BaseURL: "http://127.0.0.1:8080", ExpectedHomeID: "home-a"},
 		{Enabled: true, BaseURL: "http://example.com", BearerToken: authorityToken, ExpectedHomeID: "home-a"},
 		{Enabled: true, BaseURL: "http://127.0.0.1:8080", BearerToken: "changeme", ExpectedHomeID: "home-a"},
+		{Enabled: true, BaseURL: "http://127.0.0.1:8080", BearerToken: authorityToken, ExpectedHomeID: "home-a", ExpectedRunnerType: "external", RequestTimeout: time.Second, PollInterval: time.Second, HeartbeatMaxAge: time.Second, ClockSkew: time.Second},
 	}
 	for _, cfg := range tests {
 		if _, err := NewRunAuthorityVerifier(cfg); err == nil {
@@ -45,7 +46,7 @@ func TestRunAuthorityVerifierRequiresAuthenticatedMatchingEligibleView(t *testin
 
 	verifier := mustRunAuthorityVerifier(t, server.URL, 20*time.Millisecond)
 	err := verifier.Verify(context.Background(), RunAuthorityRef{
-		HomeID: "home-a", RunID: "run-1", LeaseOwner: "worker-a",
+		HomeID: "home-a", RunID: "run-1", LeaseOwner: "worker-a", Attempt: 1,
 	})
 	if err != nil {
 		t.Fatalf("expected eligible authority view: %v", err)
@@ -55,12 +56,27 @@ func TestRunAuthorityVerifierRequiresAuthenticatedMatchingEligibleView(t *testin
 	}
 
 	for _, ref := range []RunAuthorityRef{
-		{HomeID: "home-b", RunID: "run-1", LeaseOwner: "worker-a"},
-		{HomeID: "home-a", RunID: "run-1", LeaseOwner: "worker-b"},
+		{HomeID: "home-b", RunID: "run-1", LeaseOwner: "worker-a", Attempt: 1},
+		{HomeID: "home-a", RunID: "run-1", LeaseOwner: "worker-b", Attempt: 1},
 	} {
 		if err := verifier.Verify(context.Background(), ref); err == nil {
 			t.Fatalf("expected mismatched authority reference to fail: %+v", ref)
 		}
+	}
+}
+
+func TestRunAuthorityVerifierRejectsWrongDeputiesRunnerType(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		view := strings.Replace(authorityView("running", true, "home-a", "run-1", "worker-a"), `"runnerType":"agentfield"`, `"runnerType":"external"`, 1)
+		fmt.Fprint(w, view)
+	}))
+	defer server.Close()
+
+	verifier := mustRunAuthorityVerifier(t, server.URL, 20*time.Millisecond)
+	err := verifier.Verify(context.Background(), RunAuthorityRef{HomeID: "home-a", RunID: "run-1", LeaseOwner: "worker-a", Attempt: 1})
+	if err == nil || !strings.Contains(err.Error(), "runner type") {
+		t.Fatalf("expected runner type rejection, got %v", err)
 	}
 }
 
@@ -69,13 +85,13 @@ func TestRunAuthorityVerifierRejectsStaleHeartbeat(t *testing.T) {
 	leaseExpiresAt := time.Now().UTC().Add(time.Hour)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprintf(w, `{"schemaVersion":"deputies.run-authority.v1","homeId":"home-a","runId":"run-1","sessionId":"session-1","messageId":"message-1","attempt":1,"runnerType":"external","status":"running","leaseOwner":"worker-a","leaseExpiresAt":%q,"heartbeatAt":%q,"heartbeatAgeMs":60000,"terminalAt":null,"eligibleForDispatch":true,"reasonCodes":[]}`, leaseExpiresAt.Format(time.RFC3339Nano), heartbeatAt.Format(time.RFC3339Nano))
+		fmt.Fprintf(w, `{"schemaVersion":"deputies.run-authority.v1","homeId":"home-a","runId":"run-1","sessionId":"session-1","messageId":"message-1","attempt":1,"runnerType":"agentfield","status":"running","leaseOwner":"worker-a","leaseExpiresAt":%q,"heartbeatAt":%q,"heartbeatAgeMs":60000,"terminalAt":null,"eligibleForDispatch":true,"reasonCodes":[]}`, leaseExpiresAt.Format(time.RFC3339Nano), heartbeatAt.Format(time.RFC3339Nano))
 	}))
 	defer server.Close()
 
 	verifier := mustRunAuthorityVerifier(t, server.URL, 20*time.Millisecond)
 	err := verifier.Verify(context.Background(), RunAuthorityRef{
-		HomeID: "home-a", RunID: "run-1", LeaseOwner: "worker-a",
+		HomeID: "home-a", RunID: "run-1", LeaseOwner: "worker-a", Attempt: 1,
 	})
 	if err == nil || !strings.Contains(err.Error(), "heartbeat") {
 		t.Fatalf("expected stale heartbeat rejection, got %v", err)
@@ -94,7 +110,7 @@ func TestRunAuthorityVerifierPropagatesCancellation(t *testing.T) {
 
 	verifier := mustRunAuthorityVerifier(t, server.URL, 10*time.Millisecond)
 	guarded, stop, err := verifier.Guard(context.Background(), RunAuthorityRef{
-		HomeID: "home-a", RunID: "run-1", LeaseOwner: "worker-a",
+		HomeID: "home-a", RunID: "run-1", LeaseOwner: "worker-a", Attempt: 1,
 	})
 	if err != nil {
 		t.Fatalf("guard admission failed: %v", err)
@@ -140,7 +156,7 @@ func TestExecuteHandlerRefusesDispatchWithoutEligibleOuterAuthority(t *testing.T
 	req := httptest.NewRequest(
 		http.MethodPost,
 		"/api/v1/execute/node-1.reasoner-a",
-		strings.NewReader(`{"input":{},"authority":{"home_id":"home-a","run_id":"run-1","lease_owner":"worker-a"}}`),
+		strings.NewReader(`{"input":{},"authority":{"home_id":"home-a","run_id":"run-1","lease_owner":"worker-a","attempt":1}}`),
 	)
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Run-ID", "run-1")
@@ -156,6 +172,41 @@ func TestExecuteHandlerRefusesDispatchWithoutEligibleOuterAuthority(t *testing.T
 	}
 	if agentCalls.Load() != 0 {
 		t.Fatalf("agent was called despite denied authority: %d", agentCalls.Load())
+	}
+}
+
+func TestExecuteAsyncVerifiesAuthorityBeforeDeterministicRecordCreation(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	authorityServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, authorityView("running", true, "home-a", "run-1", "worker-a"))
+	}))
+	defer authorityServer.Close()
+	agentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusAccepted) }))
+	defer agentServer.Close()
+
+	store := newTestExecutionStorage(&types.AgentNode{ID: "node-1", BaseURL: agentServer.URL, Reasoners: []types.ReasonerDefinition{{ID: "reasoner-a"}}})
+	router := gin.New()
+	router.POST("/execute/async/:target", ExecuteAsyncHandlerWithRunAuthority(store, services.NewFilePayloadStore(t.TempDir()), nil, time.Second, "", mustRunAuthorityVerifier(t, authorityServer.URL, 20*time.Millisecond)))
+
+	request := func(leaseOwner string) *httptest.ResponseRecorder {
+		body := fmt.Sprintf(`{"input":{},"authority":{"home_id":"home-a","run_id":"run-1","lease_owner":%q,"attempt":1}}`, leaseOwner)
+		req := httptest.NewRequest(http.MethodPost, "/execute/async/node-1.reasoner-a", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Run-ID", "run-1")
+		response := httptest.NewRecorder()
+		router.ServeHTTP(response, req)
+		return response
+	}
+
+	if response := request("worker-b"); response.Code != http.StatusServiceUnavailable {
+		t.Fatalf("wrong lease was not denied: %d %s", response.Code, response.Body.String())
+	}
+	if records, _ := store.QueryExecutionRecords(context.Background(), types.ExecutionFilter{}); len(records) != 0 {
+		t.Fatalf("denied authority poisoned durable execution identity: %+v", records)
+	}
+	if response := request("worker-a"); response.Code != http.StatusAccepted {
+		t.Fatalf("valid lease was not accepted after denied request: %d %s", response.Code, response.Body.String())
 	}
 }
 
@@ -187,7 +238,7 @@ func TestExecuteHandlerCancelsExecutionWhenRunAuthorityIsRevoked(t *testing.T) {
 		mustRunAuthorityVerifier(t, authorityServer.URL, 10*time.Millisecond),
 	))
 	req := httptest.NewRequest(http.MethodPost, "/execute/node-1.reasoner-a", strings.NewReader(
-		`{"input":{"value":1},"authority":{"home_id":"home-a","run_id":"run-1","lease_owner":"worker-a"}}`,
+		`{"input":{"value":1},"authority":{"home_id":"home-a","run_id":"run-1","lease_owner":"worker-a","attempt":1}}`,
 	))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Run-ID", "run-1")
@@ -257,7 +308,7 @@ func TestExecuteAsyncMonitorsAuthorityAfterAgentAcceptance(t *testing.T) {
 		mustRunAuthorityVerifier(t, authorityServer.URL, 10*time.Millisecond),
 	))
 	req := httptest.NewRequest(http.MethodPost, "/execute/async/node-1.reasoner-a", strings.NewReader(
-		`{"input":{"value":1},"authority":{"home_id":"home-a","run_id":"run-1","lease_owner":"worker-a"}}`,
+		`{"input":{"value":1},"authority":{"home_id":"home-a","run_id":"run-1","lease_owner":"worker-a","attempt":1}}`,
 	))
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Run-ID", "run-1")
@@ -320,7 +371,7 @@ func TestExecuteAsyncIsIdempotentForOneOuterAuthorityRun(t *testing.T) {
 	responses := make([]*httptest.ResponseRecorder, 2)
 	for index := range responses {
 		req := httptest.NewRequest(http.MethodPost, "/execute/async/node-1.reasoner-a", strings.NewReader(
-			`{"input":{"value":1},"authority":{"home_id":"home-a","run_id":"run-1","lease_owner":"worker-a"}}`,
+			`{"input":{"value":1},"authority":{"home_id":"home-a","run_id":"run-1","lease_owner":"worker-a","attempt":1}}`,
 		))
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("X-Run-ID", "run-1")
@@ -348,10 +399,88 @@ func TestExecuteAsyncIsIdempotentForOneOuterAuthorityRun(t *testing.T) {
 	}
 }
 
+func TestRevocationPreventsLaterSuccessAndPersistsBinding(t *testing.T) {
+	store := newTestExecutionStorage(nil)
+	ref := &RunAuthorityRef{HomeID: "home-a", RunID: "run-1", LeaseOwner: "worker-a", Attempt: 1}
+	exec := &types.Execution{ExecutionID: "exec-race", RunID: "run-1", Status: types.ExecutionStatusRunning, StartedAt: time.Now().UTC(), CreatedAt: time.Now().UTC(), UpdatedAt: time.Now().UTC()}
+	bindExecutionAuthority(exec, ref)
+	if err := store.CreateExecutionRecord(context.Background(), exec); err != nil {
+		t.Fatal(err)
+	}
+	controller := newExecutionController(store, nil, nil, time.Second, "")
+	plan := &preparedExecution{exec: exec, runAuthority: ref}
+	if err := controller.cancelRevokedRunAuthority(context.Background(), plan, time.Millisecond); err != nil {
+		t.Fatal(err)
+	}
+	if err := controller.completeExecution(context.Background(), plan, []byte(`{"ok":true}`), time.Millisecond); err == nil {
+		t.Fatal("success overwrote revoked execution")
+	}
+	record, _ := store.GetExecutionRecord(context.Background(), exec.ExecutionID)
+	if record.Status != types.ExecutionStatusCancelled || record.AuthorityRevokedAt == nil || !sameAuthorityExecution(record, exec) {
+		t.Fatalf("revocation or authority binding was not durable: %+v", record)
+	}
+}
+
+func TestTerminalExecutionWritesAreImmutableAndIdempotent(t *testing.T) {
+	store := newTestExecutionStorage(nil)
+	exec := &types.Execution{ExecutionID: "exec-terminal", RunID: "run-1", Status: types.ExecutionStatusRunning, StartedAt: time.Now().UTC()}
+	if err := store.CreateExecutionRecord(context.Background(), exec); err != nil {
+		t.Fatal(err)
+	}
+	controller := newExecutionController(store, nil, nil, time.Second, "")
+	now := time.Now().UTC()
+	desired := terminalExecutionMutation{status: string(types.ExecutionStatusSucceeded), result: []byte(`{"ok":true}`), completedAt: now, durationMS: 1, compareDuration: true}
+	if _, transitioned, err := controller.writeTerminalExecution(context.Background(), exec.ExecutionID, desired); err != nil || !transitioned {
+		t.Fatalf("first terminal transition failed: transitioned=%t err=%v", transitioned, err)
+	}
+	if _, transitioned, err := controller.writeTerminalExecution(context.Background(), exec.ExecutionID, desired); err != nil || transitioned {
+		t.Fatalf("identical retry was not a no-op: transitioned=%t err=%v", transitioned, err)
+	}
+	conflict := desired
+	conflict.result = []byte(`{"ok":false}`)
+	if _, _, err := controller.writeTerminalExecution(context.Background(), exec.ExecutionID, conflict); !errors.Is(err, errTerminalExecutionConflict) {
+		t.Fatalf("conflicting terminal retry was not rejected: %v", err)
+	}
+}
+
+func TestRecoverRunAuthorityExecutionsRehydratesMonitor(t *testing.T) {
+	var status atomic.Value
+	status.Store("running")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		current := status.Load().(string)
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, authorityView(current, current == "running", "home-a", "run-1", "worker-a"))
+	}))
+	defer server.Close()
+	verifier := mustRunAuthorityVerifier(t, server.URL, 10*time.Millisecond)
+	defer verifier.Close()
+
+	store := newTestExecutionStorage(nil)
+	ref := &RunAuthorityRef{HomeID: "home-a", RunID: "run-1", LeaseOwner: "worker-a", Attempt: 1}
+	exec := &types.Execution{ExecutionID: "exec-recover", RunID: "run-1", Status: types.ExecutionStatusRunning, StartedAt: time.Now().UTC()}
+	bindExecutionAuthority(exec, ref)
+	if err := store.CreateExecutionRecord(context.Background(), exec); err != nil {
+		t.Fatal(err)
+	}
+	if err := RecoverRunAuthorityExecutions(context.Background(), store, verifier, time.Second); err != nil {
+		t.Fatal(err)
+	}
+	status.Store("cancelled")
+	deadline := time.Now().Add(time.Second)
+	for time.Now().Before(deadline) {
+		record, _ := store.GetExecutionRecord(context.Background(), exec.ExecutionID)
+		if record.Status == types.ExecutionStatusCancelled && record.AuthorityRevokedAt != nil {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatal("recovered authority monitor did not reconcile revocation")
+}
+
 func mustRunAuthorityVerifier(t *testing.T, baseURL string, pollInterval time.Duration) *RunAuthorityVerifier {
 	t.Helper()
 	verifier, err := NewRunAuthorityVerifier(config.RunAuthorityConfig{
-		Enabled: true, BaseURL: baseURL, BearerToken: authorityToken, ExpectedHomeID: "home-a",
+		Enabled: true, BaseURL: baseURL, BearerToken: authorityToken, ExpectedHomeID: "home-a", ExpectedRunnerType: "agentfield",
 		RequestTimeout: time.Second, PollInterval: pollInterval, HeartbeatMaxAge: 30 * time.Second, ClockSkew: 5 * time.Second,
 	})
 	if err != nil {
@@ -366,7 +495,7 @@ func authorityView(status string, eligible bool, homeID, runID, leaseOwner strin
 	return fmt.Sprintf(`{
 			"schemaVersion":"deputies.run-authority.v1",
 			"homeId":%q,"runId":%q,"sessionId":"session-1","messageId":"message-1",
-			"attempt":1,"runnerType":"external","status":%q,"leaseOwner":%q,
+			"attempt":1,"runnerType":"agentfield","status":%q,"leaseOwner":%q,
 			"leaseExpiresAt":%q,"heartbeatAt":%q,
 			"heartbeatAgeMs":0,"terminalAt":null,"eligibleForDispatch":%t,"reasonCodes":[]
 		}`, homeID, runID, status, leaseOwner, leaseExpiresAt.Format(time.RFC3339Nano), heartbeatAt.Format(time.RFC3339Nano), eligible)

@@ -10,6 +10,25 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+func TestExecutionAuthorityBindingRoundTripsForRecovery(t *testing.T) {
+	ls, ctx := setupLocalStorage(t)
+	homeID, runID, leaseOwner, attempt := "home-a", "run-1", "worker-a", 2
+	revokedAt := time.Now().UTC().Truncate(time.Millisecond)
+	exec := &types.Execution{
+		ExecutionID: "exec-authority-roundtrip", RunID: runID, AgentNodeID: "agent-1", ReasonerID: "reasoner-a", NodeID: "node-1",
+		Status: string(types.ExecutionStatusCancelled), StartedAt: revokedAt.Add(-time.Second), CompletedAt: &revokedAt,
+		AuthorityHomeID: &homeID, AuthorityRunID: &runID, AuthorityLeaseOwner: &leaseOwner, AuthorityAttempt: &attempt, AuthorityRevokedAt: &revokedAt,
+	}
+	require.NoError(t, ls.CreateExecutionRecord(ctx, exec))
+	loaded, err := ls.GetExecutionRecord(ctx, exec.ExecutionID)
+	require.NoError(t, err)
+	require.Equal(t, homeID, *loaded.AuthorityHomeID)
+	require.Equal(t, runID, *loaded.AuthorityRunID)
+	require.Equal(t, leaseOwner, *loaded.AuthorityLeaseOwner)
+	require.Equal(t, attempt, *loaded.AuthorityAttempt)
+	require.NotNil(t, loaded.AuthorityRevokedAt)
+}
+
 func TestQueryRunSummariesParsesTextTimestamps(t *testing.T) {
 	ls, ctx := setupLocalStorage(t)
 

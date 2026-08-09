@@ -38,9 +38,11 @@ func (ls *LocalStorage) CreateExecutionRecord(ctx context.Context, exec *types.E
 			input_uri, result_uri,
 			session_id, actor_id,
 			started_at, completed_at, duration_ms,
+			authority_home_id, authority_run_id, authority_lease_owner,
+			authority_attempt, authority_revoked_at,
 			notes,
 			created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	// Serialize notes to JSON
 	var notesJSON []byte
@@ -73,6 +75,11 @@ func (ls *LocalStorage) CreateExecutionRecord(ctx context.Context, exec *types.E
 		exec.StartedAt,
 		exec.CompletedAt,
 		exec.DurationMS,
+		exec.AuthorityHomeID,
+		exec.AuthorityRunID,
+		exec.AuthorityLeaseOwner,
+		exec.AuthorityAttempt,
+		exec.AuthorityRevokedAt,
 		notesJSON,
 		exec.CreatedAt,
 		exec.UpdatedAt,
@@ -93,6 +100,8 @@ func (ls *LocalStorage) GetExecutionRecord(ctx context.Context, executionID stri
 		       input_uri, result_uri,
 		       session_id, actor_id,
 		       started_at, completed_at, duration_ms,
+		       authority_home_id, authority_run_id, authority_lease_owner,
+		       authority_attempt, authority_revoked_at,
 		       notes,
 		       created_at, updated_at
 		FROM executions
@@ -135,6 +144,8 @@ func (ls *LocalStorage) GetExecutionRecordsBatch(ctx context.Context, executionI
 		       input_uri, result_uri,
 		       session_id, actor_id,
 		       started_at, completed_at, duration_ms,
+		       authority_home_id, authority_run_id, authority_lease_owner,
+		       authority_attempt, authority_revoked_at,
 		       notes,
 		       created_at, updated_at
 		FROM executions
@@ -187,17 +198,23 @@ func (ls *LocalStorage) UpdateExecutionRecord(ctx context.Context, executionID s
 	}
 	defer rollbackTx(tx, "UpdateExecutionRecord:"+executionID)
 
-	row := tx.QueryRowContext(ctx, `
+	selectQuery := `
 		SELECT execution_id, run_id, parent_execution_id,
 		       agent_node_id, reasoner_id, node_id,
 		       status, status_reason, input_payload, result_payload, error_message,
 		       input_uri, result_uri,
 		       session_id, actor_id,
 		       started_at, completed_at, duration_ms,
+		       authority_home_id, authority_run_id, authority_lease_owner,
+		       authority_attempt, authority_revoked_at,
 		       notes,
 		       created_at, updated_at
 		FROM executions
-		WHERE execution_id = ?`, executionID)
+		WHERE execution_id = ?`
+	if ls.mode != "local" {
+		selectQuery += " FOR UPDATE"
+	}
+	row := tx.QueryRowContext(ctx, selectQuery, executionID)
 
 	current, err := scanExecution(row)
 	if err != nil {
@@ -245,6 +262,11 @@ func (ls *LocalStorage) UpdateExecutionRecord(ctx context.Context, executionID s
 			started_at = ?,
 			completed_at = ?,
 			duration_ms = ?,
+			authority_home_id = ?,
+			authority_run_id = ?,
+			authority_lease_owner = ?,
+			authority_attempt = ?,
+			authority_revoked_at = ?,
 			notes = ?,
 			updated_at = ?
 		WHERE execution_id = ?`
@@ -269,6 +291,11 @@ func (ls *LocalStorage) UpdateExecutionRecord(ctx context.Context, executionID s
 		updated.StartedAt,
 		updated.CompletedAt,
 		updated.DurationMS,
+		updated.AuthorityHomeID,
+		updated.AuthorityRunID,
+		updated.AuthorityLeaseOwner,
+		updated.AuthorityAttempt,
+		updated.AuthorityRevokedAt,
 		notesJSON,
 		updated.UpdatedAt,
 		updated.ExecutionID,
@@ -324,6 +351,13 @@ func (ls *LocalStorage) QueryExecutionRecords(ctx context.Context, filter types.
 		where = append(where, "actor_id = ?")
 		args = append(args, *filter.ActorID)
 	}
+	if filter.AuthorityBoundOnly {
+		where = append(where, "authority_home_id IS NOT NULL")
+	}
+	if filter.NonTerminalOnly {
+		where = append(where, "status NOT IN (?, ?, ?, ?)")
+		args = append(args, types.ExecutionStatusSucceeded, types.ExecutionStatusFailed, types.ExecutionStatusCancelled, types.ExecutionStatusTimeout)
+	}
 	if filter.StartTime != nil {
 		where = append(where, "started_at >= ?")
 		args = append(args, filter.StartTime.UTC())
@@ -347,6 +381,8 @@ func (ls *LocalStorage) QueryExecutionRecords(ctx context.Context, filter types.
 		       input_uri, result_uri,
 		       session_id, actor_id,
 		       started_at, completed_at, duration_ms,
+		       authority_home_id, authority_run_id, authority_lease_owner,
+		       authority_attempt, authority_revoked_at,
 		       notes,
 		       created_at, updated_at
 		FROM executions`)
@@ -1529,6 +1565,11 @@ func scanExecution(scanner interface {
 		errorMessage                 sql.NullString
 		completedAt                  sql.NullTime
 		durationMS                   sql.NullInt64
+		authorityHomeID              sql.NullString
+		authorityRunID               sql.NullString
+		authorityLeaseOwner          sql.NullString
+		authorityAttempt             sql.NullInt64
+		authorityRevokedAt           sql.NullTime
 		notesJSON                    []byte
 	)
 
@@ -1551,6 +1592,11 @@ func scanExecution(scanner interface {
 		&exec.StartedAt,
 		&completedAt,
 		&durationMS,
+		&authorityHomeID,
+		&authorityRunID,
+		&authorityLeaseOwner,
+		&authorityAttempt,
+		&authorityRevokedAt,
 		&notesJSON,
 		&exec.CreatedAt,
 		&exec.UpdatedAt,
@@ -1594,6 +1640,26 @@ func scanExecution(scanner interface {
 	if durationMS.Valid {
 		val := durationMS.Int64
 		exec.DurationMS = &val
+	}
+	if authorityHomeID.Valid {
+		value := authorityHomeID.String
+		exec.AuthorityHomeID = &value
+	}
+	if authorityRunID.Valid {
+		value := authorityRunID.String
+		exec.AuthorityRunID = &value
+	}
+	if authorityLeaseOwner.Valid {
+		value := authorityLeaseOwner.String
+		exec.AuthorityLeaseOwner = &value
+	}
+	if authorityAttempt.Valid {
+		attempt := int(authorityAttempt.Int64)
+		exec.AuthorityAttempt = &attempt
+	}
+	if authorityRevokedAt.Valid {
+		revokedAt := authorityRevokedAt.Time
+		exec.AuthorityRevokedAt = &revokedAt
 	}
 	if len(notesJSON) > 0 {
 		if err := json.Unmarshal(notesJSON, &exec.Notes); err != nil {

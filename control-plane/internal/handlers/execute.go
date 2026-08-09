@@ -382,25 +382,25 @@ func (c *executionController) handleSync(ctx *gin.Context) {
 			finishedAt = time.Now().UTC().Format(time.RFC3339)
 		}
 
-		// Check if execution failed
-		if exec.Status == types.ExecutionStatusFailed {
-			errMsg := "execution failed"
+		if exec.Status != types.ExecutionStatusSucceeded {
+			errMsg := "execution did not succeed"
 			if exec.ErrorMessage != nil {
 				errMsg = *exec.ErrorMessage
 			}
 			response := ExecuteResponse{
-				ExecutionID:       exec.ExecutionID,
-				RunID:             exec.RunID,
-				Status:            string(exec.Status),
-				ErrorMessage:      &errMsg,
-				ErrorDetails:      decodeJSON(exec.ResultPayload),
-				DurationMS:        durationMS,
-				FinishedAt:        finishedAt,
-				WebhookRegistered: exec.WebhookRegistered,
+				ExecutionID: exec.ExecutionID, RunID: exec.RunID, Status: string(exec.Status), ErrorMessage: &errMsg,
+				ErrorDetails: decodeJSON(exec.ResultPayload), DurationMS: durationMS, FinishedAt: finishedAt, WebhookRegistered: exec.WebhookRegistered,
+			}
+			statusCode := http.StatusBadGateway
+			switch exec.Status {
+			case types.ExecutionStatusCancelled:
+				statusCode = http.StatusConflict
+			case types.ExecutionStatusTimeout:
+				statusCode = http.StatusGatewayTimeout
 			}
 			ctx.Header("X-Execution-ID", exec.ExecutionID)
 			ctx.Header("X-Run-ID", exec.RunID)
-			ctx.JSON(http.StatusBadGateway, response)
+			ctx.JSON(statusCode, response)
 			return
 		}
 
@@ -492,6 +492,12 @@ func (c *executionController) tryHandleExternalARDCall(ctx *gin.Context) bool {
 	if req.Input == nil {
 		req.Input = map[string]interface{}{}
 	}
+	if req.Authority != nil {
+		if err := normalizeRunAuthorityRef(req.Authority); err != nil {
+			writeExecutionError(ctx, &callError{statusCode: http.StatusBadRequest, message: err.Error()})
+			return true
+		}
+	}
 
 	reader, ok := c.store.(ard.StateReader)
 	if !ok {
@@ -525,6 +531,9 @@ func (c *executionController) tryHandleExternalARDCall(ctx *gin.Context) bool {
 		runID = utils.GenerateRunID()
 	}
 	executionID := utils.GenerateExecutionID()
+	if req.Authority != nil {
+		executionID = authorityExecutionID(*req.Authority, nil)
+	}
 	start := time.Now().UTC()
 	clientPayload := map[string]interface{}{"input": req.Input}
 	if len(req.Context) > 0 {
@@ -545,17 +554,23 @@ func (c *executionController) tryHandleExternalARDCall(ctx *gin.Context) bool {
 		NodeID:            "external",
 		Status:            types.ExecutionStatusRunning,
 		InputPayload:      json.RawMessage(storedPayload),
-		InputURI:          c.savePayload(ctx.Request.Context(), storedPayload),
 		StartedAt:         start,
 		CreatedAt:         start,
 		UpdatedAt:         start,
 	}
+	bindExecutionAuthority(exec, req.Authority)
 	if headers.sessionID != nil {
 		exec.SessionID = headers.sessionID
 	}
 	if headers.actorID != nil {
 		exec.ActorID = headers.actorID
 	}
+	preAdmission := &preparedExecution{exec: exec, runAuthority: req.Authority}
+	if err := c.verifyRunAuthority(ctx.Request.Context(), preAdmission); err != nil {
+		writeExecutionError(ctx, err)
+		return true
+	}
+	exec.InputURI = c.savePayload(ctx.Request.Context(), storedPayload)
 	if err := c.store.CreateExecutionRecord(ctx.Request.Context(), exec); err != nil {
 		writeExecutionError(ctx, fmt.Errorf("create external ARD execution record: %w", err))
 		return true
@@ -680,31 +695,14 @@ func (c *executionController) callExternalARD(ctx context.Context, req ExecuteRe
 
 func (c *executionController) finishExternalARDExecution(ctx context.Context, executionID string, status string, elapsed time.Duration, result []byte, callErr error) error {
 	resultURI := c.savePayload(ctx, result)
-	_, err := c.store.UpdateExecutionRecord(ctx, executionID, func(current *types.Execution) (*types.Execution, error) {
-		if current == nil {
-			return nil, fmt.Errorf("execution %s not found", executionID)
-		}
-		now := time.Now().UTC()
-		current.Status = status
-		current.CompletedAt = pointerTime(now)
-		duration := elapsed.Milliseconds()
-		current.DurationMS = &duration
-		current.UpdatedAt = now
-		if len(result) > 0 {
-			current.ResultPayload = json.RawMessage(result)
-			current.ResultURI = resultURI
-		}
-		if callErr != nil {
-			errMsg := callErr.Error()
-			current.ErrorMessage = &errMsg
-			category := string(classifyExecutionError(callErr))
-			current.StatusReason = &category
-		} else {
-			current.ErrorMessage = nil
-			current.StatusReason = nil
-		}
-		return current, nil
-	})
+	mutation := terminalExecutionMutation{status: status, result: result, resultURI: resultURI, completedAt: time.Now().UTC(), durationMS: elapsed.Milliseconds(), compareDuration: true}
+	if callErr != nil {
+		errMessage := callErr.Error()
+		reason := string(classifyExecutionError(callErr))
+		mutation.errorMessage = &errMessage
+		mutation.statusReason = &reason
+	}
+	_, _, err := c.writeTerminalExecution(ctx, executionID, mutation)
 	if err != nil {
 		return fmt.Errorf("update external ARD execution record: %w", err)
 	}
@@ -746,11 +744,30 @@ func validateExternalARDOperation(req ExecuteRequest, binding *ard.ExternalBindi
 	return &callError{statusCode: http.StatusForbidden, message: fmt.Sprintf("external ARD operation %q is not allowed by binding policy", operation)}
 }
 
-func authorityExecutionID(authority RunAuthorityRef, target *parsedTarget) string {
+func authorityExecutionID(authority RunAuthorityRef, _ *parsedTarget) string {
 	digest := sha256.Sum256([]byte(strings.Join([]string{
-		authority.HomeID, authority.RunID, target.NodeID, target.TargetType, target.TargetName,
+		authority.HomeID, authority.RunID, authority.LeaseOwner, strconv.Itoa(authority.Attempt),
 	}, "\x00")))
 	return fmt.Sprintf("exec_authority_%x", digest)
+}
+
+func bindExecutionAuthority(exec *types.Execution, authority *RunAuthorityRef) {
+	if exec == nil || authority == nil {
+		return
+	}
+	homeID, runID, leaseOwner, attempt := authority.HomeID, authority.RunID, authority.LeaseOwner, authority.Attempt
+	exec.AuthorityHomeID = &homeID
+	exec.AuthorityRunID = &runID
+	exec.AuthorityLeaseOwner = &leaseOwner
+	exec.AuthorityAttempt = &attempt
+}
+
+func executionAuthorityRef(exec *types.Execution) (*RunAuthorityRef, bool) {
+	if exec == nil || exec.AuthorityHomeID == nil || exec.AuthorityRunID == nil || exec.AuthorityLeaseOwner == nil || exec.AuthorityAttempt == nil {
+		return nil, false
+	}
+	ref := &RunAuthorityRef{HomeID: *exec.AuthorityHomeID, RunID: *exec.AuthorityRunID, LeaseOwner: *exec.AuthorityLeaseOwner, Attempt: *exec.AuthorityAttempt}
+	return ref, normalizeRunAuthorityRef(ref) == nil
 }
 
 func sameAuthorityExecution(existing, requested *types.Execution) bool {
@@ -760,7 +777,18 @@ func sameAuthorityExecution(existing, requested *types.Execution) bool {
 		existing.ReasonerID == requested.ReasonerID &&
 		existing.NodeID == requested.NodeID &&
 		sameOptionalString(existing.ParentExecutionID, requested.ParentExecutionID) &&
+		sameOptionalString(existing.AuthorityHomeID, requested.AuthorityHomeID) &&
+		sameOptionalString(existing.AuthorityRunID, requested.AuthorityRunID) &&
+		sameOptionalString(existing.AuthorityLeaseOwner, requested.AuthorityLeaseOwner) &&
+		sameOptionalInt(existing.AuthorityAttempt, requested.AuthorityAttempt) &&
 		bytes.Equal(existing.InputPayload, requested.InputPayload)
+}
+
+func sameOptionalInt(left, right *int) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
 }
 
 func sameOptionalString(left, right *string) bool {
@@ -1007,6 +1035,7 @@ func (c *executionController) handleStatusUpdate(ctx *gin.Context) {
 
 	resultURI := c.savePayload(reqCtx, resultBytes)
 	isTerminal := types.IsTerminalExecutionStatus(normalizedStatus)
+	transitioned := true
 	var elapsed time.Duration
 	var errorMsg *string
 
@@ -1036,19 +1065,15 @@ func (c *executionController) handleStatusUpdate(ctx *gin.Context) {
 			}
 		}
 
-		// Terminal-state immutability guard. Once an execution has reached a
-		// terminal state, only an exact same-status retry is allowed. This
-		// prevents late callbacks from replacing cancellation or another
-		// terminal decision while preserving idempotent delivery retries.
-		if types.IsTerminalExecutionStatus(string(current.Status)) {
-			if normalizedStatus != string(current.Status) {
-				logger.Logger.Warn().
-					Str("execution_id", executionID).
-					Str("current_status", string(current.Status)).
-					Str("requested_status", normalizedStatus).
-					Msg("rejecting status update: execution is already in a terminal state")
-				return nil, fmt.Errorf("execution %s is already in terminal state '%s'; cannot transition to '%s'", executionID, current.Status, normalizedStatus)
+		if types.IsTerminalExecutionStatus(current.Status) {
+			if terminalCallbackMatches(current, normalizedStatus, req, resultBytes) {
+				transitioned = false
+				return current, nil
 			}
+			return nil, fmt.Errorf("%w: execution %s is already %s", errTerminalExecutionConflict, executionID, current.Status)
+		}
+		if isTerminal && current.AuthorityRevokedAt != nil && normalizedStatus != string(types.ExecutionStatusCancelled) {
+			return nil, ErrRunAuthorityRevoked
 		}
 
 		current.Status = normalizedStatus
@@ -1100,7 +1125,11 @@ func (c *executionController) handleStatusUpdate(ctx *gin.Context) {
 		return current, nil
 	})
 	if err != nil {
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update execution: %v", err)})
+		statusCode := http.StatusInternalServerError
+		if errors.Is(err, errTerminalExecutionConflict) || errors.Is(err, ErrRunAuthorityRevoked) {
+			statusCode = http.StatusConflict
+		}
+		ctx.JSON(statusCode, gin.H{"error": fmt.Sprintf("failed to update execution: %v", err)})
 		return
 	}
 	if updated == nil {
@@ -1109,6 +1138,10 @@ func (c *executionController) handleStatusUpdate(ctx *gin.Context) {
 	}
 	if elapsed == 0 && updated.DurationMS != nil {
 		elapsed = time.Duration(*updated.DurationMS) * time.Millisecond
+	}
+	if !transitioned {
+		ctx.JSON(http.StatusOK, c.renderStatusWithApproval(reqCtx, updated))
+		return
 	}
 
 	// Persist token/cost usage reported alongside the status callback.
@@ -1263,8 +1296,10 @@ func (c *executionController) publishExecutionEventWithReasonerInfo(exec *types.
 	switch status {
 	case string(types.ExecutionStatusSucceeded):
 		eventType = events.ExecutionCompleted
-	case string(types.ExecutionStatusFailed):
+	case string(types.ExecutionStatusFailed), string(types.ExecutionStatusTimeout):
 		eventType = events.ExecutionFailed
+	case string(types.ExecutionStatusCancelled):
+		eventType = events.ExecutionCancelledEvent
 	case string(types.ExecutionStatusRunning):
 		eventType = events.ExecutionStarted
 	case "created":
@@ -1422,6 +1457,33 @@ func (c *executionController) publishExecutionStartedEvent(plan *preparedExecuti
 	)
 }
 
+func (c *executionController) terminalizeExecutionTimeout(ctx context.Context, executionID string, elapsed time.Duration) (*types.Execution, error) {
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	reason := string(ErrorCategoryAgentTimeout)
+	errMessage := fmt.Sprintf("execution timeout after %v", elapsed)
+	now := time.Now().UTC()
+	updated, transitioned, err := c.writeTerminalExecution(persistCtx, executionID, terminalExecutionMutation{
+		status: string(types.ExecutionStatusTimeout), statusReason: &reason, errorMessage: &errMessage,
+		completedAt: now, durationMS: elapsed.Milliseconds(), compareDuration: true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !transitioned {
+		return updated, nil
+	}
+	c.updateWorkflowExecutionFinalState(persistCtx, executionID, types.ExecutionStatusTimeout, nil, elapsed, &errMessage)
+	c.updateWorkflowExecutionStatus(persistCtx, executionID, string(types.ExecutionStatusTimeout), &reason)
+	if updated.WebhookRegistered {
+		c.triggerWebhook(executionID)
+	}
+	c.publishExecutionEvent(updated, string(types.ExecutionStatusTimeout), map[string]interface{}{
+		"error": errMessage, "transition_source": "execution_deadline",
+	})
+	return updated, nil
+}
+
 // waitForExecutionCompletion waits for an execution to complete by subscribing to the event bus.
 // It returns the completed execution record or an error if the execution fails or times out.
 // This is used when agents return HTTP 202 (async acknowledgment) but the sync endpoint needs to wait for completion.
@@ -1468,7 +1530,14 @@ func (c *executionController) waitForExecutionCompletion(ctx context.Context, ex
 				Str("execution_id", executionID).
 				Dur("timeout", timeout).
 				Msg("execution completion timeout")
-			return nil, fmt.Errorf("execution timeout after %v", timeout)
+			updated, err := c.terminalizeExecutionTimeout(ctx, executionID, timeout)
+			if err != nil {
+				if current, lookupErr := c.store.GetExecutionRecord(context.WithoutCancel(ctx), executionID); lookupErr == nil && current != nil && types.IsTerminalExecutionStatus(current.Status) {
+					return current, nil
+				}
+				return nil, fmt.Errorf("terminalize execution timeout: %w", err)
+			}
+			return updated, nil
 
 		case event := <-eventChan:
 			// Only process events for this specific execution
@@ -1477,7 +1546,7 @@ func (c *executionController) waitForExecutionCompletion(ctx context.Context, ex
 			}
 
 			// Check if this is a terminal event
-			if event.Type == events.ExecutionCompleted || event.Type == events.ExecutionFailed {
+			if event.Type == events.ExecutionCompleted || event.Type == events.ExecutionFailed || event.Type == events.ExecutionCancelledEvent {
 				logger.Logger.Debug().
 					Str("execution_id", executionID).
 					Str("event_type", string(event.Type)).
@@ -1610,6 +1679,11 @@ func (c *executionController) prepareExecutionForTarget(ctx context.Context, tar
 	if req.Input == nil {
 		req.Input = map[string]interface{}{}
 	}
+	if req.Authority != nil {
+		if err := normalizeRunAuthorityRef(req.Authority); err != nil {
+			return nil, &callError{statusCode: http.StatusBadRequest, message: err.Error()}
+		}
+	}
 
 	var (
 		sanitizedWebhook *normalizedWebhookConfig
@@ -1712,6 +1786,7 @@ func (c *executionController) prepareExecutionForTarget(ctx context.Context, tar
 		CreatedAt:         now,
 		UpdatedAt:         now,
 	}
+	bindExecutionAuthority(exec, req.Authority)
 
 	agentPayload := make(map[string]interface{}, len(req.Input))
 	for key, value := range req.Input {
@@ -1733,6 +1808,12 @@ func (c *executionController) prepareExecutionForTarget(ctx context.Context, tar
 	}
 	if headers.actorID != nil {
 		exec.ActorID = headers.actorID
+	}
+	if req.Authority != nil {
+		preAdmission := &preparedExecution{exec: exec, runAuthority: req.Authority}
+		if err := c.verifyRunAuthority(ctx, preAdmission); err != nil {
+			return nil, err
+		}
 	}
 
 	authorityDuplicatePlan := func(existing *types.Execution) (*preparedExecution, error) {
@@ -1935,6 +2016,100 @@ func canonicalReplayPayload(raw []byte) (string, bool) {
 	return string(encoded), true
 }
 
+var errTerminalExecutionConflict = errors.New("execution terminal state conflict")
+
+type terminalExecutionMutation struct {
+	status           string
+	statusReason     *string
+	result           []byte
+	resultURI        *string
+	errorMessage     *string
+	completedAt      time.Time
+	durationMS       int64
+	compareDuration  bool
+	compareCompleted bool
+}
+
+func (c *executionController) writeTerminalExecution(ctx context.Context, executionID string, desired terminalExecutionMutation) (*types.Execution, bool, error) {
+	transitioned := false
+	updated, err := c.store.UpdateExecutionRecord(ctx, executionID, func(current *types.Execution) (*types.Execution, error) {
+		if current == nil {
+			return nil, fmt.Errorf("execution %s not found", executionID)
+		}
+		if types.IsTerminalExecutionStatus(current.Status) {
+			if terminalExecutionMatches(current, desired) {
+				return current, nil
+			}
+			return nil, fmt.Errorf("%w: execution %s is already %s", errTerminalExecutionConflict, executionID, current.Status)
+		}
+		if current.Status == types.ExecutionStatusWaiting {
+			return current, nil
+		}
+		if current.AuthorityRevokedAt != nil && desired.status != string(types.ExecutionStatusCancelled) {
+			return nil, ErrRunAuthorityRevoked
+		}
+		current.Status = desired.status
+		current.StatusReason = cloneStringPointer(desired.statusReason)
+		current.ResultPayload = cloneBytes(desired.result)
+		current.ResultURI = cloneStringPointer(desired.resultURI)
+		current.ErrorMessage = cloneStringPointer(desired.errorMessage)
+		completedAt := desired.completedAt.UTC()
+		current.CompletedAt = &completedAt
+		durationMS := desired.durationMS
+		current.DurationMS = &durationMS
+		transitioned = true
+		return current, nil
+	})
+	return updated, transitioned, err
+}
+
+func terminalExecutionMatches(current *types.Execution, desired terminalExecutionMutation) bool {
+	if current == nil || current.Status != desired.status || !sameOptionalString(current.StatusReason, desired.statusReason) ||
+		!sameOptionalString(current.ErrorMessage, desired.errorMessage) || !bytes.Equal(current.ResultPayload, desired.result) {
+		return false
+	}
+	if desired.compareDuration && (current.DurationMS == nil || *current.DurationMS != desired.durationMS) {
+		return false
+	}
+	if desired.compareCompleted && (current.CompletedAt == nil || !current.CompletedAt.Equal(desired.completedAt)) {
+		return false
+	}
+	return true
+}
+
+func cloneStringPointer(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func terminalCallbackMatches(current *types.Execution, status string, req executionStatusUpdateRequest, result []byte) bool {
+	if current == nil || current.Status != status {
+		return false
+	}
+	if req.StatusReason != nil && !sameOptionalString(current.StatusReason, req.StatusReason) {
+		return false
+	}
+	if len(result) > 0 && !bytes.Equal(current.ResultPayload, result) {
+		return false
+	}
+	if req.Error != "" && (current.ErrorMessage == nil || *current.ErrorMessage != req.Error) {
+		return false
+	}
+	if status == string(types.ExecutionStatusSucceeded) && current.ErrorMessage != nil {
+		return false
+	}
+	if req.DurationMS != nil && (current.DurationMS == nil || *current.DurationMS != *req.DurationMS) {
+		return false
+	}
+	if req.CompletedAt != nil && !req.CompletedAt.IsZero() && (current.CompletedAt == nil || !current.CompletedAt.Equal(req.CompletedAt.UTC())) {
+		return false
+	}
+	return true
+}
+
 func (c *executionController) completeReplayHit(ctx context.Context, plan *preparedExecution) error {
 	if plan == nil || plan.exec == nil || plan.replayHit == nil {
 		return fmt.Errorf("missing replay execution plan")
@@ -1945,22 +2120,15 @@ func (c *executionController) completeReplayHit(ctx context.Context, plan *prepa
 	result := cloneBytes(plan.replayHit.Result)
 	resultURI := c.savePayload(ctx, result)
 
-	updated, err := c.store.UpdateExecutionRecord(ctx, plan.exec.ExecutionID, func(current *types.Execution) (*types.Execution, error) {
-		if current == nil {
-			return nil, fmt.Errorf("execution %s not found", plan.exec.ExecutionID)
-		}
-		current.Status = types.ExecutionStatusSucceeded
-		current.StatusReason = &reason
-		current.ResultPayload = json.RawMessage(result)
-		current.ResultURI = resultURI
-		current.ErrorMessage = nil
-		current.CompletedAt = &now
-		current.DurationMS = &duration
-		current.UpdatedAt = now
-		return current, nil
+	updated, transitioned, err := c.writeTerminalExecution(ctx, plan.exec.ExecutionID, terminalExecutionMutation{
+		status: string(types.ExecutionStatusSucceeded), statusReason: &reason, result: result, resultURI: resultURI,
+		completedAt: now, durationMS: duration, compareDuration: true,
 	})
 	if err != nil {
 		return err
+	}
+	if !transitioned {
+		return nil
 	}
 
 	c.updateWorkflowExecutionFinalState(ctx, plan.exec.ExecutionID, types.ExecutionStatusSucceeded, result, 0, nil)
@@ -2038,6 +2206,7 @@ func (c *executionController) callAgent(ctx context.Context, plan *preparedExecu
 		req.Header.Set("X-AgentField-Authority-Home-ID", plan.runAuthority.HomeID)
 		req.Header.Set("X-AgentField-Authority-Run-ID", plan.runAuthority.RunID)
 		req.Header.Set("X-AgentField-Authority-Lease-Owner", plan.runAuthority.LeaseOwner)
+		req.Header.Set("X-AgentField-Authority-Attempt", strconv.Itoa(plan.runAuthority.Attempt))
 	}
 	if plan.exec.ParentExecutionID != nil {
 		req.Header.Set("X-Parent-Execution-ID", *plan.exec.ParentExecutionID)
@@ -2118,35 +2287,15 @@ func (c *executionController) completeExecution(ctx context.Context, plan *prepa
 	resultURI := c.savePayload(ctx, result)
 
 	var lastErr error
-	var alreadyCancelled bool
 	for attempt := 0; attempt < 5; attempt++ {
-		updated, err := c.store.UpdateExecutionRecord(ctx, plan.exec.ExecutionID, func(current *types.Execution) (*types.Execution, error) {
-			if current == nil {
-				return nil, fmt.Errorf("execution %s not found", plan.exec.ExecutionID)
-			}
-			// Guard: don't overwrite if already cancelled (e.g. by approval rejection webhook)
-			// or waiting for approval — the approval webhook handler manages the transition.
-			if current.Status == types.ExecutionStatusCancelled || current.Status == types.ExecutionStatusWaiting {
-				logger.Logger.Info().
-					Str("execution_id", plan.exec.ExecutionID).
-					Str("current_status", string(current.Status)).
-					Msg("skipping completion update; execution already cancelled or waiting for approval")
-				alreadyCancelled = true
-				return current, nil
-			}
-			now := time.Now().UTC()
-			current.Status = types.ExecutionStatusSucceeded
-			current.ResultPayload = json.RawMessage(result)
-			current.ErrorMessage = nil
-			current.CompletedAt = pointerTime(now)
-			duration := elapsed.Milliseconds()
-			current.DurationMS = &duration
-			current.UpdatedAt = now
-			current.ResultURI = resultURI
-			return current, nil
+		now := time.Now().UTC()
+		duration := elapsed.Milliseconds()
+		updated, transitioned, err := c.writeTerminalExecution(ctx, plan.exec.ExecutionID, terminalExecutionMutation{
+			status: string(types.ExecutionStatusSucceeded), result: result, resultURI: resultURI, completedAt: now,
+			durationMS: duration, compareDuration: true,
 		})
 		if err == nil {
-			if alreadyCancelled {
+			if !transitioned {
 				return nil
 			}
 			c.updateWorkflowExecutionFinalState(
@@ -2202,39 +2351,16 @@ func (c *executionController) failExecution(ctx context.Context, plan *preparedE
 	errMsg := callErr.Error()
 	resultURI := c.savePayload(ctx, result)
 	var lastErr error
-	var alreadyCancelled bool
+	categoryStr := string(category)
 	for attempt := 0; attempt < 5; attempt++ {
-		updated, err := c.store.UpdateExecutionRecord(ctx, plan.exec.ExecutionID, func(current *types.Execution) (*types.Execution, error) {
-			if current == nil {
-				return nil, fmt.Errorf("execution %s not found", plan.exec.ExecutionID)
-			}
-			// Guard: don't overwrite if already cancelled (e.g. by approval rejection webhook)
-			// or waiting for approval — the approval webhook handler manages the transition.
-			if current.Status == types.ExecutionStatusCancelled || current.Status == types.ExecutionStatusWaiting {
-				logger.Logger.Info().
-					Str("execution_id", plan.exec.ExecutionID).
-					Str("current_status", string(current.Status)).
-					Msg("skipping failure update; execution already cancelled or waiting for approval")
-				alreadyCancelled = true
-				return current, nil
-			}
-			now := time.Now().UTC()
-			current.Status = types.ExecutionStatusFailed
-			current.ErrorMessage = &errMsg
-			categoryStr := string(category)
-			current.StatusReason = &categoryStr
-			current.CompletedAt = pointerTime(now)
-			duration := elapsed.Milliseconds()
-			current.DurationMS = &duration
-			current.UpdatedAt = now
-			if len(result) > 0 {
-				current.ResultPayload = json.RawMessage(result)
-			}
-			current.ResultURI = resultURI
-			return current, nil
+		now := time.Now().UTC()
+		duration := elapsed.Milliseconds()
+		updated, transitioned, err := c.writeTerminalExecution(ctx, plan.exec.ExecutionID, terminalExecutionMutation{
+			status: string(types.ExecutionStatusFailed), statusReason: &categoryStr, result: result, resultURI: resultURI,
+			errorMessage: &errMsg, completedAt: now, durationMS: duration, compareDuration: true,
 		})
 		if err == nil {
-			if alreadyCancelled {
+			if !transitioned {
 				return nil
 			}
 			c.updateWorkflowExecutionFinalState(
@@ -2480,6 +2606,7 @@ func buildServerlessPayload(target *parsedTarget, exec *types.Execution, headers
 			"home_id":     authority.HomeID,
 			"run_id":      authority.RunID,
 			"lease_owner": authority.LeaseOwner,
+			"attempt":     authority.Attempt,
 		}
 	}
 

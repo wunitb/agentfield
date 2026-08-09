@@ -592,6 +592,9 @@ func initKnowledgeBase() *knowledgebase.KB {
 func (s *AgentFieldServer) Start() error {
 	// Setup routes
 	s.setupRoutes()
+	if err := handlers.RecoverRunAuthorityExecutions(context.Background(), s.storage, s.runAuthority, s.config.AgentField.ExecutionTimeout); err != nil {
+		return fmt.Errorf("recover run authority executions: %w", err)
+	}
 
 	// Start status manager service in background
 	go s.statusManager.Start()

@@ -291,6 +291,54 @@ func TestHandleSync_AsyncAcknowledgment(t *testing.T) {
 	require.Equal(t, int32(1), atomic.LoadInt32(&requestCount))
 }
 
+func TestHandleSyncAsyncAcknowledgmentCancelledIsNon2xx(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	agentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusAccepted) }))
+	defer agentServer.Close()
+	store := newTestExecutionStorage(&types.AgentNode{ID: "node-1", BaseURL: agentServer.URL, Reasoners: []types.ReasonerDefinition{{ID: "reasoner-a"}}})
+	router := gin.New()
+	router.POST("/execute/:target", ExecuteHandler(store, services.NewFilePayloadStore(t.TempDir()), nil, time.Second, ""))
+	request := httptest.NewRequest(http.MethodPost, "/execute/node-1.reasoner-a", strings.NewReader(`{"input":{}}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	done := make(chan struct{})
+	go func() { router.ServeHTTP(response, request); close(done) }()
+
+	var executionID string
+	deadline := time.Now().Add(time.Second)
+	for executionID == "" && time.Now().Before(deadline) {
+		records, _ := store.QueryExecutionRecords(context.Background(), types.ExecutionFilter{})
+		if len(records) > 0 { executionID = records[0].ExecutionID }
+		time.Sleep(time.Millisecond)
+	}
+	if executionID == "" { t.Fatal("execution record was not created") }
+	_, err := store.UpdateExecutionRecord(context.Background(), executionID, func(current *types.Execution) (*types.Execution, error) {
+		now := time.Now().UTC(); current.Status = types.ExecutionStatusCancelled; current.CompletedAt = &now; return current, nil
+	})
+	if err != nil { t.Fatal(err) }
+	store.GetExecutionEventBus().Publish(events.ExecutionEvent{Type: events.ExecutionCancelledEvent, ExecutionID: executionID, Status: string(types.ExecutionStatusCancelled)})
+	select { case <-done: case <-time.After(time.Second): t.Fatal("cancelled sync wait did not wake") }
+	if response.Code < 400 { t.Fatalf("cancelled sync execution returned %d: %s", response.Code, response.Body.String()) }
+}
+
+func TestHandleSyncAsyncAcknowledgmentTimeoutTerminalizes(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+	agentServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(http.StatusAccepted) }))
+	defer agentServer.Close()
+	store := newTestExecutionStorage(&types.AgentNode{ID: "node-1", BaseURL: agentServer.URL, Reasoners: []types.ReasonerDefinition{{ID: "reasoner-a"}}})
+	router := gin.New()
+	router.POST("/execute/:target", ExecuteHandler(store, services.NewFilePayloadStore(t.TempDir()), nil, 20*time.Millisecond, ""))
+	request := httptest.NewRequest(http.MethodPost, "/execute/node-1.reasoner-a", strings.NewReader(`{"input":{}}`))
+	request.Header.Set("Content-Type", "application/json")
+	response := httptest.NewRecorder()
+	router.ServeHTTP(response, request)
+	if response.Code != http.StatusGatewayTimeout { t.Fatalf("timeout returned %d: %s", response.Code, response.Body.String()) }
+	records, _ := store.QueryExecutionRecords(context.Background(), types.ExecutionFilter{})
+	if len(records) != 1 || records[0].Status != types.ExecutionStatusTimeout || records[0].CompletedAt == nil {
+		t.Fatalf("timeout was not terminalized: %+v", records)
+	}
+}
+
 func TestCallAgent_HTTP202Response(t *testing.T) {
 	gin.SetMode(gin.TestMode)
 

@@ -432,6 +432,15 @@ func (s *testExecutionStorage) QueryExecutionRecords(ctx context.Context, filter
 		if filter.RunID != nil && *filter.RunID != exec.RunID {
 			continue
 		}
+		if filter.Status != nil && *filter.Status != exec.Status {
+			continue
+		}
+		if filter.AuthorityBoundOnly && exec.AuthorityHomeID == nil {
+			continue
+		}
+		if filter.NonTerminalOnly && types.IsTerminalExecutionStatus(exec.Status) {
+			continue
+		}
 		copy := *exec
 		results = append(results, &copy)
 	}

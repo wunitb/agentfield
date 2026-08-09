@@ -34,13 +34,15 @@ type RunAuthorityRef struct {
 	HomeID     string `json:"home_id"`
 	RunID      string `json:"run_id"`
 	LeaseOwner string `json:"lease_owner"`
+	Attempt    int    `json:"attempt"`
 }
 
 // RunAuthorityVerifier admits and monitors executions against an outer control plane.
 type RunAuthorityVerifier struct {
 	baseURL         *url.URL
 	bearerToken     string
-	expectedHomeID  string
+	expectedHomeID     string
+	expectedRunnerType string
 	pollInterval    time.Duration
 	heartbeatMaxAge time.Duration
 	clockSkew       time.Duration
@@ -101,6 +103,10 @@ func NewRunAuthorityVerifier(cfg config.RunAuthorityConfig) (*RunAuthorityVerifi
 	if !runAuthorityHomeIDPattern.MatchString(homeID) {
 		return nil, errors.New("run authority expected_home_id must be a stable deployment identifier")
 	}
+	expectedRunnerType := strings.TrimSpace(cfg.ExpectedRunnerType)
+	if expectedRunnerType != "agentfield" {
+		return nil, errors.New("run authority expected_runner_type must be agentfield")
+	}
 	if cfg.RequestTimeout <= 0 || cfg.RequestTimeout > 30*time.Second {
 		return nil, errors.New("run authority request_timeout must be between 0 and 30s")
 	}
@@ -117,8 +123,9 @@ func NewRunAuthorityVerifier(cfg config.RunAuthorityConfig) (*RunAuthorityVerifi
 
 	return &RunAuthorityVerifier{
 		baseURL:         baseURL,
-		bearerToken:     token,
-		expectedHomeID:  homeID,
+		bearerToken:        token,
+		expectedHomeID:     homeID,
+		expectedRunnerType: expectedRunnerType,
 		pollInterval:    cfg.PollInterval,
 		heartbeatMaxAge: cfg.HeartbeatMaxAge,
 		clockSkew:       cfg.ClockSkew,
@@ -164,15 +171,28 @@ func (v *RunAuthorityVerifier) startMonitor(run func(context.Context)) {
 	}()
 }
 
+func normalizeRunAuthorityRef(ref *RunAuthorityRef) error {
+	if ref == nil {
+		return errors.New("run authority reference is required")
+	}
+	ref.HomeID = strings.TrimSpace(ref.HomeID)
+	ref.RunID = strings.TrimSpace(ref.RunID)
+	ref.LeaseOwner = strings.TrimSpace(ref.LeaseOwner)
+	if !runAuthorityHomeIDPattern.MatchString(ref.HomeID) || ref.RunID == "" || ref.LeaseOwner == "" || ref.Attempt < 1 {
+		return errors.New("run authority reference requires home_id, run_id, lease_owner, and a 1-based attempt")
+	}
+	return nil
+}
+
 // Verify performs one fail-closed admission check.
 func (v *RunAuthorityVerifier) Verify(ctx context.Context, ref RunAuthorityRef) error {
 	if v == nil {
 		return nil
 	}
-	ref.HomeID = strings.TrimSpace(ref.HomeID)
-	ref.RunID = strings.TrimSpace(ref.RunID)
-	ref.LeaseOwner = strings.TrimSpace(ref.LeaseOwner)
-	if ref.HomeID != v.expectedHomeID || ref.RunID == "" || ref.LeaseOwner == "" {
+	if err := normalizeRunAuthorityRef(&ref); err != nil {
+		return err
+	}
+	if ref.HomeID != v.expectedHomeID {
 		return errors.New("run authority reference does not match configured home identity")
 	}
 
@@ -239,11 +259,14 @@ func (v *RunAuthorityVerifier) monitor(ctx context.Context, ref RunAuthorityRef,
 }
 
 func (v *RunAuthorityVerifier) validateView(view runAuthorityView, ref RunAuthorityRef) error {
-	if view.SchemaVersion != runAuthoritySchemaVersion || view.HomeID != v.expectedHomeID || view.RunID != ref.RunID {
+	if view.SchemaVersion != runAuthoritySchemaVersion || view.HomeID != v.expectedHomeID || view.RunID != ref.RunID || view.Attempt != ref.Attempt {
 		return errors.New("run authority response identity mismatch")
 	}
 	if view.LeaseOwner == nil || *view.LeaseOwner != ref.LeaseOwner {
 		return errors.New("run authority lease owner mismatch")
+	}
+	if view.RunnerType != v.expectedRunnerType {
+		return errors.New("run authority runner type mismatch")
 	}
 	if view.Status != "running" || !view.EligibleForDispatch || len(view.ReasonCodes) != 0 {
 		return fmt.Errorf("run authority denied dispatch: status=%s reasons=%s", view.Status, strings.Join(view.ReasonCodes, ","))
@@ -319,14 +342,40 @@ func (c *executionController) monitorAcceptedRunAuthority(plan preparedExecution
 	})
 }
 
+// RecoverRunAuthorityExecutions rehydrates authority monitors for durable nonterminal work.
+func RecoverRunAuthorityExecutions(ctx context.Context, store ExecutionStore, authority *RunAuthorityVerifier, timeout time.Duration) error {
+	if authority == nil {
+		return nil
+	}
+	controller := newExecutionControllerWithRunAuthority(store, nil, nil, timeout, "", nil, authority)
+	records, err := store.QueryExecutionRecords(ctx, types.ExecutionFilter{AuthorityBoundOnly: true, NonTerminalOnly: true})
+	if err != nil {
+		return fmt.Errorf("query authority-bound executions for recovery: %w", err)
+	}
+	for _, record := range records {
+		ref, ok := executionAuthorityRef(record)
+		if !ok {
+			return fmt.Errorf("execution %s has an incomplete persisted authority binding", record.ExecutionID)
+		}
+		controller.monitorAcceptedRunAuthority(preparedExecution{exec: record, runAuthority: ref, executionMode: "recovery"})
+	}
+	return nil
+}
+
 func (c *executionController) runAcceptedAuthorityMonitor(parent context.Context, plan preparedExecution) {
-	monitorCtx, cancel := context.WithTimeout(parent, 24*time.Hour)
+	deadline := plan.exec.StartedAt.Add(c.timeout)
+	monitorCtx, cancel := context.WithDeadline(parent, deadline)
 	defer cancel()
 
 	guardedCtx, stop, err := c.runAuthority.Guard(monitorCtx, *plan.runAuthority)
 	if err != nil {
-		if cancelErr := c.cancelRevokedRunAuthority(monitorCtx, &plan, time.Since(plan.exec.StartedAt)); cancelErr != nil {
-			logger.Logger.Error().Err(cancelErr).Str("execution_id", plan.exec.ExecutionID).Msg("failed to persist accepted execution authority cancellation")
+		if errors.Is(monitorCtx.Err(), context.DeadlineExceeded) {
+			_, err = c.terminalizeExecutionTimeout(monitorCtx, plan.exec.ExecutionID, time.Since(plan.exec.StartedAt))
+		} else {
+			err = c.cancelRevokedRunAuthority(monitorCtx, &plan, time.Since(plan.exec.StartedAt))
+		}
+		if err != nil {
+			logger.Logger.Error().Err(err).Str("execution_id", plan.exec.ExecutionID).Msg("failed to reconcile accepted execution authority")
 		}
 		return
 	}
@@ -337,7 +386,14 @@ func (c *executionController) runAcceptedAuthorityMonitor(parent context.Context
 	for {
 		select {
 		case <-guardedCtx.Done():
-			_ = c.runAuthorityRevocationError(guardedCtx, &plan, time.Since(plan.exec.StartedAt))
+			elapsed := time.Since(plan.exec.StartedAt)
+			if errors.Is(context.Cause(guardedCtx), ErrRunAuthorityRevoked) {
+				_ = c.runAuthorityRevocationError(guardedCtx, &plan, elapsed)
+			} else if errors.Is(context.Cause(guardedCtx), context.DeadlineExceeded) {
+				if _, err := c.terminalizeExecutionTimeout(guardedCtx, plan.exec.ExecutionID, elapsed); err != nil && !errors.Is(err, ErrRunAuthorityRevoked) && !errors.Is(err, errTerminalExecutionConflict) {
+					logger.Logger.Error().Err(err).Str("execution_id", plan.exec.ExecutionID).Msg("failed to persist accepted execution timeout")
+				}
+			}
 			return
 		case <-statusTicker.C:
 			record, lookupErr := c.store.GetExecutionRecord(monitorCtx, plan.exec.ExecutionID)
@@ -380,10 +436,17 @@ func (c *executionController) cancelRevokedRunAuthority(ctx context.Context, pla
 		if current == nil {
 			return nil, fmt.Errorf("execution %s not found", executionID)
 		}
+		persisted, ok := executionAuthorityRef(current)
+		if !ok || plan.runAuthority == nil || *persisted != *plan.runAuthority {
+			return nil, errors.New("execution authority binding changed before revocation")
+		}
+		now := time.Now().UTC()
+		if current.AuthorityRevokedAt == nil {
+			current.AuthorityRevokedAt = &now
+		}
 		if types.IsTerminalExecutionStatus(current.Status) {
 			return current, nil
 		}
-		now := time.Now().UTC()
 		current.Status = types.ExecutionStatusCancelled
 		current.StatusReason = &reason
 		current.CompletedAt = &now
@@ -447,6 +510,10 @@ func (c *executionController) requiredRunAuthority(plan *preparedExecution) (*Ru
 	}
 	if plan.exec.RunID != plan.runAuthority.RunID {
 		return nil, runAuthorityAdmissionError(errors.New("execution run does not match outer run authority"))
+	}
+	persisted, ok := executionAuthorityRef(plan.exec)
+	if !ok || *persisted != *plan.runAuthority {
+		return nil, runAuthorityAdmissionError(errors.New("execution authority binding does not match persisted authority"))
 	}
 	return plan.runAuthority, nil
 }

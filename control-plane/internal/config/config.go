@@ -233,6 +233,7 @@ type RunAuthorityConfig struct {
 	BaseURL         string        `yaml:"base_url" mapstructure:"base_url"`
 	BearerToken     string        `yaml:"bearer_token" mapstructure:"bearer_token"`
 	ExpectedHomeID  string        `yaml:"expected_home_id" mapstructure:"expected_home_id"`
+	ExpectedRunnerType string      `yaml:"expected_runner_type" mapstructure:"expected_runner_type"`
 	RequestTimeout  time.Duration `yaml:"request_timeout" mapstructure:"request_timeout"`
 	PollInterval    time.Duration `yaml:"poll_interval" mapstructure:"poll_interval"`
 	HeartbeatMaxAge time.Duration `yaml:"heartbeat_max_age" mapstructure:"heartbeat_max_age"`
@@ -521,6 +522,9 @@ func ApplyDefaults(cfg *Config) {
 	if cfg.AgentField.ShutdownTimeout <= 0 {
 		cfg.AgentField.ShutdownTimeout = 30 * time.Second
 	}
+	if strings.TrimSpace(cfg.AgentField.RunAuthority.ExpectedRunnerType) == "" {
+		cfg.AgentField.RunAuthority.ExpectedRunnerType = "agentfield"
+	}
 	if cfg.AgentField.RunAuthority.RequestTimeout <= 0 {
 		cfg.AgentField.RunAuthority.RequestTimeout = 2 * time.Second
 	}
@@ -710,6 +714,9 @@ func ApplyEnvOverrides(cfg *Config) {
 	}
 	if val := os.Getenv("AGENTFIELD_RUN_AUTHORITY_EXPECTED_HOME_ID"); val != "" {
 		cfg.AgentField.RunAuthority.ExpectedHomeID = strings.TrimSpace(val)
+	}
+	if val := os.Getenv("AGENTFIELD_RUN_AUTHORITY_EXPECTED_RUNNER_TYPE"); val != "" {
+		cfg.AgentField.RunAuthority.ExpectedRunnerType = strings.TrimSpace(val)
 	}
 	if val := os.Getenv("AGENTFIELD_RUN_AUTHORITY_REQUEST_TIMEOUT"); val != "" {
 		if d, err := time.ParseDuration(val); err == nil {

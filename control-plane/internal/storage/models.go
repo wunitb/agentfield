@@ -22,6 +22,11 @@ type ExecutionRecordModel struct {
 	StartedAt         time.Time  `gorm:"column:started_at;not null;index"`
 	CompletedAt       *time.Time `gorm:"column:completed_at"`
 	DurationMS        *int64     `gorm:"column:duration_ms"`
+	AuthorityHomeID     *string    `gorm:"column:authority_home_id;index"`
+	AuthorityRunID      *string    `gorm:"column:authority_run_id"`
+	AuthorityLeaseOwner *string    `gorm:"column:authority_lease_owner"`
+	AuthorityAttempt    *int       `gorm:"column:authority_attempt"`
+	AuthorityRevokedAt  *time.Time `gorm:"column:authority_revoked_at"`
 	Notes             string     `gorm:"column:notes;default:'[]'"`
 	CreatedAt         time.Time  `gorm:"column:created_at;autoCreateTime"`
 	UpdatedAt         time.Time  `gorm:"column:updated_at;autoUpdateTime"`
