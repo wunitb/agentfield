@@ -88,7 +88,7 @@ var (
 	commitPattern     = regexp.MustCompile(`^[a-f0-9]{40}$`)
 	requestIDPattern  = regexp.MustCompile(`^[A-Za-z0-9_-]{1,128}$`)
 	defaultCredential = regexp.MustCompile(`(?i)(?:password|token|api[_-]?key)\s*[:=]\s*["']?(?:admin|password|changeme|secret|test|demo|example)(?:["'\s,]|$)`)
-	remotePipe        = regexp.MustCompile(`(?i)(?:curl|wget)[^|]{0,256}\|\s*(?:ba)?sh\b`)
+	remotePipe        = regexp.MustCompile(`(?i)(?:curl|wget)[^|]{0,256}\|&?\s*(?:ba)?sh\b`)
 	imageSetting      = regexp.MustCompile(`^\s*image:\s*([^\s#]+)`)
 	workflowUse       = regexp.MustCompile(`^\s*-?\s*uses:\s*([^\s#]+)`)
 )
@@ -392,6 +392,47 @@ func hasShellLineContinuation(line string) bool {
 	return trailingBackslashes%2 == 1
 }
 
+func hasTrailingShellOperator(line string) bool {
+	quote := byte(0)
+	escaped := false
+	for index := 0; index < len(line); index++ {
+		character := line[index]
+		if escaped {
+			escaped = false
+			continue
+		}
+		if quote == '\'' {
+			if character == quote {
+				quote = 0
+			}
+			continue
+		}
+		if character == '\\' {
+			escaped = true
+			continue
+		}
+		if quote == '"' {
+			if character == quote {
+				quote = 0
+			}
+			continue
+		}
+		if character == '\'' || character == '"' {
+			quote = character
+			continue
+		}
+		if character == '#' && (index == 0 || strings.ContainsRune(" \t;|&()", rune(line[index-1]))) {
+			line = line[:index]
+			break
+		}
+	}
+	if quote != 0 {
+		return false
+	}
+	line = strings.TrimRight(line, " \t")
+	return strings.HasSuffix(line, "|") || strings.HasSuffix(line, "|&") || strings.HasSuffix(line, "&&")
+}
+
 func scanSecurityFile(name string, contents string) ([]securityTriageFinding, error) {
 	findings := []securityTriageFinding{}
 	scanner := bufio.NewScanner(strings.NewReader(contents))
@@ -423,8 +464,9 @@ func scanSecurityFile(name string, contents string) ([]securityTriageFinding, er
 		if logicalStartLine == 0 {
 			logicalStartLine = lineNumber
 		}
-		continued := hasShellLineContinuation(line)
-		if continued {
+		backslashContinuation := hasShellLineContinuation(line)
+		continued := backslashContinuation || hasTrailingShellOperator(line)
+		if backslashContinuation {
 			line = line[:len(line)-1]
 		}
 		if logicalLine.Len()+len(line) > 1<<20 {

