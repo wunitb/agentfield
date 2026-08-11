@@ -282,7 +282,12 @@ func (a *Agent) startServer() error {
 	}
 
 	server := &http.Server{
-		Handler: a.Handler(),
+		Handler:           a.Handler(),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		IdleTimeout:       30 * time.Second,
+		MaxHeaderBytes:    16 << 10,
 	}
 	a.serverMu.Lock()
 	a.server = server

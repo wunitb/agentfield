@@ -29,6 +29,8 @@ import (
 
 type executionContextKey struct{}
 
+const maxExecutionRequestBytes int64 = 1 << 20
+
 // ExecutionContext captures the headers AgentField sends with each execution request.
 type ExecutionContext struct {
 	RunID             string
@@ -1162,8 +1164,13 @@ func (a *Agent) handleExecute(w http.ResponseWriter, r *http.Request) {
 	var payload map[string]any
 	if r.Body != nil {
 		defer r.Body.Close()
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil && !errors.Is(err, io.EOF) {
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxExecutionRequestBytes))
+		if err := decoder.Decode(&payload); err != nil && !errors.Is(err, io.EOF) {
 			http.Error(w, fmt.Sprintf("invalid JSON: %v", err), http.StatusBadRequest)
+			return
+		}
+		if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+			http.Error(w, "invalid JSON: trailing data", http.StatusBadRequest)
 			return
 		}
 	}
@@ -1382,8 +1389,13 @@ func (a *Agent) handleReasoner(w http.ResponseWriter, r *http.Request) {
 
 	defer r.Body.Close()
 	var input map[string]any
-	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxExecutionRequestBytes))
+	if err := decoder.Decode(&input); err != nil {
 		http.Error(w, fmt.Sprintf("invalid JSON: %v", err), http.StatusBadRequest)
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		http.Error(w, "invalid JSON: trailing data", http.StatusBadRequest)
 		return
 	}
 
@@ -1529,8 +1541,13 @@ func (a *Agent) handleSkill(w http.ResponseWriter, r *http.Request) {
 
 	defer r.Body.Close()
 	var input map[string]any
-	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxExecutionRequestBytes))
+	if err := decoder.Decode(&input); err != nil {
 		http.Error(w, fmt.Sprintf("invalid JSON: %v", err), http.StatusBadRequest)
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		http.Error(w, "invalid JSON: trailing data", http.StatusBadRequest)
 		return
 	}
 	if input == nil {

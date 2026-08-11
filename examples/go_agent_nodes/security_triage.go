@@ -3,6 +3,7 @@ package main
 import (
 	"archive/tar"
 	"bufio"
+	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -18,7 +19,7 @@ import (
 )
 
 const (
-	securityTriageArchivePath = "/input/control-room-source.tar"
+	securityTriageArchivePath = "/input/source.tar"
 	maxArchiveBytes           = 32 << 20
 	maxScannedFileBytes       = 2 << 20
 	maxScannedTotalBytes      = 64 << 20
@@ -26,12 +27,15 @@ const (
 	maxSecurityFindings       = 200
 )
 
+var securityTriageSourceCommit string
+
 type securityTriageTask struct {
-	SchemaVersion       string `json:"schemaVersion"`
-	RequestID           string `json:"requestId"`
-	Scope               string `json:"scope"`
-	SourceArchiveSHA256 string `json:"sourceArchiveSha256"`
-	SourceCommit        string `json:"sourceCommit"`
+	SchemaVersion            string `json:"schemaVersion"`
+	RequestID                string `json:"requestId"`
+	Scope                    string `json:"scope"`
+	SourceArchiveSHA256      string `json:"sourceArchiveSha256"`
+	SourceTreeManifestSHA256 string `json:"sourceTreeManifestSha256"`
+	SourceCommit             string `json:"sourceCommit"`
 }
 
 type securityTriageFinding struct {
@@ -50,17 +54,19 @@ type securityTriageSummary struct {
 }
 
 type securityTriageReport struct {
-	SchemaVersion       string                  `json:"schemaVersion"`
-	RuleSetVersion      string                  `json:"ruleSetVersion"`
-	RequestID           string                  `json:"requestId"`
-	Scope               string                  `json:"scope"`
-	SourceArchiveSHA256 string                  `json:"sourceArchiveSha256"`
-	SourceCommit        string                  `json:"sourceCommit"`
-	Status              string                  `json:"status"`
-	ScannedFiles        int                     `json:"scannedFiles"`
-	ScannedBytes        int64                   `json:"scannedBytes"`
-	Summary             securityTriageSummary   `json:"summary"`
-	Findings            []securityTriageFinding `json:"findings"`
+	SchemaVersion            string                  `json:"schemaVersion"`
+	RuleSetVersion           string                  `json:"ruleSetVersion"`
+	ScannerSourceCommit      string                  `json:"scannerSourceCommit"`
+	RequestID                string                  `json:"requestId"`
+	Scope                    string                  `json:"scope"`
+	SourceArchiveSHA256      string                  `json:"sourceArchiveSha256"`
+	SourceTreeManifestSHA256 string                  `json:"sourceTreeManifestSha256"`
+	SourceCommit             string                  `json:"sourceCommit"`
+	Status                   string                  `json:"status"`
+	ScannedFiles             int                     `json:"scannedFiles"`
+	ScannedBytes             int64                   `json:"scannedBytes"`
+	Summary                  securityTriageSummary   `json:"summary"`
+	Findings                 []securityTriageFinding `json:"findings"`
 }
 
 type securityRule struct {
@@ -68,6 +74,13 @@ type securityRule struct {
 	severity    string
 	description string
 	match       func(string, string) bool
+}
+
+type sourceTreeEntry struct {
+	mode string
+	oid  string
+	size int64
+	path string
 }
 
 var (
@@ -92,25 +105,25 @@ var securityRules = []securityRule{
 	{
 		id:          "DIRECT_OPENROUTER_EGRESS",
 		severity:    "high",
-		description: "executable source references OpenRouter directly instead of the mandated gateway",
-		match: func(name string, line string) bool {
-			return executableSource(name) && strings.Contains(strings.ToLower(line), "https://openrouter.ai/api/v1")
+		description: "tracked text references OpenRouter directly instead of the mandated gateway",
+		match: func(_ string, line string) bool {
+			return strings.Contains(strings.ToLower(line), "https://openrouter.ai/api/v1")
 		},
 	},
 	{
 		id:          "REMOTE_SCRIPT_PIPE",
 		severity:    "high",
-		description: "executable source pipes a remote download directly into a shell",
-		match: func(name string, line string) bool {
-			return executableSource(name) && remotePipe.MatchString(line)
+		description: "tracked text pipes a remote download directly into a shell",
+		match: func(_ string, line string) bool {
+			return remotePipe.MatchString(line)
 		},
 	},
 	{
 		id:          "DEFAULT_CREDENTIAL_LITERAL",
 		severity:    "high",
-		description: "executable source appears to assign a default or placeholder credential",
-		match: func(name string, line string) bool {
-			return executableSource(name) && defaultCredential.MatchString(line)
+		description: "tracked text appears to assign a default or placeholder credential",
+		match: func(_ string, line string) bool {
+			return defaultCredential.MatchString(line)
 		},
 	},
 	{
@@ -132,25 +145,24 @@ var securityRules = []securityRule{
 	{
 		id:          "MUTABLE_EXTERNAL_IMAGE",
 		severity:    "medium",
-		description: "container configuration references an external image without an immutable digest",
+		description: "container configuration references an image without an immutable digest",
 		match: func(name string, line string) bool {
-			if !executableSource(name) || !(strings.HasSuffix(name, ".yml") || strings.HasSuffix(name, ".yaml")) {
+			if !(strings.HasSuffix(name, ".yml") || strings.HasSuffix(name, ".yaml")) {
 				return false
 			}
 			match := imageSetting.FindStringSubmatch(line)
 			if len(match) != 2 {
 				return false
 			}
-			ref := strings.Trim(match[1], `"'`)
-			return !strings.Contains(ref, "${") && !strings.HasPrefix(ref, "bee-lab-") && !strings.Contains(ref, "@sha256:")
+			return !strings.Contains(strings.Trim(match[1], `"'`), "@sha256:")
 		},
 	},
 	{
 		id:          "WILDCARD_LISTEN_ADDRESS",
 		severity:    "medium",
-		description: "executable source contains a wildcard IPv4 listen address requiring trust-boundary review",
-		match: func(name string, line string) bool {
-			return executableSource(name) && strings.Contains(line, "0.0.0.0")
+		description: "tracked text contains a wildcard IPv4 listen address requiring trust-boundary review",
+		match: func(_ string, line string) bool {
+			return strings.Contains(line, "0.0.0.0")
 		},
 	},
 }
@@ -159,6 +171,9 @@ func runSecurityTriage(input map[string]any, archivePath string) (securityTriage
 	task, err := parseSecurityTriageTask(input)
 	if err != nil {
 		return securityTriageReport{}, err
+	}
+	if !commitPattern.MatchString(securityTriageSourceCommit) {
+		return securityTriageReport{}, errors.New("security triage scanner provenance unavailable")
 	}
 
 	archive, err := os.Open(archivePath)
@@ -185,16 +200,19 @@ func runSecurityTriage(input map[string]any, archivePath string) (securityTriage
 	}
 
 	report := securityTriageReport{
-		SchemaVersion:       "bee.security-triage-report.v1",
-		RuleSetVersion:      "bee.security-triage-rules.v1",
-		RequestID:           task.RequestID,
-		Scope:               task.Scope,
-		SourceArchiveSHA256: actualDigest,
-		SourceCommit:        task.SourceCommit,
-		Status:              "clean",
-		Findings:            []securityTriageFinding{},
+		SchemaVersion:            "bee.security-triage-report.v1",
+		RuleSetVersion:           "bee.security-triage-rules.v2",
+		ScannerSourceCommit:      securityTriageSourceCommit,
+		RequestID:                task.RequestID,
+		Scope:                    task.Scope,
+		SourceArchiveSHA256:      actualDigest,
+		SourceTreeManifestSHA256: task.SourceTreeManifestSHA256,
+		SourceCommit:             task.SourceCommit,
+		Status:                   "clean",
+		Findings:                 []securityTriageFinding{},
 	}
 	seen := make(map[string]struct{})
+	treeEntries := make([]sourceTreeEntry, 0)
 	reader := tar.NewReader(archive)
 	for {
 		header, err := reader.Next()
@@ -204,6 +222,23 @@ func runSecurityTriage(input map[string]any, archivePath string) (securityTriage
 		if err != nil {
 			return securityTriageReport{}, errors.New("security triage archive malformed")
 		}
+		if header.Typeflag == tar.TypeXGlobalHeader {
+			continue
+		}
+		if header.Typeflag == tar.TypeDir {
+			name, ok := safeArchivePath(strings.TrimSuffix(header.Name, "/"))
+			if !ok {
+				return securityTriageReport{}, errors.New("security triage archive path rejected")
+			}
+			if _, duplicate := seen[name]; duplicate {
+				return securityTriageReport{}, errors.New("security triage archive has duplicate paths")
+			}
+			seen[name] = struct{}{}
+			continue
+		}
+		if header.Typeflag != tar.TypeReg || header.Size < 0 || header.Size > maxScannedFileBytes {
+			return securityTriageReport{}, errors.New("security triage archive entry rejected")
+		}
 		name, ok := safeArchivePath(header.Name)
 		if !ok {
 			return securityTriageReport{}, errors.New("security triage archive path rejected")
@@ -212,12 +247,6 @@ func runSecurityTriage(input map[string]any, archivePath string) (securityTriage
 			return securityTriageReport{}, errors.New("security triage archive has duplicate paths")
 		}
 		seen[name] = struct{}{}
-		if header.Typeflag == tar.TypeDir {
-			continue
-		}
-		if header.Typeflag != tar.TypeReg || header.Size < 0 || header.Size > maxScannedFileBytes {
-			return securityTriageReport{}, errors.New("security triage archive entry rejected")
-		}
 		report.ScannedFiles++
 		report.ScannedBytes += header.Size
 		if report.ScannedFiles > maxScannedFiles || report.ScannedBytes > maxScannedTotalBytes {
@@ -227,14 +256,16 @@ func runSecurityTriage(input map[string]any, archivePath string) (securityTriage
 		if err != nil || int64(len(contents)) != header.Size {
 			return securityTriageReport{}, errors.New("security triage archive entry unreadable")
 		}
-		if !utf8.Valid(contents) {
-			continue
+		if !utf8.Valid(contents) || strings.IndexByte(string(contents), 0) >= 0 {
+			return securityTriageReport{}, errors.New("security triage archive entry is not text")
 		}
-		text := string(contents)
-		if strings.IndexByte(text, 0) >= 0 {
-			continue
-		}
-		findings, err := scanSecurityFile(name, text)
+		treeEntries = append(treeEntries, sourceTreeEntry{
+			mode: sourceTreeMode(header.Mode),
+			oid:  gitBlobSHA1(contents),
+			size: header.Size,
+			path: name,
+		})
+		findings, err := scanSecurityFile(name, string(contents))
 		if err != nil {
 			return securityTriageReport{}, err
 		}
@@ -245,6 +276,9 @@ func runSecurityTriage(input map[string]any, archivePath string) (securityTriage
 	}
 	if report.ScannedFiles == 0 {
 		return securityTriageReport{}, errors.New("security triage archive contains no files")
+	}
+	if sourceTreeManifestDigest(treeEntries) != task.SourceTreeManifestSHA256 {
+		return securityTriageReport{}, errors.New("security triage source tree manifest mismatch")
 	}
 
 	sort.Slice(report.Findings, func(i, j int) bool {
@@ -294,14 +328,14 @@ func parseSecurityTriageTask(input map[string]any) (securityTriageTask, error) {
 	}
 	if task.SchemaVersion != "bee.security-triage-task.v1" || task.Scope != "tracked-source" ||
 		!requestIDPattern.MatchString(task.RequestID) || !sha256RefPattern.MatchString(task.SourceArchiveSHA256) ||
-		!commitPattern.MatchString(task.SourceCommit) {
+		!sha256RefPattern.MatchString(task.SourceTreeManifestSHA256) || !commitPattern.MatchString(task.SourceCommit) {
 		return securityTriageTask{}, errors.New("security triage task rejected")
 	}
 	return task, nil
 }
 
 func safeArchivePath(name string) (string, bool) {
-	if name == "" || len(name) > 512 || strings.ContainsRune(name, '\x00') || strings.HasPrefix(name, "/") {
+	if name == "" || len(name) > 512 || !utf8.ValidString(name) || strings.ContainsRune(name, '\x00') || strings.HasPrefix(name, "/") {
 		return "", false
 	}
 	cleaned := pathpkg.Clean(name)
@@ -311,12 +345,27 @@ func safeArchivePath(name string) (string, bool) {
 	return cleaned, true
 }
 
-func executableSource(name string) bool {
-	if strings.HasPrefix(name, "docs/") || strings.HasPrefix(name, "tests/") || strings.HasPrefix(name, "vendor/") ||
-		strings.HasSuffix(name, ".md") || strings.Contains(name, ".example") {
-		return false
+func gitBlobSHA1(contents []byte) string {
+	digest := sha1.New()
+	_, _ = fmt.Fprintf(digest, "blob %d\x00", len(contents))
+	_, _ = digest.Write(contents)
+	return hex.EncodeToString(digest.Sum(nil))
+}
+
+func sourceTreeMode(mode int64) string {
+	if mode&0o111 != 0 {
+		return "100755"
 	}
-	return true
+	return "100644"
+}
+
+func sourceTreeManifestDigest(entries []sourceTreeEntry) string {
+	sort.Slice(entries, func(i, j int) bool { return entries[i].path < entries[j].path })
+	digest := sha256.New()
+	for _, entry := range entries {
+		_, _ = fmt.Fprintf(digest, "%s blob %s %d\t%s\x00", entry.mode, entry.oid, entry.size, entry.path)
+	}
+	return "sha256:" + hex.EncodeToString(digest.Sum(nil))
 }
 
 func scanSecurityFile(name string, contents string) ([]securityTriageFinding, error) {
