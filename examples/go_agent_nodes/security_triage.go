@@ -3,6 +3,7 @@ package main
 import (
 	"archive/tar"
 	"bufio"
+	"bytes"
 	"crypto/sha1"
 	"crypto/sha256"
 	"encoding/hex"
@@ -201,7 +202,7 @@ func runSecurityTriage(input map[string]any, archivePath string) (securityTriage
 
 	report := securityTriageReport{
 		SchemaVersion:            "bee.security-triage-report.v1",
-		RuleSetVersion:           "bee.security-triage-rules.v2",
+		RuleSetVersion:           "bee.security-triage-rules.v3",
 		ScannerSourceCommit:      securityTriageSourceCommit,
 		RequestID:                task.RequestID,
 		Scope:                    task.Scope,
@@ -258,8 +259,8 @@ func runSecurityTriage(input map[string]any, archivePath string) (securityTriage
 		if err != nil || int64(len(contents)) != header.Size {
 			return securityTriageReport{}, errors.New("security triage archive entry unreadable")
 		}
-		if !utf8.Valid(contents) || strings.IndexByte(string(contents), 0) >= 0 {
-			return securityTriageReport{}, errors.New("security triage archive entry is not text")
+		if !utf8.Valid(contents) || bytes.IndexByte(contents, 0) >= 0 {
+			return securityTriageReport{}, fmt.Errorf("security triage archive entry is not text: %s", name)
 		}
 		treeEntries = append(treeEntries, sourceTreeEntry{
 			mode: sourceTreeMode(header.Mode),
@@ -392,7 +393,7 @@ func hasShellLineContinuation(line string) bool {
 	return trailingBackslashes%2 == 1
 }
 
-func hasTrailingShellOperator(line string) bool {
+func normalizeShellLine(line string) (string, bool) {
 	quote := byte(0)
 	escaped := false
 	for index := 0; index < len(line); index++ {
@@ -427,10 +428,21 @@ func hasTrailingShellOperator(line string) bool {
 		}
 	}
 	if quote != 0 {
-		return false
+		return line, false
 	}
 	line = strings.TrimRight(line, " \t")
-	return strings.HasSuffix(line, "|") || strings.HasSuffix(line, "|&") || strings.HasSuffix(line, "&&")
+	return line, strings.HasSuffix(line, "|") || strings.HasSuffix(line, "|&") || strings.HasSuffix(line, "&&")
+}
+
+func hasShellLineSemantics(name string) bool {
+	base := pathpkg.Base(name)
+	extension := strings.ToLower(pathpkg.Ext(base))
+	switch extension {
+	case "", ".bash", ".ksh", ".mk", ".sh", ".yaml", ".yml", ".zsh":
+		return true
+	default:
+		return base == "Makefile" || base == "GNUmakefile" || strings.HasPrefix(base, "Dockerfile")
+	}
 }
 
 func scanSecurityFile(name string, contents string) ([]securityTriageFinding, error) {
@@ -439,6 +451,8 @@ func scanSecurityFile(name string, contents string) ([]securityTriageFinding, er
 	scanner.Buffer(make([]byte, 64*1024), 1<<20)
 	var logicalLine strings.Builder
 	logicalStartLine := 0
+	shellLineSemantics := hasShellLineSemantics(name)
+	pendingShellOperator := false
 	lineNumber := 0
 
 	scanLogicalLine := func() {
@@ -464,13 +478,25 @@ func scanSecurityFile(name string, contents string) ([]securityTriageFinding, er
 		if logicalStartLine == 0 {
 			logicalStartLine = lineNumber
 		}
-		backslashContinuation := hasShellLineContinuation(line)
-		continued := backslashContinuation || hasTrailingShellOperator(line)
+		operatorContinuation := false
+		if shellLineSemantics {
+			line, operatorContinuation = normalizeShellLine(line)
+		}
+		backslashContinuation := shellLineSemantics && hasShellLineContinuation(line)
 		if backslashContinuation {
 			line = line[:len(line)-1]
 		}
+		blankShellLine := shellLineSemantics && strings.TrimSpace(line) == ""
+		continued := backslashContinuation || operatorContinuation || (pendingShellOperator && blankShellLine)
+		switch {
+		case operatorContinuation:
+			pendingShellOperator = true
+		case pendingShellOperator && blankShellLine:
+		default:
+			pendingShellOperator = false
+		}
 		if logicalLine.Len()+len(line) > 1<<20 {
-			return nil, errors.New("security triage logical line rejected")
+			return nil, fmt.Errorf("security triage logical line rejected: %s", name)
 		}
 		_, _ = logicalLine.WriteString(line)
 		if !continued {

