@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -64,7 +65,7 @@ func TestSecurityTriageAcceptsRealGitArchiveLayout(t *testing.T) {
 
 func TestSecurityTriageFailsClosedOnTreeOrTaskMutation(t *testing.T) {
 	entry := testArchiveEntry{name: "src/index.ts", contents: []byte("export const ok = true\n"), mode: 0o644}
-	archive, archiveDigest, manifestDigest := writeTestArchive(t, []testArchiveEntry{entry}, false)
+	archive, archiveDigest, manifestDigest := writeTestArchive(t, []testArchiveEntry{entry}, true)
 	_, err := runTestTriage(archive, archiveDigest, "sha256:"+strings.Repeat("f", 64))
 	if err == nil || !strings.Contains(err.Error(), "manifest mismatch") {
 		t.Fatalf("expected manifest mismatch, got %v", err)
@@ -97,24 +98,46 @@ func TestSecurityTriageRejectsUnsafeOrUnscannableEntries(t *testing.T) {
 		})
 	}
 
-	archive := filepath.Join(t.TempDir(), "symlink.tar")
-	file, err := os.Create(archive)
-	if err != nil {
-		t.Fatal(err)
-	}
-	writer := tar.NewWriter(file)
-	if err := writer.WriteHeader(&tar.Header{Name: "escape", Typeflag: tar.TypeSymlink, Linkname: "../../etc/passwd"}); err != nil {
-		t.Fatal(err)
-	}
-	if err := writer.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if err := file.Close(); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := runTestTriage(archive, fileSHA256(t, archive), "sha256:"+strings.Repeat("a", 64)); err == nil {
-		t.Fatal("expected symlink entry to fail")
-	}
+	t.Run("untracked symlink beside expected file", func(t *testing.T) {
+		archive := filepath.Join(t.TempDir(), "symlink.tar")
+		file, err := os.Create(archive)
+		if err != nil {
+			t.Fatal(err)
+		}
+		writer := tar.NewWriter(file)
+		if err := writer.WriteHeader(&tar.Header{Name: "escape", Typeflag: tar.TypeSymlink, Linkname: "../../etc/passwd"}); err != nil {
+			t.Fatal(err)
+		}
+		contents := []byte("export const ok = true\n")
+		if err := writer.WriteHeader(&tar.Header{Name: "src/index.ts", Typeflag: tar.TypeReg, Mode: 0o644, Size: int64(len(contents))}); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := writer.Write(contents); err != nil {
+			t.Fatal(err)
+		}
+		if err := writer.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := file.Close(); err != nil {
+			t.Fatal(err)
+		}
+		manifest := sourceTreeManifestDigest([]sourceTreeEntry{{
+			mode: "100644", oid: gitBlobSHA1(contents), size: int64(len(contents)), path: "src/index.ts",
+		}})
+		if _, err := runTestTriage(archive, fileSHA256(t, archive), manifest); err == nil {
+			t.Fatal("expected untracked symlink entry to fail")
+		}
+	})
+
+	t.Run("untracked directory beside expected file", func(t *testing.T) {
+		entries := []testArchiveEntry{{name: "src/index.ts", contents: []byte("export const ok = true\n"), mode: 0o644}}
+		archive, archiveDigest, manifestDigest := writeTestArchive(t, entries, true)
+		appendUntrackedDirectory(t, archive, "untracked/")
+		if _, err := runTestTriage(archive, fileSHA256(t, archive), manifestDigest); err == nil ||
+			!strings.Contains(err.Error(), "directory set mismatch") {
+			t.Fatalf("expected untracked directory to fail, got %v (original digest %s)", err, archiveDigest)
+		}
+	})
 }
 
 func TestSecurityTriageRulesCoverDynamicImagesAndTrackedText(t *testing.T) {
@@ -165,8 +188,21 @@ func writeTestArchive(t *testing.T, entries []testArchiveEntry, directories bool
 	}
 	writer := tar.NewWriter(file)
 	if directories {
-		if err := writer.WriteHeader(&tar.Header{Name: "src/", Typeflag: tar.TypeDir, Mode: 0o755}); err != nil {
-			t.Fatal(err)
+		directorySet := make(map[string]struct{})
+		for _, entry := range entries {
+			for directory := filepath.ToSlash(filepath.Dir(entry.name)); directory != "."; directory = filepath.ToSlash(filepath.Dir(directory)) {
+				directorySet[directory] = struct{}{}
+			}
+		}
+		directoryNames := make([]string, 0, len(directorySet))
+		for directory := range directorySet {
+			directoryNames = append(directoryNames, directory)
+		}
+		sort.Strings(directoryNames)
+		for _, directory := range directoryNames {
+			if err := writer.WriteHeader(&tar.Header{Name: directory + "/", Typeflag: tar.TypeDir, Mode: 0o755}); err != nil {
+				t.Fatal(err)
+			}
 		}
 	}
 	treeEntries := make([]sourceTreeEntry, 0, len(entries))
@@ -190,6 +226,34 @@ func writeTestArchive(t *testing.T, entries []testArchiveEntry, directories bool
 		t.Fatal(err)
 	}
 	return archive, fileSHA256(t, archive), sourceTreeManifestDigest(treeEntries)
+}
+
+func appendUntrackedDirectory(t *testing.T, archivePath, name string) {
+	t.Helper()
+	contents, err := os.ReadFile(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for len(contents) >= 1024 && string(contents[len(contents)-1024:]) == strings.Repeat("\x00", 1024) {
+		contents = contents[:len(contents)-1024]
+	}
+	file, err := os.Create(archivePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.Write(contents); err != nil {
+		t.Fatal(err)
+	}
+	writer := tar.NewWriter(file)
+	if err := writer.WriteHeader(&tar.Header{Name: name, Typeflag: tar.TypeDir, Mode: 0o755}); err != nil {
+		t.Fatal(err)
+	}
+	if err := writer.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := file.Close(); err != nil {
+		t.Fatal(err)
+	}
 }
 
 func readArchiveTreeEntries(t *testing.T, archivePath string) []sourceTreeEntry {

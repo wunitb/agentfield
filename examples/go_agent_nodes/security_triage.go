@@ -212,6 +212,7 @@ func runSecurityTriage(input map[string]any, archivePath string) (securityTriage
 		Findings:                 []securityTriageFinding{},
 	}
 	seen := make(map[string]struct{})
+	directories := make(map[string]struct{})
 	treeEntries := make([]sourceTreeEntry, 0)
 	reader := tar.NewReader(archive)
 	for {
@@ -234,6 +235,7 @@ func runSecurityTriage(input map[string]any, archivePath string) (securityTriage
 				return securityTriageReport{}, errors.New("security triage archive has duplicate paths")
 			}
 			seen[name] = struct{}{}
+			directories[name] = struct{}{}
 			continue
 		}
 		if header.Typeflag != tar.TypeReg || header.Size < 0 || header.Size > maxScannedFileBytes {
@@ -276,6 +278,20 @@ func runSecurityTriage(input map[string]any, archivePath string) (securityTriage
 	}
 	if report.ScannedFiles == 0 {
 		return securityTriageReport{}, errors.New("security triage archive contains no files")
+	}
+	expectedDirectories := make(map[string]struct{})
+	for _, entry := range treeEntries {
+		for directory := pathpkg.Dir(entry.path); directory != "."; directory = pathpkg.Dir(directory) {
+			expectedDirectories[directory] = struct{}{}
+		}
+	}
+	if len(directories) != len(expectedDirectories) {
+		return securityTriageReport{}, errors.New("security triage archive directory set mismatch")
+	}
+	for directory := range directories {
+		if _, expected := expectedDirectories[directory]; !expected {
+			return securityTriageReport{}, errors.New("security triage archive directory set mismatch")
+		}
 	}
 	if sourceTreeManifestDigest(treeEntries) != task.SourceTreeManifestSHA256 {
 		return securityTriageReport{}, errors.New("security triage source tree manifest mismatch")
