@@ -23,6 +23,10 @@ _litellm = None
 _openai = None
 
 
+class _EmptyReasoningStructuredOutput(ValueError):
+    pass
+
+
 def _get_litellm():
     """Lazy import of litellm - only loads when AI features are used."""
     global _litellm
@@ -39,6 +43,61 @@ def _get_litellm():
 
             _litellm = _LiteLLMStub()
     return _litellm
+
+
+def _get_message_reasoning_content(response: Any) -> Optional[Any]:
+    """Return provider reasoning metadata when it is present on the message."""
+    try:
+        message = response.choices[0].message
+    except (AttributeError, IndexError, TypeError):
+        return None
+    return getattr(message, "reasoning_content", None)
+
+
+def _has_non_empty_reasoning_content(response: Any) -> bool:
+    reasoning_content = _get_message_reasoning_content(response)
+    if reasoning_content is None:
+        return False
+    if isinstance(reasoning_content, str):
+        return bool(reasoning_content.strip())
+    return bool(reasoning_content)
+
+
+def _is_empty_structured_result(parsed: BaseModel) -> bool:
+    """
+    Treat {} or values equal to schema defaults as empty structured output.
+    """
+    if not isinstance(parsed, BaseModel):
+        return False
+
+    explicitly_set = getattr(parsed, "model_fields_set", set())
+    if not explicitly_set:
+        return True
+
+    try:
+        return parsed == parsed.__class__()
+    except Exception:
+        return False
+
+
+def _increase_retry_max_tokens(params: Dict[str, Any]) -> None:
+    current = params.get("max_tokens")
+    if current is None:
+        params.pop("max_tokens", None)
+        return
+    if isinstance(current, int) and current > 0:
+        params["max_tokens"] = current * 2
+
+
+def _raise_if_empty_reasoning_structured_output(
+    response: Any, parsed: BaseModel
+) -> None:
+    if _has_non_empty_reasoning_content(response) and _is_empty_structured_result(
+        parsed
+    ):
+        raise _EmptyReasoningStructuredOutput(
+            "Empty structured response after non-empty reasoning_content"
+        )
 
 
 def _reset_litellm_http_clients(litellm_module: Any) -> None:
@@ -104,6 +163,123 @@ def _reset_litellm_http_clients(litellm_module: Any) -> None:
         log_debug(f"litellm client reset failed: {exc}")
 
 
+_AI_TIMEOUT_RETRIES_DEFAULT = 2
+
+
+def _resolve_timeout_retries() -> int:
+    """How many times to retry an LLM call that hit the wall-clock safety-net
+    timeout. Precedence: env ``AGENTFIELD_AI_TIMEOUT_RETRIES``, then default (2).
+    These timeouts are usually a stalled connection rather than the model
+    genuinely needing the full window, so a retry on a fresh pool usually
+    succeeds. Set to 0 to disable."""
+    raw = os.environ.get("AGENTFIELD_AI_TIMEOUT_RETRIES")
+    if raw is not None:
+        try:
+            n = int(raw)
+            return n if n >= 0 else 0
+        except ValueError:
+            pass
+    return _AI_TIMEOUT_RETRIES_DEFAULT
+
+
+_PERMANENT_LLM_ERROR_MARKERS = (
+    "invalid_request_error",
+    "not supported",
+    "authentication",
+    "unauthorized",
+    "invalid api key",
+    "permission",
+    "no such model",
+    "model_not_found",
+    "context_length",
+    "maximum context",
+)
+_TRANSIENT_LLM_ERROR_MARKERS = (
+    "unable to get json response",
+    "internal server error",
+    "internalservererror",
+    "service unavailable",
+    "serviceunavailable",
+    "overloaded",
+    "bad gateway",
+    "gateway timeout",
+    "connection",
+    "econnreset",
+    "temporarily",
+    "try again",
+    "provider returned error",
+)
+
+
+def _is_transient_llm_error(exc: Exception) -> bool:
+    """Whether an LLM-call exception is a transient provider glitch worth
+    retrying (a malformed/garbage response, a 5xx, a dropped connection) versus
+    a permanent client error (bad request, auth, model-not-found, schema) that a
+    retry can never fix. Conservative: a clear permanent marker always wins."""
+    code = getattr(exc, "status_code", None)
+    if code is None:
+        resp = getattr(exc, "response", None)
+        code = getattr(resp, "status_code", None)
+    msg = str(exc).lower()
+    if any(p in msg for p in _PERMANENT_LLM_ERROR_MARKERS):
+        return False
+    if isinstance(code, int):
+        if code in (408, 409, 425, 429) or code >= 500:
+            return True
+        if 400 <= code < 500:
+            return False
+    return any(t in msg for t in _TRANSIENT_LLM_ERROR_MARKERS)
+
+
+async def _acompletion_with_timeout_retry(
+    litellm_module: Any, params: Dict[str, Any], timeout: float
+) -> Any:
+    """Run ``litellm.acompletion`` under an asyncio.wait_for safety net, retrying
+    on timeout AND on transient provider errors (malformed response, 5xx, dropped
+    connection). On each retry the cached HTTP clients are reset so the next
+    attempt opens a fresh connection pool. Permanent client errors (bad request,
+    auth, model-not-found) are NOT retried. Raises after the retries are
+    exhausted."""
+    retries = _resolve_timeout_retries()
+    for attempt in range(retries + 1):
+        try:
+            return await asyncio.wait_for(
+                litellm_module.acompletion(**params), timeout=timeout
+            )
+        except asyncio.TimeoutError:
+            model_name = params.get("model", "unknown")
+            # Reset litellm's cached HTTP clients so the next call gets a fresh
+            # connection pool — the previous client likely holds a stuck
+            # connection that would hang forever.
+            _reset_litellm_http_clients(litellm_module)
+            if attempt < retries:
+                log_warn(
+                    f"LLM call to {model_name} timed out after {timeout}s; "
+                    f"retry {attempt + 1}/{retries} on a fresh connection pool"
+                )
+                await asyncio.sleep(min(2.0 * (attempt + 1), 8.0))
+                continue
+            raise TimeoutError(
+                f"LLM call to {model_name} timed out after {timeout}s "
+                f"(asyncio safety net) after {retries} retries"
+            )
+        except Exception as exc:
+            # Transient provider glitch (malformed/garbage response, 5xx, dropped
+            # connection): retry on a fresh pool. Permanent client errors (bad
+            # request, auth, model-not-found) propagate immediately.
+            if attempt < retries and _is_transient_llm_error(exc):
+                model_name = params.get("model", "unknown")
+                _reset_litellm_http_clients(litellm_module)
+                log_warn(
+                    f"LLM call to {model_name} hit a transient error "
+                    f"({type(exc).__name__}: {str(exc)[:80]}); retry "
+                    f"{attempt + 1}/{retries} on a fresh connection pool"
+                )
+                await asyncio.sleep(min(2.0 * (attempt + 1), 8.0))
+                continue
+            raise
+
+
 def _get_openai():
     """Lazy import of openai - only loads when AI features are used."""
     global _openai
@@ -140,6 +316,42 @@ litellm = _LazyModule(_get_litellm)
 openai = _LazyModule(_get_openai)
 
 
+def _strictify_openai_schema(schema: Any) -> Any:
+    """Make a Pydantic-generated JSON schema satisfy OpenAI's strict
+    structured-output rules.
+
+    OpenAI's ``response_format`` with ``strict: True`` requires every object to
+    (a) set ``additionalProperties: false`` and (b) list ALL of its properties in
+    ``required``. Pydantic's ``model_json_schema()`` emits neither, so OpenAI
+    rejects the request with::
+
+        BadRequestError: Invalid schema ... 'additionalProperties' is required
+        to be supplied and to be false.
+
+    This walks the entire schema — including ``$defs``/``definitions`` and nested
+    ``properties``/``items``/``anyOf`` — and returns a corrected copy. Forcing
+    every property into ``required`` is OpenAI's documented requirement for strict
+    mode (truly-optional fields should be modelled as nullable); it never makes a
+    previously-valid schema invalid.
+    """
+
+    def walk(node: Any) -> Any:
+        if isinstance(node, dict):
+            node = {key: walk(value) for key, value in node.items()}
+            props = node.get("properties")
+            if isinstance(props, dict) and (
+                node.get("type") == "object" or "type" not in node
+            ):
+                node["additionalProperties"] = False
+                node["required"] = list(props.keys())
+            return node
+        if isinstance(node, list):
+            return [walk(item) for item in node]
+        return node
+
+    return walk(schema)
+
+
 class AgentAI:
     """AI/LLM Integration functionality for AgentField Agent"""
 
@@ -154,6 +366,7 @@ class AgentAI:
         self._initialization_complete = False
         self._rate_limiter = None
         self._fal_provider_instance = None
+        self._minimax_provider_instance = None
         self._openrouter_provider_instance = None
         self._media_router_instance = None
 
@@ -188,12 +401,27 @@ class AgentAI:
         return self._openrouter_provider_instance
 
     @property
+    def _minimax_provider(self):
+        """Lazy-initialized MiniMax media provider."""
+        if self._minimax_provider_instance is None:
+            from agentfield.media_providers import MiniMaxProvider
+
+            config = self.agent.ai_config
+            api_key = getattr(config, "minimax_api_key", None)
+            base_url = getattr(config, "minimax_base_url", None)
+            self._minimax_provider_instance = MiniMaxProvider(
+                api_key=api_key if isinstance(api_key, str) else None,
+                base_url=base_url if isinstance(base_url, str) else None,
+            )
+        return self._minimax_provider_instance
+
+    @property
     def _media_router(self):
         """
         Lazy-initialized MediaRouter for prefix-based provider dispatch.
 
         Returns:
-            MediaRouter: Configured router with fal, openrouter, and litellm providers
+            MediaRouter: Configured router with registered media providers
         """
         if self._media_router_instance is None:
             from agentfield.media_providers import LiteLLMProvider
@@ -202,6 +430,7 @@ class AgentAI:
             router = MediaRouter()
             router.register("fal-ai/", self._fal_provider)
             router.register("fal/", self._fal_provider)
+            router.register("minimax/", self._minimax_provider)
             router.register("openrouter/", self._openrouter_provider)
             router.register("", LiteLLMProvider())  # catch-all fallback
             self._media_router_instance = router
@@ -277,6 +506,7 @@ class AgentAI:
         ] = None,
         max_turns: Optional[int] = None,
         max_tool_calls: Optional[int] = None,
+        timeout: Optional[float] = None,
         **kwargs,
     ) -> Any:
         """
@@ -311,6 +541,7 @@ class AgentAI:
                 - ToolCallConfig or dict: discover with filtering/progressive options
             max_turns (int, optional): Maximum LLM turns in the tool-call loop (default: 10).
             max_tool_calls (int, optional): Maximum total tool calls allowed (default: 25).
+            timeout (float, optional): Per-call timeout in seconds. Overrides agent's async_config.llm_call_timeout for this call only.
             **kwargs: Additional provider-specific parameters to pass to the LLM.
 
         Returns:
@@ -491,16 +722,34 @@ class AgentAI:
         if safe_input_limit < 1000:
             safe_input_limit = 1000
 
-        # Count actual prompt tokens using LiteLLM's token counter
+        def has_untrimmable_media(messages_to_check: List[dict]) -> bool:
+            for message in messages_to_check:
+                content = message.get("content")
+                if not isinstance(content, list):
+                    continue
+                for part in content:
+                    if isinstance(part, dict) and part.get("type") in {
+                        "input_audio",
+                        "file",
+                    }:
+                        return True
+            return False
+
+        skip_trimming = has_untrimmable_media(messages)
+
+        # Count actual prompt tokens using LiteLLM's token counter. LiteLLM's
+        # trimming utilities do not currently handle all media parts and can
+        # dump base64 payloads in their error logs, so media payloads pass
+        # through unchanged.
         try:
-            actual_prompt_tokens = token_counter(
-                model=final_config.model, messages=messages
+            actual_prompt_tokens = (
+                0
+                if skip_trimming
+                else token_counter(model=final_config.model, messages=messages)
             )
         except Exception as e:
-            log_debug(f"Could not count prompt tokens, proceeding with trimming: {e}")
-            actual_prompt_tokens = (
-                safe_input_limit + 1
-            )  # Force trimming if we can't count
+            log_debug(f"Could not count prompt tokens; skipping trimming: {e}")
+            actual_prompt_tokens = 0
 
         # Only trim if necessary based on actual token count
         if actual_prompt_tokens > safe_input_limit:
@@ -531,10 +780,15 @@ class AgentAI:
         # then grab the stale pooled connection and hang forever — a silent
         # deadlock that py-spy reveals as 'all worker threads idle'.
         # litellm forwards `timeout` to httpx as a request-level timeout.
-        _litellm_call_timeout = getattr(
-            self.agent.async_config, "llm_call_timeout", 120.0
+        # Per-call `timeout` kwarg overrides the agent-wide async_config default.
+        if timeout is not None and timeout <= 0:
+            raise ValueError(f"timeout must be positive, got {timeout}")
+        effective_timeout = (
+            timeout
+            if timeout is not None
+            else getattr(self.agent.async_config, "llm_call_timeout", 120.0)
         )
-        litellm_params.setdefault("timeout", _litellm_call_timeout)
+        litellm_params.setdefault("timeout", effective_timeout)
 
         if schema:
             # Convert Pydantic model to JSON schema format for LiteLLM
@@ -543,7 +797,10 @@ class AgentAI:
             litellm_params["response_format"] = {
                 "type": "json_schema",
                 "json_schema": {
-                    "schema": schema.model_json_schema(),
+                    # OpenAI strict mode requires additionalProperties:false +
+                    # all-properties-required on every object; Pydantic emits
+                    # neither, so sanitize before sending (else BadRequestError).
+                    "schema": _strictify_openai_schema(schema.model_json_schema()),
                     "name": schema.__name__,
                     "strict": True,
                 },
@@ -582,28 +839,16 @@ class AgentAI:
                     )
 
                 async def _make_call():
-                    timeout = getattr(
-                        self.agent.async_config, "llm_call_timeout", 120.0
-                    )
                     # Ensure litellm/httpx itself enforces the timeout at the
                     # socket level, so cancelled requests don't poison the
                     # connection pool for subsequent calls.
-                    params.setdefault("timeout", timeout)
-                    # asyncio.wait_for is a safety net at 2x the litellm timeout
-                    # in case litellm fails to honor its own timeout.
-                    try:
-                        return await asyncio.wait_for(
-                            litellm_module.acompletion(**params),
-                            timeout=timeout * 2,
-                        )
-                    except asyncio.TimeoutError:
-                        model_name = params.get("model", "unknown")
-                        # Reset litellm's cached HTTP clients so the next call
-                        # gets a fresh connection pool.
-                        _reset_litellm_http_clients(litellm_module)
-                        raise TimeoutError(
-                            f"LLM call to {model_name} timed out after {timeout * 2}s (asyncio safety net)"
-                        )
+                    params.setdefault("timeout", effective_timeout)
+                    # asyncio.wait_for is a safety net at 2x the litellm timeout;
+                    # on timeout it resets the client pool and retries (a stalled
+                    # connection is the usual cause, not the model itself).
+                    return await _acompletion_with_timeout_retry(
+                        litellm_module, params, effective_timeout * 2
+                    )
 
                 async def _call_with_fallbacks():
                     fallback_models = getattr(final_config, "fallback_models", None)
@@ -662,24 +907,13 @@ class AgentAI:
                 raise ImportError(
                     "litellm is not installed. Please install it with `pip install litellm`."
                 )
-            timeout = getattr(self.agent.async_config, "llm_call_timeout", 120.0)
             # litellm/httpx already gets `timeout` via litellm_params (set
-            # earlier). asyncio.wait_for is a safety net at 2x in case litellm
-            # fails to honor its own timeout.
-            try:
-                return await asyncio.wait_for(
-                    litellm_module.acompletion(**litellm_params),
-                    timeout=timeout * 2,
-                )
-            except asyncio.TimeoutError:
-                model_name = litellm_params.get("model", "unknown")
-                # Reset litellm's cached HTTP clients so the next call gets
-                # a fresh connection pool — the previous client is likely
-                # holding a stuck connection that will hang forever.
-                _reset_litellm_http_clients(litellm_module)
-                raise TimeoutError(
-                    f"LLM call to {model_name} timed out after {timeout * 2}s (asyncio safety net)"
-                )
+            # earlier). asyncio.wait_for is a safety net at 2x; on timeout it
+            # resets the client pool and retries (a stalled connection is the
+            # usual cause, not the model itself).
+            return await _acompletion_with_timeout_retry(
+                litellm_module, litellm_params, effective_timeout * 2
+            )
 
         async def _execute_with_fallbacks():
             # Check for configured fallback models in AI config
@@ -724,6 +958,7 @@ class AgentAI:
 
         # Maximum retries for transient parse failures (malformed JSON from LLM)
         max_parse_retries = 2
+        empty_reasoning_retry_used = False
 
         async def _execute_and_parse():
             """Execute LLM call and parse response. Raised ValueError triggers parse retry."""
@@ -761,31 +996,46 @@ class AgentAI:
 
             multimodal_response = detect_multimodal_response(resp)
 
-            # Record cost in tracker before schema parsing strips multimodal metadata.
-            if (
-                hasattr(self.agent, "cost_tracker")
-                and multimodal_response.cost_usd is not None
-            ):
-                model_name = (
-                    getattr(resp, "model", "") or final_config.model or "unknown"
-                )
-                usage = multimodal_response.usage
-                from agentfield.execution_context import get_current_context
+            # Record usage in the tracker before schema parsing strips
+            # multimodal metadata. Token recording is decoupled from pricing:
+            # whenever token counts are available we record them, with
+            # cost_usd=None when the price is unknown. Cost failure must never
+            # discard tokens that were successfully extracted.
+            usage = multimodal_response.usage
+            if usage:
+                from agentfield.cost_tracker import get_current_cost_tracker
 
-                ctx = get_current_context()
-                self.agent.cost_tracker.record(
-                    model=model_name,
-                    prompt_tokens=usage.get("prompt_tokens", 0),
-                    completion_tokens=usage.get("completion_tokens", 0),
-                    total_tokens=usage.get("total_tokens", 0),
-                    cost_usd=multimodal_response.cost_usd,
-                    reasoner_name=ctx.reasoner_name if ctx else None,
-                )
+                tracker = get_current_cost_tracker()
+                if tracker is None and hasattr(self.agent, "cost_tracker"):
+                    tracker = self.agent.cost_tracker
+                if tracker is not None:
+                    model_name = (
+                        getattr(resp, "model", "") or final_config.model or "unknown"
+                    )
+                    from agentfield.execution_context import get_current_context
+
+                    ctx = get_current_context()
+                    tracker.record(
+                        model=model_name,
+                        prompt_tokens=usage.get("prompt_tokens", 0),
+                        completion_tokens=usage.get("completion_tokens", 0),
+                        total_tokens=usage.get("total_tokens", 0),
+                        cost_usd=multimodal_response.cost_usd,
+                        reasoner_name=ctx.reasoner_name if ctx else None,
+                        source="llm",
+                        cache_read_tokens=usage.get("cache_read_tokens", 0),
+                        cache_creation_tokens=usage.get("cache_creation_tokens", 0),
+                        cost_source=multimodal_response.cost_source,
+                    )
 
             if schema:
                 try:
                     json_data = json.loads(str(multimodal_response.text))
-                    return schema(**json_data)
+                    parsed = schema(**json_data)
+                    _raise_if_empty_reasoning_structured_output(resp, parsed)
+                    return parsed
+                except _EmptyReasoningStructuredOutput:
+                    raise
                 except (
                     json.JSONDecodeError,
                     ValueError,
@@ -799,7 +1049,11 @@ class AgentAI:
                     if json_match:
                         try:
                             json_data = json.loads(json_match.group())
-                            return schema(**json_data)
+                            parsed = schema(**json_data)
+                            _raise_if_empty_reasoning_structured_output(resp, parsed)
+                            return parsed
+                        except _EmptyReasoningStructuredOutput:
+                            raise
                         except (json.JSONDecodeError, ValueError, ValidationError):
                             pass
                     raise ValueError(
@@ -813,6 +1067,15 @@ class AgentAI:
         for attempt in range(max_parse_retries + 1):
             try:
                 return await _execute_and_parse()
+            except _EmptyReasoningStructuredOutput:
+                if schema and not empty_reasoning_retry_used:
+                    empty_reasoning_retry_used = True
+                    _increase_retry_max_tokens(litellm_params)
+                    log_debug(
+                        "Structured response was empty after reasoning_content; retrying once with a larger max_tokens budget..."
+                    )
+                    continue
+                raise
             except ValueError as e:
                 if schema and "Could not parse structured response" in str(e):
                     last_parse_error = e
@@ -826,7 +1089,7 @@ class AgentAI:
 
     def _process_multimodal_args(self, args: tuple) -> List[Dict[str, Any]]:
         """Process multimodal arguments into LiteLLM-compatible message format"""
-        from agentfield.multimodal import Audio, File, Image, Text
+        from agentfield.multimodal import Audio, File, Image, Text, Video
 
         messages = []
         user_content = []
@@ -854,6 +1117,9 @@ class AgentAI:
                 user_content.append(
                     {"type": "input_audio", "input_audio": arg.input_audio}
                 )
+
+            elif isinstance(arg, Video):
+                user_content.append({"type": "video_url", "video_url": arg.video_url})
 
             elif isinstance(arg, File):
                 # For now, treat files as text references
@@ -981,6 +1247,32 @@ class AgentAI:
                             {"type": "text", "text": "[Audio data provided]"}
                         )
 
+                elif detected_type == "video_file":
+                    try:
+                        import base64
+
+                        with open(arg, "rb") as f:
+                            video_data = base64.b64encode(f.read()).decode()
+                        ext = os.path.splitext(arg)[1].lower()
+                        mime_type = AgentUtils.get_mime_type(ext)
+                        data_url = f"data:{mime_type};base64,{video_data}"
+                        user_content.append(
+                            {"type": "video_url", "video_url": {"url": data_url}}
+                        )
+                    except Exception as e:
+                        log_warn(f"Could not read video file {arg}: {e}")
+                        user_content.append(
+                            {
+                                "type": "text",
+                                "text": f"[Video file: {os.path.basename(arg)}]",
+                            }
+                        )
+
+                elif detected_type == "video_base64":
+                    user_content.append(
+                        {"type": "video_url", "video_url": {"url": arg}}
+                    )
+
                 elif detected_type == "image_bytes":
                     # Convert bytes to base64 data URL
                     try:
@@ -1051,6 +1343,8 @@ class AgentAI:
                         "image",
                         "image_url",
                         "audio",
+                        "video",
+                        "video_url",
                     ]:
                         if key in arg:
                             if key == "text":
@@ -1079,6 +1373,18 @@ class AgentAI:
                                     # Assume it's a file path or URL
                                     user_content.append(
                                         {"type": "text", "text": f"[Audio: {arg[key]}]"}
+                                    )
+                            elif key in ["video", "video_url"]:
+                                if isinstance(arg[key], dict):
+                                    user_content.append(
+                                        {"type": "video_url", "video_url": arg[key]}
+                                    )
+                                else:
+                                    user_content.append(
+                                        {
+                                            "type": "video_url",
+                                            "video_url": {"url": arg[key]},
+                                        }
                                     )
 
                 elif detected_type == "message_dict":
@@ -1137,16 +1443,21 @@ class AgentAI:
         """
         AI method optimized for audio output generation.
 
-        Automatically detects the model type and uses the appropriate LiteLLM function:
+        Automatically detects the model type and uses the appropriate provider:
+        - For MiniMax TTS models (minimax/speech-2.8-hd, etc.): Uses MiniMax T2A
         - For TTS models (tts-1, tts-1-hd, gpt-4o-mini-tts): Uses litellm.speech()
         - For audio-capable chat models (gpt-4o-audio-preview): Uses litellm.completion() with audio modalities
 
         Args:
             *args: Input arguments (text prompts, etc.)
-            voice: Voice to use for audio generation (alloy, echo, fable, onyx, nova, shimmer)
-            format: Audio format (wav, mp3, etc.)
+            voice: Voice identifier. OpenAI voices include alloy, echo, fable,
+                onyx, nova, and shimmer. MiniMax models require a MiniMax voice ID.
+            format: Audio format. MiniMax supports mp3, wav, flac, and pcm.
             model: Model to use (defaults to tts-1)
-            **kwargs: Additional parameters
+            **kwargs: Additional parameters. MiniMax supports output_format
+                ("hex" or "url"), language_boost, voice_setting,
+                pronunciation_dict, audio_setting, voice_modify, and
+                subtitle_enable. Streaming is not supported.
 
         Returns:
             MultimodalResponse with audio content
@@ -1154,12 +1465,32 @@ class AgentAI:
         Example:
             audio_result = await agent.ai_with_audio("Say hello warmly", voice="alloy")
             audio_result.audio.save("greeting.wav")
+
+            minimax_result = await agent.ai_with_audio(
+                "Say hello warmly",
+                model="minimax/speech-2.8-hd",
+                voice="English_Graceful_Lady",
+                format="mp3",
+            )
         """
         # Use TTS model as default (more reliable than gpt-4o-audio-preview)
         if model is None:
             model = (
                 self.agent.ai_config.audio_model
             )  # Use configured audio model (defaults to tts-1)
+
+        if model.startswith("minimax/"):
+            provider = self._media_router.resolve(model, "audio")
+            text_input = " ".join(str(arg) for arg in args if isinstance(arg, str))
+            if not text_input:
+                text_input = "Hello, this is a test audio message."
+            return await provider.generate_audio(
+                text=text_input,
+                model=model,
+                voice=voice,
+                format=format,
+                **kwargs,
+            )
 
         # Try media router for fal models
         try:
@@ -1410,7 +1741,7 @@ class AgentAI:
 
         Supports both LiteLLM and OpenRouter providers:
         - LiteLLM: Use model names like "dall-e-3", "azure/dall-e-3", "bedrock/stability.stable-diffusion-xl"
-        - OpenRouter: Use model names with "openrouter/" prefix like "openrouter/google/gemini-2.5-flash-image-preview"
+        - OpenRouter: Use model names with "openrouter/" prefix like "openrouter/google/gemini-3.1-flash-image-preview"
 
         Args:
             prompt: Text prompt for image generation
@@ -1432,7 +1763,7 @@ class AgentAI:
             # OpenRouter (Gemini)
             result = await agent.ai_with_vision(
                 "A futuristic city",
-                model="openrouter/google/gemini-2.5-flash-image-preview",
+                model="openrouter/google/gemini-3.1-flash-image-preview",
                 image_config={"aspect_ratio": "16:9"}
             )
 
@@ -1525,7 +1856,7 @@ class AgentAI:
 
         Supported Providers:
         - LiteLLM: DALL-E models like "dall-e-3", "dall-e-2"
-        - OpenRouter: Models like "openrouter/google/gemini-2.5-flash-image-preview"
+        - OpenRouter: Models like "openrouter/google/gemini-3.1-flash-image-preview"
         - Fal.ai: Models like "fal-ai/flux/dev", "fal-ai/flux/schnell", "fal-ai/recraft-v3"
 
         Args:
@@ -1553,7 +1884,7 @@ class AgentAI:
             # OpenRouter with Gemini
             result = await app.ai_generate_image(
                 "A futuristic cityscape at night",
-                model="openrouter/google/gemini-2.5-flash-image-preview",
+                model="openrouter/google/gemini-3.1-flash-image-preview",
                 image_config={"aspect_ratio": "16:9"}
             )
 
@@ -1613,14 +1944,22 @@ class AgentAI:
         Supported Providers:
         - LiteLLM: OpenAI TTS models like "tts-1", "tts-1-hd", "gpt-4o-mini-tts"
         - Fal.ai: TTS models like "fal-ai/kokoro/..." (custom deployments)
+        - MiniMax: TTS models prefixed with "minimax/", such as
+          "minimax/speech-2.8-hd"
 
         Args:
             text: Text to convert to speech
             model: TTS model to use (defaults to AIConfig.audio_model, typically "tts-1")
-            voice: Voice to use ("alloy", "echo", "fable", "onyx", "nova", "shimmer")
-            format: Audio format ("wav", "mp3", "opus", "aac", "flac", "pcm")
+            voice: Voice identifier. OpenAI voices include "alloy", "echo",
+                "fable", "onyx", "nova", and "shimmer". MiniMax models
+                require a MiniMax voice ID instead of the default "alloy".
+            format: Audio format. MiniMax supports "mp3", "wav", "flac", and
+                "pcm".
             speed: Speech speed multiplier (0.25 to 4.0)
-            **kwargs: Provider-specific parameters
+            **kwargs: Provider-specific parameters. MiniMax supports
+                output_format ("hex" or "url"), language_boost,
+                voice_setting, pronunciation_dict, audio_setting,
+                voice_modify, and subtitle_enable. Streaming is not supported.
 
         Returns:
             MultimodalResponse: Response object with .audio containing AudioOutput.
@@ -1641,6 +1980,16 @@ class AgentAI:
                 model="tts-1-hd",
                 voice="nova",
                 format="mp3"
+            )
+
+            # MiniMax TTS with a MiniMax voice ID
+            result = await app.ai_generate_audio(
+                "Welcome to the presentation.",
+                model="minimax/speech-2.8-hd",
+                voice="English_Graceful_Lady",
+                format="mp3",
+                language_boost="English",
+                output_format="hex",
             )
 
             # Adjust speech speed
@@ -1714,12 +2063,14 @@ class AgentAI:
         """
         Generate video from text or image.
 
-        This method generates videos using Fal.ai's video generation models.
-        Supports both text-to-video and image-to-video generation.
+        Routes video generation requests by model prefix. MiniMax models use
+        the ``minimax/`` prefix and support text-to-video and image-to-video.
 
         Supported Providers:
+        - MiniMax: Models prefixed with "minimax/"
         - Fal.ai: Models like "fal-ai/minimax-video/image-to-video",
-          "fal-ai/kling-video/v1/standard", "fal-ai/luma-dream-machine"
+          "fal-ai/kling-video/v1/standard/text-to-video",
+          "fal-ai/luma-dream-machine"
 
         Args:
             prompt: Text description for the video
@@ -1745,7 +2096,7 @@ class AgentAI:
             # Text to video
             result = await app.ai_generate_video(
                 "A cat playing with yarn",
-                model="fal-ai/kling-video/v1/standard"
+                model="fal-ai/kling-video/v1/standard/text-to-video"
             )
 
             # Luma Dream Machine

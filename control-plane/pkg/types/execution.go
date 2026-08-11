@@ -32,6 +32,14 @@ type Execution struct {
 	CompletedAt  *time.Time `json:"completed_at,omitempty" db:"completed_at"`
 	DurationMS   *int64     `json:"duration_ms,omitempty" db:"duration_ms"`
 
+	// Outer lifecycle authority. These fields are immutable after creation except
+	// AuthorityRevokedAt, which is a monotonic revocation latch.
+	AuthorityHomeID     *string    `json:"authority_home_id,omitempty" db:"authority_home_id"`
+	AuthorityRunID      *string    `json:"authority_run_id,omitempty" db:"authority_run_id"`
+	AuthorityLeaseOwner *string    `json:"authority_lease_owner,omitempty" db:"authority_lease_owner"`
+	AuthorityAttempt    *int       `json:"authority_attempt,omitempty" db:"authority_attempt"`
+	AuthorityRevokedAt  *time.Time `json:"authority_revoked_at,omitempty" db:"authority_revoked_at"`
+
 	// Optional metadata
 	SessionID *string `json:"session_id,omitempty" db:"session_id"`
 	ActorID   *string `json:"actor_id,omitempty" db:"actor_id"`
@@ -68,6 +76,15 @@ type ExecutionFilter struct {
 	// Set this for list/dashboard queries that do not need payload data to avoid
 	// transferring large TOAST columns over the wire.
 	ExcludePayloads bool
+	// ActiveOnly keeps only runs with at least one non-terminal execution
+	// (running/pending/queued/waiting). Unlike Status, which drops non-matching
+	// execution rows BEFORE aggregation (losing terminal children from the
+	// counts), ActiveOnly filters whole runs after aggregation, so a run's
+	// status_counts stay complete. Only honored by QueryRunSummaries.
+	ActiveOnly bool
+	// AuthorityBoundOnly and NonTerminalOnly support durable lifecycle recovery.
+	AuthorityBoundOnly bool
+	NonTerminalOnly    bool
 }
 
 // ExecutionDAGEdge captures a parent→child relationship inside a run. The UI uses

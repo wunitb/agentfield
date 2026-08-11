@@ -1,4 +1,3 @@
-
 package packages
 
 import (
@@ -20,7 +19,7 @@ func TestInstallerCoverage(t *testing.T) {
 		}
 	})
 
-	t.Run("copyFile-open-fails", func(t *testing.T){
+	t.Run("copyFile-open-fails", func(t *testing.T) {
 		pi := &PackageInstaller{}
 		err := pi.copyFile("/nonexistent", "/tmp/dest")
 		if err == nil {
@@ -28,7 +27,7 @@ func TestInstallerCoverage(t *testing.T) {
 		}
 	})
 
-	t.Run("copyFile-create-fails", func(t *testing.T){
+	t.Run("copyFile-create-fails", func(t *testing.T) {
 		pi := &PackageInstaller{}
 		src := filepath.Join(t.TempDir(), "src")
 		if err := os.WriteFile(src, []byte{}, 0644); err != nil {
@@ -46,7 +45,7 @@ func TestInstallerCoverage(t *testing.T) {
 		_ = os.Chmod(destDir, 0755)
 	})
 
-	t.Run("installDependencies-python-fails", func(t *testing.T){
+	t.Run("installDependencies-python-fails", func(t *testing.T) {
 		pi := &PackageInstaller{}
 		pkgPath := t.TempDir()
 		metadata := &PackageMetadata{
@@ -59,12 +58,12 @@ func TestInstallerCoverage(t *testing.T) {
 		t.Setenv("PATH", "")
 
 		err := pi.installDependencies(pkgPath, metadata)
-		if err == nil || !strings.Contains(err.Error(), "failed to create virtual environment") {
+		if err == nil || !strings.Contains(err.Error(), "no working Python interpreter found on PATH") {
 			t.Fatalf("expected python to fail, got %v", err)
 		}
 	})
-	
-	t.Run("installDependencies-pip-fails", func(t *testing.T){
+
+	t.Run("installDependencies-pip-fails", func(t *testing.T) {
 		pi := &PackageInstaller{}
 		pkgPath := t.TempDir()
 		metadata := &PackageMetadata{
@@ -73,10 +72,12 @@ func TestInstallerCoverage(t *testing.T) {
 			},
 		}
 
-		// create a fake python that will succeed, but no pip
+		// create a fake python that answers the version probe and "succeeds"
+		// at venv creation without producing a pip
 		fakebin := t.TempDir()
 		pythonPath := filepath.Join(fakebin, "python3")
-		if err := os.WriteFile(pythonPath, []byte("#!/bin/sh\nexit 0"), 0755); err != nil {
+		script := "#!/bin/sh\nif [ \"$1\" = \"-c\" ]; then echo \"3.12.0\"; fi\nexit 0"
+		if err := os.WriteFile(pythonPath, []byte(script), 0755); err != nil {
 			t.Fatal(err)
 		}
 		t.Setenv("PATH", fakebin)
@@ -86,8 +87,8 @@ func TestInstallerCoverage(t *testing.T) {
 			t.Fatalf("expected pip to fail, got %v", err)
 		}
 	})
-	
-	t.Run("InstallPackage-install-deps-fails", func(t *testing.T){
+
+	t.Run("InstallPackage-install-deps-fails", func(t *testing.T) {
 		pi := &PackageInstaller{AgentFieldHome: t.TempDir()}
 		sourcePath := t.TempDir()
 		writeTestPackage(t, sourcePath, `

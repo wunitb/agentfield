@@ -158,13 +158,17 @@ describe('AgentFieldClient', () => {
       callerDid: 'did:key:caller',
       targetDid: 'did:key:target',
       agentNodeDid: 'did:key:node',
-      agentNodeId: 'node-1'
+      agentNodeId: 'node-1',
+      runAuthority: { homeId: 'home-a', runId: 'outer-run-1', leaseOwner: 'worker-a' }
     });
 
     expect(result).toEqual({ ok: true });
     expect(http.post).toHaveBeenCalledWith(
       '/api/v1/execute/agent.name:plan',
-      JSON.stringify({ input: { prompt: 'hi' } }),
+      JSON.stringify({
+        input: { prompt: 'hi' },
+        authority: { home_id: 'home-a', run_id: 'outer-run-1', lease_owner: 'worker-a' }
+      }),
       {
         headers: expect.objectContaining({
           Authorization: 'Bearer tenant-token',

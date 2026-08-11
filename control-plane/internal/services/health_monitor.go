@@ -89,12 +89,24 @@ func NewHealthMonitor(storage storage.StorageProvider, config HealthMonitorConfi
 	}
 }
 
-// RegisterAgent adds an agent to the active monitoring list
+// RegisterAgent adds an agent to the active monitoring list.
+// Idempotent: keep-alive handlers call this on every DB-updating heartbeat or
+// lease renewal, so an agent already tracked at the same BaseURL keeps its
+// state (LastStatus, consecutive failures, last transition) — resetting to
+// "unknown" on each call would discard the promote/demote history the checker
+// relies on. A changed BaseURL means the agent moved; tracking starts over.
 func (hm *HealthMonitor) RegisterAgent(nodeID, baseURL string) {
 	hm.agentsMutex.Lock()
 	defer hm.agentsMutex.Unlock()
 
 	seenAt := time.Now()
+
+	if existing, ok := hm.activeAgents[nodeID]; ok && existing.BaseURL == baseURL {
+		if hm.presence != nil {
+			hm.presence.Touch(nodeID, "", seenAt)
+		}
+		return
+	}
 
 	hm.activeAgents[nodeID] = &ActiveAgent{
 		NodeID:         nodeID,
@@ -109,6 +121,14 @@ func (hm *HealthMonitor) RegisterAgent(nodeID, baseURL string) {
 	}
 
 	logger.Logger.Debug().Msgf("🏥 Registered agent %s for HTTP health monitoring", nodeID)
+}
+
+// IsMonitoring reports whether the node is in the active HTTP-polling registry.
+func (hm *HealthMonitor) IsMonitoring(nodeID string) bool {
+	hm.agentsMutex.RLock()
+	defer hm.agentsMutex.RUnlock()
+	_, ok := hm.activeAgents[nodeID]
+	return ok
 }
 
 // UnregisterAgent removes an agent from the active monitoring list
@@ -182,10 +202,19 @@ func (hm *HealthMonitor) RecoverFromDatabase(ctx context.Context) error {
 
 	logger.Logger.Info().Int("count", len(nodes)).Msg("🏥 Recovering nodes from database for health monitoring")
 
-	// Register all nodes with the health monitor
+	// Register all nodes with the health monitor. Serverless nodes are
+	// excluded: they have no heartbeat loop (DisableLeaseLoop) and no
+	// guaranteed /status implementation, so during live operation only the
+	// heartbeat handler ever adds a node to this registry - never
+	// registration itself. Registering them here would make a CP restart
+	// the only time they get HTTP-polled, spuriously flipping them to
+	// HealthStatusInactive on the first failed/missing check.
 	for _, node := range nodes {
 		if node == nil || node.BaseURL == "" {
 			continue // Skip nodes without callback URL
+		}
+		if node.DeploymentType == "serverless" {
+			continue
 		}
 
 		hm.RegisterAgent(node.ID, node.BaseURL)

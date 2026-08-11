@@ -29,9 +29,9 @@ func NewSkillCommand() *cobra.Command {
 A skill is a self-contained instruction packet (a SKILL.md file plus
 reference markdown) that teaches a coding agent (Claude Code, Codex,
 Gemini, etc.) how to use AgentField properly. The af binary ships with
-the agentfield-multi-reasoner-builder skill embedded — install it once
-into every agent you use and they will know how to architect, scaffold,
-and ship multi-reasoner systems on AgentField.
+the agentfield skill embedded — install it once into every agent you use
+and they will know how to architect, scaffold, and ship multi-agent
+systems on AgentField.
 
 Examples:
   af skill install                       # Interactive picker (default)
@@ -60,13 +60,13 @@ Examples:
 
 func newSkillInstallCommand() *cobra.Command {
 	var (
-		skillName    string
-		version      string
-		targets      []string
-		allDetected  bool
-		allTargets   bool
-		force        bool
-		dryRun       bool
+		skillName      string
+		version        string
+		targets        []string
+		allDetected    bool
+		allTargets     bool
+		force          bool
+		dryRun         bool
 		nonInteractive bool
 	)
 
@@ -93,7 +93,7 @@ func newSkillInstallCommand() *cobra.Command {
 				targets = picked
 			}
 
-			report, err := skillkit.Install(skillkit.InstallOptions{
+			installOpts := skillkit.InstallOptions{
 				SkillName:     skillName,
 				Version:       version,
 				Targets:       targets,
@@ -101,7 +101,25 @@ func newSkillInstallCommand() *cobra.Command {
 				AllRegistered: allTargets,
 				Force:         force,
 				DryRun:        dryRun,
-			})
+			}
+
+			// With no explicit skill name, install the whole catalog — both the
+			// build skill (agentfield) and the drive skill (agentfield-use) — so a
+			// harness that installs skills lands the golden-loop docs too, not just
+			// the first catalog entry. An explicit `af skill install <name>` still
+			// installs exactly that one skill.
+			if skillName == "" {
+				reports, err := skillkit.InstallAll(installOpts)
+				if err != nil {
+					return err
+				}
+				for _, report := range reports {
+					printInstallReport(report, dryRun)
+				}
+				return nil
+			}
+
+			report, err := skillkit.Install(installOpts)
 			if err != nil {
 				return err
 			}
@@ -277,13 +295,13 @@ func runInteractivePicker() ([]string, error) {
 	dim := color.New(color.Faint)
 	green := color.New(color.FgGreen)
 
-	bold.Println("\nInstall agentfield-multi-reasoner-builder skill")
+	bold.Println("\nInstall agentfield skills")
 	fmt.Println()
-	fmt.Println("  This skill teaches any coding agent how to architect and ship")
-	fmt.Println("  multi-reasoner systems on AgentField. It uses composite-")
-	fmt.Println("  intelligence patterns: parallel reasoner hunters, dynamic")
-	fmt.Println("  routing, deep DAG composition, safe-default fallbacks, and")
-	fmt.Println("  the canonical scaffold-to-curl workflow.")
+	fmt.Println("  Installs both AgentField skills into the targets you pick:")
+	fmt.Println("    • agentfield      (build) — design and ship multi-agent systems:")
+	fmt.Println("      deep, dynamic, parallel reasoner graphs with a live smoke test.")
+	fmt.Println("    • agentfield-use  (drive) — discover and call agents already")
+	fmt.Println("      running on a control plane: the discover → call → wait loop.")
 	fmt.Println()
 	bold.Println("  Targets")
 	fmt.Println()

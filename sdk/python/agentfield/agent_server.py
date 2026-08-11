@@ -3,6 +3,7 @@ import importlib.util
 import os
 import signal
 import urllib.parse
+from contextlib import AsyncExitStack, asynccontextmanager
 from datetime import datetime
 from typing import Optional
 
@@ -10,7 +11,7 @@ import uvicorn
 from agentfield.agent_utils import AgentUtils
 from agentfield.logger import log_debug, log_error, log_info, log_success, log_warn
 from agentfield.utils import get_free_port
-from fastapi import Request
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.routing import APIRoute
 
@@ -48,7 +49,10 @@ class AgentServer:
             if not node_logs.logs_enabled():
                 return JSONResponse(
                     status_code=404,
-                    content={"error": "logs_disabled", "message": "Process logs API is disabled"},
+                    content={
+                        "error": "logs_disabled",
+                        "message": "Process logs API is disabled",
+                    },
                 )
             auth = request.headers.get("authorization") or request.headers.get(
                 "Authorization"
@@ -56,7 +60,10 @@ class AgentServer:
             if not node_logs.verify_internal_bearer(auth):
                 return JSONResponse(
                     status_code=401,
-                    content={"error": "unauthorized", "message": "Valid Authorization Bearer required"},
+                    content={
+                        "error": "unauthorized",
+                        "message": "Valid Authorization Bearer required",
+                    },
                 )
             qp = request.query_params
             try:
@@ -107,7 +114,9 @@ class AgentServer:
                     name = t.get_name()
                 except Exception:
                     name = "?"
-                buf.write(f"=== Task {name} done={t.done()} cancelled={t.cancelled()} ===\n")
+                buf.write(
+                    f"=== Task {name} done={t.done()} cancelled={t.cancelled()} ===\n"
+                )
                 try:
                     coro = t.get_coro()
                     buf.write(f"coro: {coro!r}\n")
@@ -121,7 +130,9 @@ class AgentServer:
                                 f"  {frame.f_code.co_filename}:{frame.f_lineno} in {frame.f_code.co_name}\n"
                             )
                     else:
-                        buf.write("  <no stack — task is suspended on a Future/awaitable>\n")
+                        buf.write(
+                            "  <no stack — task is suspended on a Future/awaitable>\n"
+                        )
                 except Exception as e:
                     buf.write(f"  <stack error: {e}>\n")
                 out.append(buf.getvalue())
@@ -218,7 +229,7 @@ class AgentServer:
                     log_error(f"Shutdown endpoint error: {e}")
                 return {
                     "status": "error",
-                    "message": f"Failed to initiate shutdown: {str(e)}",
+                    "message": "Failed to initiate shutdown",
                 }
 
         @self.agent.get("/status")
@@ -280,7 +291,7 @@ class AgentServer:
             except Exception as e:
                 if self.agent.dev_mode:
                     log_error(f"Status endpoint error: {e}")
-                return {"status": "error", "message": f"Failed to get status: {str(e)}"}
+                return {"status": "error", "message": "Failed to get status"}
 
         @self.agent.get("/info")
         async def node_info():
@@ -315,7 +326,10 @@ class AgentServer:
             approval_request_id = body.get("approval_request_id", "")
 
             if not execution_id or not decision:
-                return {"error": "execution_id and decision are required", "status": 400}
+                return {
+                    "error": "execution_id and decision are required",
+                    "status": 400,
+                }
 
             # Parse the raw response field (may be a JSON string or dict)
             raw_response = None
@@ -340,9 +354,13 @@ class AgentServer:
             # Try to resolve by approval_request_id first, then by execution_id
             resolved = False
             if approval_request_id:
-                resolved = await self.agent._pause_manager.resolve(approval_request_id, result)
+                resolved = await self.agent._pause_manager.resolve(
+                    approval_request_id, result
+                )
             if not resolved and execution_id:
-                resolved = await self.agent._pause_manager.resolve_by_execution_id(execution_id, result)
+                resolved = await self.agent._pause_manager.resolve_by_execution_id(
+                    execution_id, result
+                )
 
             if self.agent.dev_mode:
                 log_debug(
@@ -659,7 +677,26 @@ class AgentServer:
             env_port = os.getenv("PORT")
             if env_port and env_port.isdigit():
                 suggested_port = int(env_port)
-                if AgentUtils.is_port_available(suggested_port):
+                if os.getenv("AGENTFIELD_STRICT_PORT") == "1":
+                    # The AgentField runner assigned this exact port and polls it
+                    # for readiness. Bind it authoritatively — never silently move
+                    # to another port, or the runner would poll a port nothing is
+                    # listening on and kill us for "not becoming ready". If it is
+                    # genuinely unavailable, exit fast with a clear error so the
+                    # runner surfaces a real failure instead of a phantom timeout.
+                    if not AgentUtils.is_port_available(suggested_port):
+                        log_error(
+                            f"AGENTFIELD_STRICT_PORT set but the assigned port "
+                            f"{suggested_port} is unavailable; exiting so the "
+                            f"control plane can reallocate and retry"
+                        )
+                        raise RuntimeError(
+                            f"assigned port {suggested_port} is unavailable"
+                        )
+                    port = suggested_port
+                    if self.agent.dev_mode:
+                        log_debug(f"Using assigned port from AgentField CLI: {port}")
+                elif AgentUtils.is_port_available(suggested_port):
                     port = suggested_port
                     if self.agent.dev_mode:
                         log_debug(f"Using port from AgentField CLI: {port}")
@@ -766,8 +803,27 @@ class AgentServer:
         # Setup fast lifecycle signal handlers
         self.agent.agentfield_handler.setup_fast_lifecycle_signal_handlers()
 
-        # Add startup event handler for resilient lifecycle
-        @self.agent.on_event("startup")
+        @asynccontextmanager
+        async def internal_lifespan(app: FastAPI):
+            # Add startup event handler for resilient lifecycle
+            await startup_resilient_lifecycle()
+            try:
+                yield
+            finally:
+                # Add shutdown event handler for cleanup
+                await shutdown_cleanup()
+
+        existing_lifespan = self.agent.router.lifespan_context
+
+        @asynccontextmanager
+        async def merged_lifespan(app: FastAPI):
+            async with AsyncExitStack() as stack:
+                await stack.enter_async_context(internal_lifespan(app))
+                await stack.enter_async_context(existing_lifespan(app))
+                yield
+
+        self.agent.router.lifespan_context = merged_lifespan
+
         async def startup_resilient_lifecycle():
             """Resilient lifecycle startup: connection manager handles AgentField server connectivity"""
 
@@ -831,6 +887,9 @@ class AgentServer:
             # Start connection manager (non-blocking)
             connected = await self.agent.connection_manager.start()
 
+            # Start notification dispatcher
+            self.agent._notification_dispatcher.start()
+
             # Connect memory event client - works independently of AgentField server connection
             if self.agent.memory_event_client:
                 try:
@@ -848,8 +907,6 @@ class AgentServer:
                         "Agent started in local mode - will connect to AgentField server when available"
                     )
 
-        # Add shutdown event handler for cleanup
-        @self.agent.on_event("shutdown")
         async def shutdown_cleanup():
             """Cleanup all resources when FastAPI shuts down"""
 

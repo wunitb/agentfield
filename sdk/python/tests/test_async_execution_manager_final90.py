@@ -10,7 +10,11 @@ import pytest
 from agentfield.async_config import AsyncConfig
 from agentfield.async_execution_manager import AsyncExecutionManager
 from agentfield.execution_state import ExecutionState, ExecutionStatus
-from agentfield.exceptions import AgentFieldClientError, ExecutionTimeoutError
+from agentfield.exceptions import (
+    AgentFieldClientError,
+    ExecutionCancelledError,
+    ExecutionTimeoutError,
+)
 
 
 class _DummyTask:
@@ -125,7 +129,7 @@ async def test_wait_for_result_handles_success_failure_cancel_timeout(manager, m
     with pytest.raises(AgentFieldClientError, match="boom"):
         await manager.wait_for_result("failed")
 
-    with pytest.raises(AgentFieldClientError, match="cancelled"):
+    with pytest.raises(ExecutionCancelledError, match="cancelled"):
         await manager.wait_for_result("cancelled")
 
     async def fast_sleep(_seconds):
@@ -144,6 +148,30 @@ async def test_wait_for_result_handles_success_failure_cancel_timeout(manager, m
         await manager.wait_for_result("pending", timeout=0.01)
 
     assert pending.status == ExecutionStatus.TIMEOUT
+
+
+def test_update_execution_from_status_populates_same_status_success(manager):
+    async def run():
+        replayed = ExecutionState(
+            "replayed",
+            "node.skill",
+            {},
+            status=ExecutionStatus.SUCCEEDED,
+        )
+
+        async with manager._execution_lock:
+            manager._executions["replayed"] = replayed
+            manager.metrics.active_executions = 1
+
+        await manager._update_execution_from_status(
+            replayed,
+            {"status": "succeeded", "result": {"reused": True}},
+        )
+
+        assert replayed.result == {"reused": True}
+        assert await manager.wait_for_result("replayed") == {"reused": True}
+
+    asyncio.run(run())
 
 
 @pytest.mark.asyncio

@@ -10,20 +10,31 @@ import (
 
 // AuthConfig mirrors server configuration for HTTP authentication.
 type AuthConfig struct {
-	APIKey    string
-	SkipPaths []string
+	APIKey                  string
+	SkipPaths               []string
+	SkipPrefixes            []string
+	QueryAPIKeyAllowedPaths []string
 }
 
-// APIKeyAuth enforces API key authentication via header, bearer token, or query param.
+// APIKeyAuth enforces API key authentication via header or bearer token.
 func APIKeyAuth(config AuthConfig) gin.HandlerFunc {
 	skipPathSet := make(map[string]struct{}, len(config.SkipPaths))
 	for _, p := range config.SkipPaths {
 		skipPathSet[p] = struct{}{}
 	}
+	queryAPIKeyAllowedPathSet := make(map[string]struct{}, len(config.QueryAPIKeyAllowedPaths))
+	for _, p := range config.QueryAPIKeyAllowedPaths {
+		queryAPIKeyAllowedPathSet[p] = struct{}{}
+	}
 
 	return func(c *gin.Context) {
 		// No auth configured, allow everything.
 		if config.APIKey == "" {
+			// Callers have full access in no-auth mode; say so, or the
+			// auth-level filtering in agentic discover / smart 404 treats
+			// them as "public" and hides every api_key endpoint from the
+			// very callers who can use them.
+			c.Set("auth_level", "api_key")
 			c.Next()
 			return
 		}
@@ -32,6 +43,12 @@ func APIKeyAuth(config AuthConfig) gin.HandlerFunc {
 		if _, ok := skipPathSet[c.Request.URL.Path]; ok {
 			c.Next()
 			return
+		}
+		for _, prefix := range config.SkipPrefixes {
+			if strings.HasPrefix(c.Request.URL.Path, prefix) {
+				c.Next()
+				return
+			}
 		}
 
 		// Always allow health and metrics by default
@@ -68,6 +85,19 @@ func APIKeyAuth(config AuthConfig) gin.HandlerFunc {
 			return
 		}
 
+		// Public webhook ingest at /sources/:trigger_id — Stripe / GitHub /
+		// Slack / generic providers can't be reconfigured to send the
+		// AgentField API key, so we bypass the global key check here.
+		// Security: each Source plugin enforces its own signature
+		// verification (HMAC-SHA256 with constant-time comparison; Stripe
+		// and Slack additionally enforce a timestamp-tolerance window).
+		// Disabled triggers and unknown trigger_ids are rejected by the
+		// handler before any payload work happens.
+		if strings.HasPrefix(c.Request.URL.Path, "/sources/") {
+			c.Next()
+			return
+		}
+
 		apiKey := ""
 
 		// Preferred: X-API-Key header
@@ -81,8 +111,10 @@ func APIKeyAuth(config AuthConfig) gin.HandlerFunc {
 			}
 		}
 
-		// SSE/WebSocket friendly: api_key query parameter
-		if apiKey == "" {
+		// Browser EventSource and WebSocket clients cannot set custom
+		// authentication headers, so query-string API key auth is restricted
+		// to an explicit streaming route allowlist.
+		if apiKey == "" && queryAPIKeyAllowed(c, queryAPIKeyAllowedPathSet) {
 			apiKey = c.Query("api_key")
 		}
 
@@ -91,11 +123,11 @@ func APIKeyAuth(config AuthConfig) gin.HandlerFunc {
 			c.Set("auth_level", "public")
 			c.AbortWithStatusJSON(http.StatusUnauthorized, gin.H{
 				"error":   "unauthorized",
-				"message": "invalid or missing API key. Provide via X-API-Key header, Authorization: Bearer <token>, or ?api_key= query param",
+				"message": "invalid or missing API key. Provide via X-API-Key header or Authorization: Bearer <token>",
 				"help": map[string]string{
-					"kb":             "GET /api/v1/agentic/kb/topics (public, no auth required)",
-					"guide":          "GET /api/v1/agentic/kb/guide?goal=<your goal> (public)",
-					"api_discovery":  "GET /api/v1/agentic/discover (requires auth)",
+					"kb":              "GET /api/v1/agentic/kb/topics (public, no auth required)",
+					"guide":           "GET /api/v1/agentic/kb/guide?goal=<your goal> (public)",
+					"api_discovery":   "GET /api/v1/agentic/discover (requires auth)",
 					"agent_discovery": "GET /api/v1/discovery/capabilities (requires auth — lists live agents, reasoners, skills)",
 				},
 			})
@@ -104,8 +136,27 @@ func APIKeyAuth(config AuthConfig) gin.HandlerFunc {
 
 		// Set auth level for downstream handlers (used by agentic API for filtering)
 		c.Set("auth_level", "api_key")
+		if callerAgentID := strings.TrimSpace(c.GetHeader("X-Caller-Agent-ID")); callerAgentID != "" {
+			c.Set(string(CallerAgentIDKey), callerAgentID)
+		} else if callerAgentID := strings.TrimSpace(c.GetHeader("X-Agent-Node-ID")); callerAgentID != "" {
+			c.Set(string(CallerAgentIDKey), callerAgentID)
+		}
 		c.Next()
 	}
+}
+
+func queryAPIKeyAllowed(c *gin.Context, allowedPaths map[string]struct{}) bool {
+	if len(allowedPaths) == 0 {
+		return false
+	}
+	if _, ok := allowedPaths[c.Request.URL.Path]; ok {
+		return true
+	}
+	if fullPath := c.FullPath(); fullPath != "" {
+		_, ok := allowedPaths[fullPath]
+		return ok
+	}
+	return false
 }
 
 // AdminTokenAuth enforces a separate admin token for admin routes.

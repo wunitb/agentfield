@@ -1,7 +1,7 @@
 // @ts-nocheck
 import { fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
-import { MemoryRouter, Route, Routes } from "react-router-dom";
+import { MemoryRouter, Route, Routes } from 'react-router';
 
 import { PlaygroundPage } from "@/pages/PlaygroundPage";
 import type { ReasonerWithNode, ReasonersResponse } from "@/types/reasoners";
@@ -131,6 +131,7 @@ vi.mock("@/components/ui/icon-bridge", () => {
     Check: Icon,
     ChevronRight: Icon,
     ChevronDown: Icon,
+    RadioTower: Icon,
   };
 });
 

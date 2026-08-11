@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -16,18 +17,22 @@ import (
 	"github.com/Agent-Field/agentfield/control-plane/internal/config"
 	"github.com/Agent-Field/agentfield/control-plane/internal/core/interfaces"
 	coreservices "github.com/Agent-Field/agentfield/control-plane/internal/core/services"
+	"github.com/Agent-Field/agentfield/control-plane/internal/embedding"
 	"github.com/Agent-Field/agentfield/control-plane/internal/encryption"
 	"github.com/Agent-Field/agentfield/control-plane/internal/events"
 	"github.com/Agent-Field/agentfield/control-plane/internal/handlers"
 	"github.com/Agent-Field/agentfield/control-plane/internal/infrastructure/communication"
 	"github.com/Agent-Field/agentfield/control-plane/internal/infrastructure/process"
 	infrastorage "github.com/Agent-Field/agentfield/control-plane/internal/infrastructure/storage"
+	"github.com/Agent-Field/agentfield/control-plane/internal/knowledge"
 	"github.com/Agent-Field/agentfield/control-plane/internal/logger"
 	"github.com/Agent-Field/agentfield/control-plane/internal/observability"
 	"github.com/Agent-Field/agentfield/control-plane/internal/server/apicatalog"
 	"github.com/Agent-Field/agentfield/control-plane/internal/server/knowledgebase"
 	"github.com/Agent-Field/agentfield/control-plane/internal/server/middleware"
 	"github.com/Agent-Field/agentfield/control-plane/internal/services"
+	"github.com/Agent-Field/agentfield/control-plane/internal/services/packagejobs"
+	_ "github.com/Agent-Field/agentfield/control-plane/internal/sources/all" // register first-party trigger Sources
 	"github.com/Agent-Field/agentfield/control-plane/internal/storage"
 	"github.com/Agent-Field/agentfield/control-plane/internal/utils"
 	"github.com/Agent-Field/agentfield/control-plane/pkg/adminpb"
@@ -52,6 +57,7 @@ type AgentFieldServer struct {
 	statusManager         *services.StatusManager // Add StatusManager for unified status management
 	agentService          interfaces.AgentService // Add AgentService for lifecycle management
 	agentClient           interfaces.AgentClient  // Add AgentClient for agent communication
+	packageJobs           *packagejobs.Manager    // Async package install/update jobs
 	config                *config.Config
 	storageHealthOverride func(context.Context) gin.H
 	cacheHealthOverride   func(context.Context) gin.H
@@ -78,14 +84,35 @@ type AgentFieldServer struct {
 	observabilityForwarder services.ObservabilityForwarder
 	executionTracer        *observability.ExecutionTracer
 	tracerShutdown         func(context.Context) error
+	telemetryService       *observability.TelemetryService
 	configMu               sync.RWMutex
+	// Trigger / webhook plugin system
+	triggerDispatcher *services.TriggerDispatcher
+	sourceManager     *services.SourceManager
+	triggerHandlers   *handlers.TriggerHandlers
+	// cancelDispatcher forwards execution-cancelled events to remote SDK
+	// workers so they can cooperatively short-circuit in-flight reasoner
+	// code (raise CancelledError / abort signals / cancel contexts).
+	cancelDispatcher *services.CancelDispatcher
+	runAuthority     *handlers.RunAuthorityVerifier
 	// Agentic API
 	apiCatalog *apicatalog.Catalog
 	kb         *knowledgebase.KB
+	// Native scope-aware RAG knowledge store (embed-on-write/search).
+	knowledgeService *knowledge.Service
+	// HTTP server for graceful shutdown support
+	httpServerMu sync.RWMutex
+	httpServer   *http.Server
+	stopping     bool
 }
 
 // NewAgentFieldServer creates a new instance of the AgentFieldServer.
 func NewAgentFieldServer(cfg *config.Config) (*AgentFieldServer, error) {
+	runAuthority, err := handlers.NewRunAuthorityVerifier(cfg.AgentField.RunAuthority)
+	if err != nil {
+		return nil, fmt.Errorf("invalid run authority configuration: %w", err)
+	}
+
 	// Define agentfieldHome at the very top
 	agentfieldHome := os.Getenv("AGENTFIELD_HOME")
 	if agentfieldHome == "" {
@@ -114,6 +141,9 @@ func NewAgentFieldServer(cfg *config.Config) (*AgentFieldServer, error) {
 		}
 	}
 
+	// Configure execution event payload redaction from logging config.
+	handlers.SetRedactPayloads(cfg.Logging.ShouldRedactPayloads())
+
 	Router := gin.Default()
 
 	// Sync installed.yaml to database for package visibility
@@ -131,6 +161,14 @@ func NewAgentFieldServer(cfg *config.Config) (*AgentFieldServer, error) {
 
 	// Create AgentService
 	agentService := coreservices.NewAgentService(processManager, portManager, registryStorage, agentClient, agentfieldHome)
+
+	// Async package install/update job manager (HTTP install API)
+	packageJobs := packagejobs.NewManager(registryStorage, agentfieldHome, agentService)
+	// Sync the DB immediately after API-driven registry mutations so clients
+	// read their own writes; the fsnotify watcher covers CLI-driven changes.
+	packageJobs.SetOnRegistryChange(func() {
+		_ = SyncPackagesFromRegistry(agentfieldHome, storageProvider)
+	})
 
 	// Initialize StatusManager for unified status management
 	statusManagerConfig := services.StatusManagerConfig{
@@ -418,6 +456,16 @@ func NewAgentFieldServer(cfg *config.Config) (*AgentFieldServer, error) {
 		}
 	}
 
+	var telemetryService *observability.TelemetryService
+	if cfg.Telemetry.IsEnabled() {
+		service, err := observability.NewTelemetryService(cfg.Telemetry, agentfieldHome, cfg.Storage.Mode, cfg.Telemetry.AgentFieldVersion)
+		if err != nil {
+			logger.Logger.Warn().Err(err).Msg("failed to initialize anonymous OSS telemetry")
+		} else {
+			telemetryService = service
+		}
+	}
+
 	// Initialize LLM health monitor
 	var llmHealthMonitor *services.LLMHealthMonitor
 	if cfg.AgentField.LLMHealth.Enabled && len(cfg.AgentField.LLMHealth.Endpoints) > 0 {
@@ -443,6 +491,31 @@ func NewAgentFieldServer(cfg *config.Config) (*AgentFieldServer, error) {
 		}
 	}
 
+	triggerDispatcher := services.NewTriggerDispatcher(storageProvider, vcService)
+	if runAuthority != nil {
+		triggerDispatcher.RequireRunAuthority()
+	}
+	sourceManager := services.NewSourceManager(storageProvider, triggerDispatcher)
+	triggerHandlers := handlers.NewTriggerHandlers(storageProvider, triggerDispatcher, sourceManager)
+	handlers.SetTriggerSourceManager(sourceManager)
+
+	cancelDispatcher := services.NewCancelDispatcher(storageProvider, services.CancelDispatcherConfig{
+		InternalToken: cfg.Features.DID.Authorization.InternalToken,
+	})
+
+	// Native RAG knowledge store: pick the embedding provider from config,
+	// falling back to the deterministic FakeEmbedder when no OpenAI key is set.
+	embedder, isOpenAI := embedding.NewFromConfig(embedding.ProviderConfig{
+		Provider: cfg.Features.Knowledge.Provider,
+		APIKey:   cfg.Features.Knowledge.OpenAI.APIKey,
+		Model:    cfg.Features.Knowledge.OpenAI.Model,
+	})
+	logger.Logger.Info().
+		Bool("openai", isOpenAI).
+		Int("dimensions", embedder.Dimensions()).
+		Msg("knowledge store embedding provider initialized")
+	knowledgeService := knowledge.NewService(storageProvider, embedder)
+
 	return &AgentFieldServer{
 		storage:                storageProvider,
 		cache:                  cacheProvider,
@@ -454,6 +527,7 @@ func NewAgentFieldServer(cfg *config.Config) (*AgentFieldServer, error) {
 		statusManager:          statusManager,
 		agentService:           agentService,
 		agentClient:            agentClient,
+		packageJobs:            packageJobs,
 		config:                 cfg,
 		keystoreService:        keystoreService,
 		didService:             didService,
@@ -471,10 +545,17 @@ func NewAgentFieldServer(cfg *config.Config) (*AgentFieldServer, error) {
 		observabilityForwarder: observabilityForwarder,
 		executionTracer:        executionTracer,
 		tracerShutdown:         tracerShutdown,
+		telemetryService:       telemetryService,
 		registryWatcherCancel:  nil,
 		adminGRPCPort:          adminPort,
+		triggerDispatcher:      triggerDispatcher,
+		sourceManager:          sourceManager,
+		triggerHandlers:        triggerHandlers,
+		cancelDispatcher:       cancelDispatcher,
+		runAuthority:           runAuthority,
 		apiCatalog:             initAPICatalog(),
 		kb:                     initKnowledgeBase(),
+		knowledgeService:       knowledgeService,
 	}, nil
 }
 
@@ -511,6 +592,9 @@ func initKnowledgeBase() *knowledgebase.KB {
 func (s *AgentFieldServer) Start() error {
 	// Setup routes
 	s.setupRoutes()
+	if err := handlers.RecoverRunAuthorityExecutions(context.Background(), s.storage, s.runAuthority, s.config.AgentField.ExecutionQueue.AgentCallTimeout); err != nil {
+		return fmt.Errorf("recover run authority executions: %w", err)
+	}
 
 	// Start status manager service in background
 	go s.statusManager.Start()
@@ -549,9 +633,30 @@ func (s *AgentFieldServer) Start() error {
 		// Don't fail server startup if cleanup service fails to start
 	}
 
+	// Start cancel dispatcher: forwards bus ExecutionCancelledEvent to
+	// remote workers via HTTP callback. Best-effort; missing endpoint on
+	// older SDKs is treated as a no-op.
+	if s.cancelDispatcher != nil {
+		s.cancelDispatcher.Start(ctx)
+	}
+
 	// Start OpenTelemetry execution tracer in background
 	if s.executionTracer != nil {
 		s.executionTracer.Start(ctx)
+	}
+
+	// Start anonymous OSS usage telemetry. Best-effort only.
+	if s.telemetryService != nil {
+		s.telemetryService.Start(ctx)
+	}
+
+	// Boot loop-kind triggers (cron etc.) so a server restart resumes existing schedules.
+	if s.sourceManager != nil {
+		go func() {
+			if err := s.sourceManager.LoadAll(context.Background()); err != nil {
+				logger.Logger.Warn().Err(err).Msg("source manager: LoadAll failed")
+			}
+		}()
 	}
 
 	// Start reasoner event heartbeat (30 second intervals)
@@ -573,9 +678,59 @@ func (s *AgentFieldServer) Start() error {
 		return fmt.Errorf("failed to start admin gRPC server: %w", err)
 	}
 
-	// TODO: Implement WebSocket, gRPC
-	// Start HTTP server
-	return s.Router.Run(":" + strconv.Itoa(s.config.AgentField.Port))
+	// Start HTTP server (using net/http.Server for graceful shutdown support)
+	addr := ":" + strconv.Itoa(s.config.AgentField.Port)
+	httpServer := &http.Server{
+		Addr:    addr,
+		Handler: s.Router,
+	}
+	if !s.setHTTPServer(httpServer) {
+		return nil
+	}
+	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		return fmt.Errorf("failed to start HTTP server on %s: %w", addr, err)
+	}
+	return nil
+}
+
+func (s *AgentFieldServer) setHTTPServer(httpServer *http.Server) bool {
+	s.httpServerMu.Lock()
+	defer s.httpServerMu.Unlock()
+	if s.stopping {
+		return false
+	}
+	s.httpServer = httpServer
+	return true
+}
+
+func (s *AgentFieldServer) getHTTPServer() *http.Server {
+	s.httpServerMu.RLock()
+	defer s.httpServerMu.RUnlock()
+	return s.httpServer
+}
+
+func (s *AgentFieldServer) shutdownHTTPServer() error {
+	httpServer := s.getHTTPServer()
+	if httpServer == nil {
+		return nil
+	}
+
+	var shutdownTimeout time.Duration
+	if s.config != nil {
+		shutdownTimeout = s.config.AgentField.ShutdownTimeout
+	}
+	if shutdownTimeout <= 0 {
+		shutdownTimeout = 30 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
+	defer cancel()
+	if err := httpServer.Shutdown(ctx); err != nil {
+		logger.Logger.Error().Err(err).Msg("HTTP server shutdown timed out, forcing close")
+		_ = httpServer.Close()
+		return err
+	}
+	logger.Logger.Info().Msg("HTTP server shut down gracefully")
+	return nil
 }
 
 func (s *AgentFieldServer) startAdminGRPCServer() error {
@@ -638,6 +793,15 @@ func (s *AgentFieldServer) ListReasoners(ctx context.Context, _ *adminpb.ListRea
 
 // Stop gracefully shuts down the AgentFieldServer.
 func (s *AgentFieldServer) Stop() error {
+	s.httpServerMu.Lock()
+	s.stopping = true
+	s.httpServerMu.Unlock()
+
+	httpShutdownErr := s.shutdownHTTPServer()
+	if s.runAuthority != nil {
+		s.runAuthority.Close()
+	}
+
 	if s.adminGRPCServer != nil {
 		s.adminGRPCServer.GracefulStop()
 	}
@@ -655,13 +819,20 @@ func (s *AgentFieldServer) Stop() error {
 	}
 
 	// Stop health monitor service
-	s.healthMonitor.Stop()
+	if s.healthMonitor != nil {
+		s.healthMonitor.Stop()
+	}
 
 	// Stop execution cleanup service
 	if s.cleanupService != nil {
 		if err := s.cleanupService.Stop(); err != nil {
 			logger.Logger.Error().Err(err).Msg("Failed to stop execution cleanup service")
 		}
+	}
+
+	// Stop cancel dispatcher
+	if s.cancelDispatcher != nil {
+		s.cancelDispatcher.Stop()
 	}
 
 	if s.registryWatcherCancel != nil {
@@ -672,6 +843,11 @@ func (s *AgentFieldServer) Stop() error {
 	// Stop UI service heartbeat
 	if s.uiService != nil {
 		s.uiService.StopHeartbeat()
+	}
+
+	// Stop loop-source goroutines.
+	if s.sourceManager != nil {
+		s.sourceManager.StopAll()
 	}
 
 	// Stop observability forwarder
@@ -687,6 +863,9 @@ func (s *AgentFieldServer) Stop() error {
 	if s.executionTracer != nil {
 		s.executionTracer.Stop()
 	}
+	if s.telemetryService != nil {
+		s.telemetryService.Stop()
+	}
 	if s.tracerShutdown != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
@@ -695,8 +874,8 @@ func (s *AgentFieldServer) Stop() error {
 		}
 	}
 
-	// TODO: Implement graceful shutdown for HTTP, WebSocket, gRPC
-	return nil
+	// TODO: Implement graceful shutdown for WebSocket
+	return httpShutdownErr
 }
 
 // setupRoutes composes the full HTTP surface by delegating to focused
@@ -713,6 +892,7 @@ func (s *AgentFieldServer) setupRoutes() {
 
 	s.registerPublicRoutes()
 	s.registerDIDWellKnownRoutes()
+	s.registerARDPublicRoutes()
 
 	s.registerUIStatic()
 	s.registerUIAPI()
@@ -721,22 +901,29 @@ func (s *AgentFieldServer) setupRoutes() {
 	{
 		s.registerCoreRoutes(agentAPI)
 		s.registerMemoryRoutes(agentAPI)
+		s.registerKnowledgeRoutes(agentAPI)
 		s.registerDIDRoutes(agentAPI)
 		s.registerObservabilityRoutes(agentAPI)
 		s.registerAdminRoutes(agentAPI)
 		s.registerConnectorRoutes(agentAPI)
 		s.registerAgenticRoutes(agentAPI)
+		s.registerTriggerRoutes(agentAPI)
+		s.registerARDRoutes(agentAPI)
 	}
 
 	s.registerKBRoutes()
+	s.registerMCPRoutes()
+	s.registerPprofRoutes()
 	s.register404()
 }
+
+var absPathForServerID = filepath.Abs
 
 // generateAgentFieldServerID creates a deterministic af server ID based on the agentfield home directory.
 // This ensures each agentfield instance has a unique ID while being deterministic for the same installation.
 func generateAgentFieldServerID(agentfieldHome string) string {
 	// Use the absolute path of agentfield home to generate a deterministic ID
-	absPath, err := filepath.Abs(agentfieldHome)
+	absPath, err := absPathForServerID(agentfieldHome)
 	if err != nil {
 		// Fallback to the original path if absolute path fails
 		absPath = agentfieldHome

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"strings"
 )
 
 // Message represents a chat message.
@@ -39,6 +40,17 @@ type Request struct {
 
 	// ToolChoice controls how the model selects tools ("auto", "none", or specific)
 	ToolChoice interface{} `json:"tool_choice,omitempty"`
+
+	// Usage opts the request into provider-native usage accounting. For
+	// OpenRouter, {"usage": {"include": true}} makes the response's usage
+	// object carry the native cost of the call; the client sets it
+	// automatically for OpenRouter requests.
+	Usage *RequestUsage `json:"usage,omitempty"`
+}
+
+// RequestUsage is the request-body usage accounting opt-in (OpenRouter shape).
+type RequestUsage struct {
+	Include bool `json:"include"`
 }
 
 // ToolDefinition describes a tool available to the model.
@@ -75,15 +87,34 @@ type Message struct {
 }
 
 type ContentPart struct {
-	Type     string        `json:"type"` // "text" or "image_url"
-	Text     string        `json:"text,omitempty"`
-	ImageURL *ImageURLData `json:"image_url,omitempty"`
+	Type       string          `json:"type"` // "text" or "image_url" or "input_audio" or "file"
+	Text       string          `json:"text,omitempty"`
+	ImageURL   *ImageURLData   `json:"image_url,omitempty"`
+	VideoURL   *VideoURLData   `json:"video_url,omitempty"`
+	InputAudio *InputAudioData `json:"input_audio,omitempty"`
+	InputFile  *InputFileData  `json:"file,omitempty"`
 }
 
 // ImageURLData holds the URL and optional detail level for image content parts.
 type ImageURLData struct {
 	URL    string `json:"url"`
 	Detail string `json:"detail,omitempty"`
+}
+
+// VideoURLData holds the URL or data URL for video content parts.
+type VideoURLData struct {
+	URL string `json:"url"`
+}
+
+// InputAudioData holds the encoded data and the format for the audio content parts.
+type InputAudioData struct {
+	Data   string `json:"data"`
+	Format string `json:"format"`
+}
+
+// InputFileData holds the file data for a generic file content parts.
+type InputFileData struct {
+	FileData string `json:"file_data"`
 }
 
 // MarshalJSON serializes a Message. If the content is a single text part,
@@ -365,6 +396,68 @@ func WithImageBytes(data []byte, mimeType string) Option {
 			ImageURL: &ImageURLData{
 				URL: "data:" + mimeType + ";base64," + encoded,
 			},
+		})
+
+		return nil
+	}
+}
+
+// WithVideoFile attaches a video from a local file.
+func WithVideoFile(path string) Option {
+	return func(r *Request) error {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return fmt.Errorf("read video file: %w", err)
+		}
+
+		mimeType := detectMIMEType(path)
+		if !strings.HasPrefix(mimeType, "video/") {
+			mimeType = "video/mp4"
+		}
+		return WithVideoBytes(data, mimeType)(r)
+	}
+}
+
+// WithVideoURL attaches a video from a remote URL or data URL.
+func WithVideoURL(url string) Option {
+	return func(r *Request) error {
+		if len(r.Messages) == 0 {
+			r.Messages = append(r.Messages, Message{
+				Role:    "user",
+				Content: []ContentPart{},
+			})
+		}
+
+		last := &r.Messages[len(r.Messages)-1]
+		last.Content = append(last.Content, ContentPart{
+			Type:     "video_url",
+			VideoURL: &VideoURLData{URL: url},
+		})
+
+		return nil
+	}
+}
+
+// WithVideoBytes attaches a video from raw bytes.
+func WithVideoBytes(data []byte, mimeType string) Option {
+	return func(r *Request) error {
+		if len(data) == 0 {
+			return nil
+		}
+
+		encoded := base64.StdEncoding.EncodeToString(data)
+
+		if len(r.Messages) == 0 {
+			r.Messages = append(r.Messages, Message{
+				Role:    "user",
+				Content: []ContentPart{},
+			})
+		}
+
+		last := &r.Messages[len(r.Messages)-1]
+		last.Content = append(last.Content, ContentPart{
+			Type:     "video_url",
+			VideoURL: &VideoURLData{URL: "data:" + mimeType + ";base64," + encoded},
 		})
 
 		return nil

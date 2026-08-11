@@ -1,7 +1,7 @@
 // @ts-nocheck
 import { render, screen, fireEvent, within } from "@testing-library/react";
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter } from 'react-router';
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import { NewDashboardPage } from "./NewDashboardPage";
@@ -17,8 +17,8 @@ vi.stubGlobal('ResizeObserver', ResizeObserverMock);
 
 // Mock dependencies
 const mockNavigate = vi.fn();
-vi.mock("react-router-dom", async () => ({
-  ...(await vi.importActual("react-router-dom")),
+vi.mock("react-router", async () => ({
+  ...(await vi.importActual("react-router")),
   useNavigate: () => mockNavigate,
 }));
 
@@ -35,6 +35,7 @@ vi.mock("@/hooks/queries", () => ({
 
 vi.mock("@/services/dashboardService", () => ({
   getDashboardSummary: vi.fn(),
+  getTriggerMetrics: vi.fn(),
 }));
 
 // Mock child components that might have complex internal logic
@@ -48,7 +49,7 @@ vi.mock("@/components/dashboard/DashboardActiveWorkload", () => ({
 
 // Import mocks for manipulation
 import { useRuns, useLLMHealth, useQueueStatus, useAgents } from "@/hooks/queries";
-import { getDashboardSummary } from "@/services/dashboardService";
+import { getDashboardSummary, getTriggerMetrics } from "@/services/dashboardService";
 
 const queryClient = new QueryClient({
   defaultOptions: {
@@ -119,14 +120,17 @@ describe("NewDashboardPage", () => {
       data: { endpoints: [{ name: "test-llm", healthy: true }] },
       isLoading: false,
     });
-    vi.mocked(useQueueStatus).mockReturnValue({ data: { agents: {} }, isLoading: false });
+    vi.mocked(useQueueStatus).mockReturnValue({
+      data: { enabled: true, max_per_agent: 3, total_running: 0, agents: [] },
+      isLoading: false,
+    });
     vi.mocked(useAgents).mockReturnValue({
       data: { count: 1, nodes: [{ health_status: "ready" }] },
       isLoading: false,
     });
     vi.mocked(getDashboardSummary).mockResolvedValue({
       executions: { today: 10 },
-      success_rate: 0.9,
+      success_rate: 90,
       agents: { running: 1 },
     });
   });
@@ -185,7 +189,12 @@ describe("NewDashboardPage", () => {
 
   it("renders issues banner for overloaded agent queues", () => {
     vi.mocked(useQueueStatus).mockReturnValue({
-      data: { agents: { "agent-1": { running: 10, max_concurrent: 10 } } },
+      data: {
+        enabled: true,
+        max_per_agent: 10,
+        total_running: 10,
+        agents: [{ agent_node_id: "agent-1", running: 10, max: 10, available: 0 }],
+      },
       isLoading: false,
     });
     vi.mocked(useRuns).mockReturnValue({ isLoading: false, data: { workflows: [], total_count: 0 } });
@@ -193,7 +202,44 @@ describe("NewDashboardPage", () => {
     render(<NewDashboardPage />, { wrapper });
 
     expect(screen.getByText("System issues")).toBeInTheDocument();
+    expect(screen.getByText("LLM backend health")).toBeInTheDocument();
+    expect(screen.getByText("Healthy")).toBeInTheDocument();
     expect(screen.getByText(/Queue at capacity for agent: agent-1/i)).toBeInTheDocument();
+  });
+
+  it("renders queue card disabled state when limiter is off", () => {
+    vi.mocked(useQueueStatus).mockReturnValue({
+      data: {
+        enabled: false,
+        max_per_agent: 0,
+        total_running: 0,
+        agents: [],
+      },
+      isLoading: false,
+    });
+    vi.mocked(useRuns).mockReturnValue({ isLoading: false, data: { workflows: [], total_count: 0 } });
+
+    render(<NewDashboardPage />, { wrapper });
+
+    expect(screen.getByText("Queue concurrency")).toBeInTheDocument();
+    expect(screen.getByText("Concurrency limiter is disabled.")).toBeInTheDocument();
+  });
+
+  it("computes total running from agents when API omits total_running", () => {
+    vi.mocked(useQueueStatus).mockReturnValue({
+      data: {
+        enabled: true,
+        max_per_agent: 3,
+        agents: [{ agent_node_id: "agent-fallback", running: 2, max: 3, available: 1 }],
+      },
+      isLoading: false,
+    });
+    vi.mocked(useRuns).mockReturnValue({ isLoading: false, data: { workflows: [], total_count: 0 } });
+
+    render(<NewDashboardPage />, { wrapper });
+
+    expect(screen.getByText("2 running")).toBeInTheDocument();
+    expect(screen.getByText("Max concurrency per agent: 3")).toBeInTheDocument();
   });
   
   it("renders failures attention card with failed runs", () => {
@@ -233,7 +279,7 @@ describe("NewDashboardPage", () => {
     });
     vi.mocked(getDashboardSummary).mockResolvedValue({
         executions: { today: 123 },
-        success_rate: 0.88,
+        success_rate: 88,
         agents: { running: 5 },
     });
     

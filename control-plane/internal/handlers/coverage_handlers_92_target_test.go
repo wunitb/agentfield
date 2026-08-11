@@ -89,6 +89,21 @@ func (s *cancelHandlerErrorStorage) GetExecutionRecord(_ context.Context, _ stri
 	return &copy, nil
 }
 
+func (s *cancelHandlerErrorStorage) GetExecutionRecordsBatch(_ context.Context, executionIDs []string) (map[string]*types.Execution, error) {
+	if s.getExecErr != nil {
+		return nil, s.getExecErr
+	}
+	result := make(map[string]*types.Execution, len(executionIDs))
+	if s.exec == nil {
+		return result, nil
+	}
+	for _, id := range executionIDs {
+		copy := *s.exec
+		result[id] = &copy
+	}
+	return result, nil
+}
+
 func (s *cancelHandlerErrorStorage) GetWorkflowExecution(_ context.Context, _ string) (*types.WorkflowExecution, error) {
 	if s.getWorkflowErr != nil {
 		return nil, s.getWorkflowErr
@@ -169,6 +184,21 @@ func (s *workflowEventStoreStub) GetExecutionRecord(_ context.Context, _ string)
 	return &copy, nil
 }
 
+func (s *workflowEventStoreStub) GetExecutionRecordsBatch(_ context.Context, executionIDs []string) (map[string]*types.Execution, error) {
+	result := make(map[string]*types.Execution, len(executionIDs))
+	if s.getErr != nil {
+		return nil, s.getErr
+	}
+	if s.exec == nil {
+		return result, nil
+	}
+	for _, id := range executionIDs {
+		copy := *s.exec
+		result[id] = &copy
+	}
+	return result, nil
+}
+
 func (s *workflowEventStoreStub) CreateExecutionRecord(_ context.Context, execution *types.Execution) error {
 	s.createdExec = execution
 	return s.createErr
@@ -207,7 +237,11 @@ func TestAgentConcurrencyLimiter_MaxPerAgentNilAndConfigured(t *testing.T) {
 }
 
 func TestExecutionCleanupService_StartStopBranches(t *testing.T) {
-	t.Parallel()
+	// NOT t.Parallel(): this test swaps the process-global logger.Logger via
+	// setupExecutionCleanupTestLogger. Running it in parallel let a sibling test
+	// reassign the global logger mid-run, contaminating log buffers and flaking
+	// the coverage CI job. Keep it in the serial phase, like the other
+	// logger-swapping tests in execution_cleanup_test.go.
 
 	t.Run("disabled start is no-op", func(t *testing.T) {
 		service := NewExecutionCleanupService(&cleanupStoreMock{}, config.ExecutionCleanupConfig{Enabled: false})
@@ -341,7 +375,10 @@ func TestIsLightweightRequestQueryVariants(t *testing.T) {
 }
 
 func TestDiscoveryLoggingIncludesOptionalRequestID(t *testing.T) {
-	t.Parallel()
+	// NOT t.Parallel(): this test swaps the process-global logger.Logger via
+	// setupExecutionCleanupTestLogger and then asserts on the captured buffer.
+	// In parallel, a sibling test reassigning the global logger emptied this
+	// buffer and flaked the coverage CI job. Keep it in the serial phase.
 	gin.SetMode(gin.TestMode)
 
 	logBuffer := setupExecutionCleanupTestLogger(t)
@@ -386,7 +423,7 @@ func TestNodeRESTHandlersAdditionalBranches(t *testing.T) {
 		presence := services.NewPresenceManager(nil, services.PresenceManagerConfig{})
 
 		router := gin.New()
-		router.PUT("/nodes/:node_id/status", NodeStatusLeaseHandler(store, nil, presence, 0))
+		router.PUT("/nodes/:node_id/status", NodeStatusLeaseHandler(store, nil, nil, presence, 0))
 
 		req := httptest.NewRequest(http.MethodPut, "/nodes/node-1/status", strings.NewReader(`{"phase":"ready"}`))
 		req.Header.Set("Content-Type", "application/json")
@@ -408,7 +445,7 @@ func TestNodeRESTHandlersAdditionalBranches(t *testing.T) {
 			agent: &types.AgentNode{ID: "node-2", Version: "v2"},
 		}
 		router := gin.New()
-		router.PUT("/nodes/:node_id/status", NodeStatusLeaseHandler(store, nil, nil, time.Minute))
+		router.PUT("/nodes/:node_id/status", NodeStatusLeaseHandler(store, nil, nil, nil, time.Minute))
 
 		req := httptest.NewRequest(http.MethodPut, "/nodes/node-2/status", strings.NewReader(`{"health_score":101}`))
 		req.Header.Set("Content-Type", "application/json")

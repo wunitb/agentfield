@@ -40,6 +40,9 @@ type TagVCVerifierInterface interface {
 type PermissionConfig struct {
 	// Enabled determines if permission checking is active
 	Enabled bool
+	// DefaultDeny returns 403 instead of allowing fall-through when no
+	// access policy matches. Default false preserves backward compat.
+	DefaultDeny bool
 }
 
 // PermissionCheckResult contains the result of a permission check.
@@ -69,7 +72,12 @@ const (
 //  2. Resolves the target agent from the request path
 //  3. Evaluates access policies based on caller/target tags
 //  4. If a policy denies access, returns 403 Forbidden
-//  5. If no policy matches, allows the request (backward compat for untagged agents)
+//  5. If no policy matches and DefaultDeny is false, allows the request
+//     (backward compat for untagged agents). When DefaultDeny is true,
+//     returns HTTP 403 with an opaque error. The unmatched
+//     (caller_tags, target_tags, function) tuple is logged at DEBUG in
+//     both modes; it is not included in the response body to avoid
+//     leaking tag taxonomy to denied callers.
 func PermissionCheckMiddleware(
 	policyService AccessPolicyServiceInterface,
 	tagVCVerifier TagVCVerifierInterface,
@@ -143,16 +151,21 @@ func PermissionCheckMiddleware(
 		// Parse function name from target param for policy evaluation.
 		_, functionName, _ := parseTargetParam(target)
 
-		// Resolve caller agent identity (used by both policy evaluation and anonymous check).
+		// Resolve caller agent identity from the verified DID only. Caller identity
+		// headers are client-controlled and must not influence authorization.
 		var callerAgentID string
 		if callerDID != "" {
 			callerAgentID = didResolver.ResolveAgentIDByDID(ctx, callerDID)
-		}
-		if callerAgentID == "" {
-			callerAgentID = c.GetHeader("X-Caller-Agent-ID")
 			if callerAgentID == "" {
-				callerAgentID = c.GetHeader("X-Agent-Node-ID")
+				logger.Logger.Warn().
+					Str("caller_did", callerDID).
+					Msg("Permission middleware: verified caller DID did not resolve to an agent ID, treating caller as anonymous")
 			}
+		} else if c.GetHeader("X-Caller-Agent-ID") != "" || c.GetHeader("X-Agent-Node-ID") != "" {
+			logger.Logger.Warn().
+				Bool("x_caller_agent_id_present", c.GetHeader("X-Caller-Agent-ID") != "").
+				Bool("x_agent_node_id_present", c.GetHeader("X-Agent-Node-ID") != "").
+				Msg("Permission middleware: caller identity headers ignored without a verified DID, treating caller as anonymous")
 		}
 
 		// --- Tag-based policy evaluation ---
@@ -232,9 +245,26 @@ func PermissionCheckMiddleware(
 				c.Next()
 				return
 			}
+
+			// No policy matched. Log the tuple at DEBUG so operators can
+			// diagnose coverage gaps even when DefaultDeny is off.
+			logger.Logger.Debug().
+				Str("target", target).
+				Str("function", functionName).
+				Strs("caller_tags", callerTags).
+				Strs("target_tags", tags).
+				Msg("Permission middleware: no policy matched")
+
+			if config.DefaultDeny {
+				c.AbortWithStatusJSON(http.StatusForbidden, gin.H{
+					"error":   "no_policy_matched",
+					"message": "no access policy matches this request; see server logs for the unmatched tuple",
+				})
+				return
+			}
 		}
 
-		// No policy matched — allow (backward compat for untagged agents)
+		// No policy service configured, or no policy matched with DefaultDeny off.
 		c.Set(string(PermissionCheckResultKey), &PermissionCheckResult{Allowed: true})
 		c.Next()
 	}

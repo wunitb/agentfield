@@ -6,13 +6,17 @@ export { useLLMHealth, useQueueStatus } from "./useSystemHealth";
 export type {
   LLMHealthResponse,
   LLMEndpointHealth,
+  LLMCircuitState,
   QueueStatusResponse,
   QueueAgentStatus,
 } from "./useSystemHealth";
 export {
   useCancelExecution,
+  useCancelWorkflowTree,
   usePauseExecution,
+  useRestartExecution,
   useResumeExecution,
+  useSaveGoldenRun,
 } from "./useExecutionMutations";
 export {
   ACCESS_MANAGEMENT_QUERY_KEY,

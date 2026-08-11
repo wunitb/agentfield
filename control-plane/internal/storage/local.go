@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -19,6 +18,7 @@ import (
 	"time"
 
 	"github.com/Agent-Field/agentfield/control-plane/internal/events"
+	"github.com/Agent-Field/agentfield/control-plane/internal/logger"
 	"github.com/Agent-Field/agentfield/control-plane/pkg/types"
 
 	"github.com/boltdb/bolt"
@@ -553,7 +553,7 @@ func (ls *LocalStorage) initializeSQLite(ctx context.Context) error {
 		if err != nil {
 			return fmt.Errorf("failed to convert database path to absolute path: %w", err)
 		}
-		log.Printf("⚠️  WARNING: Database path was relative (%s), converted to absolute path: %s", dbPath, absPath)
+		logger.Logger.Warn().Msgf("Database path was relative (%s), converted to absolute path: %s", dbPath, absPath)
 		dbPath = absPath
 	}
 
@@ -563,7 +563,7 @@ func (ls *LocalStorage) initializeSQLite(ctx context.Context) error {
 		return fmt.Errorf("failed to create database directory %s: %w", dbDir, err)
 	}
 
-	log.Printf("📁 Initializing SQLite database at: %s", dbPath)
+	logger.Logger.Info().Msgf("Initializing SQLite database at: %s", dbPath)
 
 	busyTimeout := resolveEnvInt("AGENTFIELD_SQLITE_BUSY_TIMEOUT_MS", 60000)
 	if busyTimeout <= 0 {
@@ -631,7 +631,7 @@ func resolveEnvInt(key string, fallback int) int {
 	}
 	value, err := strconv.Atoi(raw)
 	if err != nil {
-		log.Printf("⚠️  Invalid integer for %s=%s, using fallback %d", key, raw, fallback)
+		logger.Logger.Warn().Msgf("Invalid integer for %s=%s, using fallback %d", key, raw, fallback)
 		return fallback
 	}
 	return value
@@ -916,7 +916,7 @@ func (ls *LocalStorage) createSchema(ctx context.Context) error {
 	if err := ls.setupWorkflowExecutionFTS(); err != nil {
 		if strings.Contains(err.Error(), "no such module: fts5") {
 			ls.ftsEnabled = false
-			log.Printf("FTS5 module not available, full-text search will be degraded")
+			logger.Logger.Warn().Msg("FTS5 module not available, full-text search will be degraded")
 		} else {
 			return err
 		}
@@ -1207,6 +1207,9 @@ func (ls *LocalStorage) ensureSQLiteIndexes() error {
 		"CREATE INDEX IF NOT EXISTS idx_execution_vcs_status ON execution_vcs(status)",
 		"CREATE INDEX IF NOT EXISTS idx_execution_vcs_parent_vc_id ON execution_vcs(parent_vc_id)",
 		"CREATE INDEX IF NOT EXISTS idx_execution_vcs_created_at ON execution_vcs(created_at)",
+		"CREATE INDEX IF NOT EXISTS idx_execution_vcs_kind ON execution_vcs(kind)",
+		"CREATE INDEX IF NOT EXISTS idx_execution_vcs_trigger_id ON execution_vcs(trigger_id)",
+		"CREATE INDEX IF NOT EXISTS idx_execution_vcs_event_id ON execution_vcs(event_id)",
 		"CREATE UNIQUE INDEX IF NOT EXISTS idx_execution_vcs_execution_unique ON execution_vcs(execution_id, issuer_did, target_did)",
 		"CREATE INDEX IF NOT EXISTS idx_workflow_vcs_workflow_id ON workflow_vcs(workflow_id)",
 		"CREATE INDEX IF NOT EXISTS idx_workflow_vcs_session_id ON workflow_vcs(session_id)",
@@ -1338,7 +1341,7 @@ func (ls *LocalStorage) runPostgresMigrations(ctx context.Context) error {
 		if _, err := ls.db.ExecContext(ctx, `INSERT INTO schema_migrations (version, description) VALUES ($1, $2)`, m.version, m.description); err != nil {
 			return fmt.Errorf("failed to record migration %s: %w", m.version, err)
 		}
-		log.Printf("Applied postgres migration %s: %s", m.version, m.description)
+		logger.Logger.Info().Msgf("Applied postgres migration %s: %s", m.version, m.description)
 	}
 
 	return nil
@@ -1369,6 +1372,11 @@ func buildExecutionVCTableSQL(tableName string, includeIfNotExists bool) string 
 		status TEXT NOT NULL DEFAULT 'pending' CHECK (status IN ('unknown', 'pending', 'queued', 'running', 'waiting', 'paused', 'succeeded', 'failed', 'cancelled', 'timeout', 'revoked')),
 		parent_vc_id TEXT,
 		child_vc_ids TEXT DEFAULT '[]',
+		kind TEXT NOT NULL DEFAULT 'execution',
+		trigger_id TEXT,
+		source_name TEXT,
+		event_type TEXT,
+		event_id TEXT,
 		created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 		updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
 		FOREIGN KEY (parent_vc_id) REFERENCES %s(vc_id) ON DELETE SET NULL
@@ -1455,7 +1463,7 @@ func (ls *LocalStorage) ensureExecutionVCSchema() error {
 		return nil
 	}
 
-	log.Printf("Migrating execution_vcs table to remove component_dids foreign keys for VC persistence")
+	logger.Logger.Info().Msg("Migrating execution_vcs table to remove component_dids foreign keys for VC persistence")
 
 	tx, err := ls.db.Begin()
 	if err != nil {
@@ -1521,7 +1529,7 @@ func (ls *LocalStorage) ensureWorkflowVCSchema() error {
 		return nil
 	}
 
-	log.Printf("Migrating workflow_vcs table to update status constraint")
+	logger.Logger.Info().Msg("Migrating workflow_vcs table to update status constraint")
 
 	tx, err := ls.db.Begin()
 	if err != nil {
@@ -1709,16 +1717,16 @@ func (ls *LocalStorage) runMigrations() error {
 		}
 
 		// Apply the migration
-		log.Printf("Applying migration %s: %s", migration.version, migration.description)
+		logger.Logger.Info().Msgf("Applying migration %s: %s", migration.version, migration.description)
 
 		// Execute the migration SQL
 		_, err = ls.db.Exec(migration.sql)
 		if err != nil {
 			// For ALTER TABLE operations, check if column already exists
 			if strings.Contains(err.Error(), "duplicate column name") {
-				log.Printf("Column already exists for migration %s, marking as applied", migration.version)
+				logger.Logger.Info().Msgf("Column already exists for migration %s, marking as applied", migration.version)
 			} else if strings.Contains(err.Error(), "no such module: fts5") {
-				log.Printf("FTS5 module not available, skipping migration %s (search will be degraded)", migration.version)
+				logger.Logger.Warn().Msgf("FTS5 module not available, skipping migration %s (search will be degraded)", migration.version)
 			} else {
 				return fmt.Errorf("failed to apply migration %s: %w", migration.version, err)
 			}
@@ -1731,7 +1739,7 @@ func (ls *LocalStorage) runMigrations() error {
 			return fmt.Errorf("failed to record migration %s: %w", migration.version, err)
 		}
 
-		log.Printf("Successfully applied migration %s", migration.version)
+		logger.Logger.Info().Msgf("Successfully applied migration %s", migration.version)
 	}
 
 	return nil
@@ -2016,14 +2024,14 @@ func (ls *LocalStorage) StoreWorkflowExecution(ctx context.Context, execution *t
 // storeWorkflowExecutionInternal performs the actual storage operation
 func (ls *LocalStorage) storeWorkflowExecutionInternal(ctx context.Context, execution *types.WorkflowExecution) error {
 	// DIAGNOSTIC: Log concurrent transaction attempt
-	log.Printf("🔒 CONCURRENCY_DEBUG: Starting transaction for execution %s", execution.ExecutionID)
+	logger.Logger.Debug().Str("execution_id", execution.ExecutionID).Msg("starting transaction for workflow execution")
 
 	// Begin transaction for atomic operation
 	tx, err := ls.db.BeginTx(ctx, nil)
 	if err != nil {
 		// DIAGNOSTIC: Log database lock errors
 		if ls.isRetryableError(err) {
-			log.Printf("🚨 DATABASE_LOCK: Failed to begin transaction for execution %s: %v", execution.ExecutionID, err)
+			logger.Logger.Warn().Err(err).Str("execution_id", execution.ExecutionID).Msg("database lock: failed to begin transaction")
 		}
 		return fmt.Errorf("failed to begin transaction: %w", err)
 	}
@@ -2033,7 +2041,7 @@ func (ls *LocalStorage) storeWorkflowExecutionInternal(ctx context.Context, exec
 	if err := ls.executeWorkflowInsert(ctx, tx, execution); err != nil {
 		// DIAGNOSTIC: Log insert/update failures
 		if ls.isRetryableError(err) {
-			log.Printf("🚨 DATABASE_LOCK: Failed to execute workflow insert for execution %s: %v", execution.ExecutionID, err)
+			logger.Logger.Warn().Err(err).Str("execution_id", execution.ExecutionID).Msg("database lock: failed to execute workflow insert")
 		}
 		return err
 	}
@@ -2042,12 +2050,12 @@ func (ls *LocalStorage) storeWorkflowExecutionInternal(ctx context.Context, exec
 	if err := tx.Commit(); err != nil {
 		// DIAGNOSTIC: Log commit failures
 		if ls.isRetryableError(err) {
-			log.Printf("🚨 DATABASE_LOCK: Failed to commit transaction for execution %s: %v", execution.ExecutionID, err)
+			logger.Logger.Warn().Err(err).Str("execution_id", execution.ExecutionID).Msg("database lock: failed to commit transaction")
 		}
 		return fmt.Errorf("failed to commit workflow execution transaction: %w", err)
 	}
 
-	log.Printf("✅ CONCURRENCY_DEBUG: Successfully committed transaction for execution %s", execution.ExecutionID)
+	logger.Logger.Debug().Str("execution_id", execution.ExecutionID).Msg("successfully committed workflow execution transaction")
 	return nil
 }
 
@@ -2093,7 +2101,7 @@ func (ls *LocalStorage) retryDatabaseOperation(ctx context.Context, operationID 
 		err := operation()
 		if err == nil {
 			if attempt > 0 {
-				log.Printf("🔄 RETRY_SUCCESS: Operation succeeded on attempt %d for %s", attempt+1, operationID)
+				logger.Logger.Debug().Msgf("retry succeeded on attempt %d for %s", attempt+1, operationID)
 			}
 			return nil
 		}
@@ -2102,7 +2110,7 @@ func (ls *LocalStorage) retryDatabaseOperation(ctx context.Context, operationID 
 
 		// Check if error is retryable
 		if !ls.isRetryableError(err) {
-			log.Printf("❌ NON_RETRYABLE: Operation failed with non-retryable error for %s: %v", operationID, err)
+			logger.Logger.Debug().Err(err).Msgf("non-retryable error for %s", operationID)
 			return err
 		}
 
@@ -2113,7 +2121,7 @@ func (ls *LocalStorage) retryDatabaseOperation(ctx context.Context, operationID 
 
 		// Calculate delay with exponential backoff
 		delay := time.Duration(1<<uint(attempt)) * baseDelay
-		log.Printf("🔄 RETRY_ATTEMPT: Retrying operation for %s in %v (attempt %d/%d): %v", operationID, delay, attempt+1, maxRetries, err)
+		logger.Logger.Debug().Msgf("retrying operation for %s in %v (attempt %d/%d): %v", operationID, delay, attempt+1, maxRetries, err)
 
 		// Wait with context cancellation support
 		select {
@@ -2124,7 +2132,7 @@ func (ls *LocalStorage) retryDatabaseOperation(ctx context.Context, operationID 
 		}
 	}
 
-	log.Printf("🚨 RETRY_EXHAUSTED: All retry attempts failed for %s: %v", operationID, lastErr)
+	logger.Logger.Warn().Err(lastErr).Msgf("all retry attempts exhausted for %s", operationID)
 	return fmt.Errorf("operation failed after %d retries: %w", maxRetries, lastErr)
 }
 
@@ -2158,7 +2166,7 @@ func (ls *LocalStorage) executeWorkflowInsert(ctx context.Context, q DBTX, execu
 	// If execution exists, validate the state transition
 	if existingExecution != nil {
 		if err := validateExecutionStateTransition(existingExecution.Status, execution.Status); err != nil {
-			log.Printf("Invalid workflow execution state transition blocked: execution_id=%s, current=%s, new=%s",
+			logger.Logger.Warn().Msgf("Invalid workflow execution state transition blocked: execution_id=%s, current=%s, new=%s",
 				execution.ExecutionID, existingExecution.Status, execution.Status)
 
 			// Add execution ID to the error for better context
@@ -2202,7 +2210,7 @@ func (ls *LocalStorage) executeWorkflowInsert(ctx context.Context, q DBTX, execu
 			return fmt.Errorf("failed to update workflow execution: %w", err)
 		}
 
-		log.Printf("Successfully updated workflow execution: execution_id=%s, status=%s", execution.ExecutionID, execution.Status)
+		logger.Logger.Debug().Msgf("Successfully updated workflow execution: execution_id=%s, status=%s", execution.ExecutionID, execution.Status)
 		return nil
 	}
 
@@ -2250,7 +2258,7 @@ func (ls *LocalStorage) executeWorkflowInsert(ctx context.Context, q DBTX, execu
 		return fmt.Errorf("failed to insert workflow execution: %w", err)
 	}
 
-	log.Printf("Successfully inserted new workflow execution: execution_id=%s, status=%s", execution.ExecutionID, execution.Status)
+	logger.Logger.Debug().Msgf("Successfully inserted new workflow execution: execution_id=%s, status=%s", execution.ExecutionID, execution.Status)
 	return nil
 }
 
@@ -2281,7 +2289,7 @@ func (ls *LocalStorage) UpdateWorkflowExecution(ctx context.Context, executionID
 
 		// Wait before retrying with exponential backoff
 		delay := baseDelay * time.Duration(1<<attempt) // 50ms, 100ms, 200ms
-		log.Printf("🔄 RETRY: Database locked, retrying workflow update for %s in %v (attempt %d/%d)", executionID, delay, attempt+1, maxRetries+1)
+		logger.Logger.Debug().Msgf("database locked, retrying workflow update for %s in %v (attempt %d/%d)", executionID, delay, attempt+1, maxRetries+1)
 
 		select {
 		case <-time.After(delay):
@@ -4456,8 +4464,8 @@ func (ls *LocalStorage) executeRegisterAgent(ctx context.Context, q DBTX, agent 
 		INSERT INTO agent_nodes (
 			id, version, group_id, team_id, base_url, traffic_weight, deployment_type, invocation_url, reasoners, skills,
 			communication_config, health_status, lifecycle_status, last_heartbeat,
-			registered_at, features, metadata, proposed_tags, approved_tags
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+			registered_at, features, metadata, proposed_tags, approved_tags, instance_id
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT(id, version) DO UPDATE SET
 			group_id = excluded.group_id,
 			team_id = excluded.team_id,
@@ -4474,7 +4482,8 @@ func (ls *LocalStorage) executeRegisterAgent(ctx context.Context, q DBTX, agent 
 			features = excluded.features,
 			metadata = excluded.metadata,
 			proposed_tags = excluded.proposed_tags,
-			approved_tags = excluded.approved_tags;`
+			approved_tags = excluded.approved_tags,
+			instance_id = CASE WHEN excluded.instance_id = '' THEN agent_nodes.instance_id ELSE excluded.instance_id END;`
 
 	reasonersJSON, err := json.Marshal(agent.Reasoners)
 	if err != nil {
@@ -4492,6 +4501,7 @@ func (ls *LocalStorage) executeRegisterAgent(ctx context.Context, q DBTX, agent 
 	if err != nil {
 		return fmt.Errorf("failed to marshal agent features: %w", err)
 	}
+	types.SyncAgentSessionsToMetadata(agent)
 	metadataJSON, err := json.Marshal(agent.Metadata)
 	if err != nil {
 		return fmt.Errorf("failed to marshal agent metadata: %w", err)
@@ -4514,6 +4524,7 @@ func (ls *LocalStorage) executeRegisterAgent(ctx context.Context, q DBTX, agent 
 		agent.ID, agent.Version, agent.GroupID, agent.TeamID, agent.BaseURL, trafficWeight, agent.DeploymentType, agent.InvocationURL,
 		reasonersJSON, skillsJSON, commConfigJSON, agent.HealthStatus, agent.LifecycleStatus,
 		agent.LastHeartbeat, agent.RegisteredAt, featuresJSON, metadataJSON, proposedTagsJSON, approvedTagsJSON,
+		agent.InstanceID,
 	)
 
 	if err != nil {
@@ -4536,7 +4547,7 @@ func (ls *LocalStorage) GetAgent(ctx context.Context, id string) (*types.AgentNo
 		SELECT
 			id, version, group_id, team_id, base_url, traffic_weight, deployment_type, invocation_url, reasoners, skills,
 			communication_config, health_status, lifecycle_status, last_heartbeat,
-			registered_at, features, metadata, proposed_tags, approved_tags
+			registered_at, features, metadata, proposed_tags, approved_tags, COALESCE(instance_id, '')
 		FROM agent_nodes WHERE id = ?
 		ORDER BY CASE WHEN version = '' THEN 0 ELSE 1 END, version ASC
 		LIMIT 1`
@@ -4554,7 +4565,7 @@ func (ls *LocalStorage) GetAgent(ctx context.Context, id string) (*types.AgentNo
 		&agent.ID, &agent.Version, &agent.GroupID, &agent.TeamID, &agent.BaseURL, &agent.TrafficWeight, &agent.DeploymentType, &invocationURL,
 		&reasonersJSON, &skillsJSON, &commConfigJSON, &healthStatusStr, &lifecycleStatusStr,
 		&lastHeartbeat, &registeredAt, &featuresJSON, &metadataJSON,
-		&proposedTagsJSON, &approvedTagsJSON,
+		&proposedTagsJSON, &approvedTagsJSON, &agent.InstanceID,
 	)
 
 	if err != nil {
@@ -4602,6 +4613,7 @@ func (ls *LocalStorage) GetAgent(ctx context.Context, id string) (*types.AgentNo
 			return nil, fmt.Errorf("failed to unmarshal agent metadata: %w", err)
 		}
 	}
+	types.HydrateAgentSessions(agent)
 	if len(proposedTagsJSON) > 0 {
 		if err := json.Unmarshal(proposedTagsJSON, &agent.ProposedTags); err != nil {
 			return nil, fmt.Errorf("failed to unmarshal agent proposed tags: %w", err)
@@ -4649,7 +4661,7 @@ func (ls *LocalStorage) GetAgentVersion(ctx context.Context, id string, version 
 		SELECT
 			id, version, group_id, team_id, base_url, traffic_weight, deployment_type, invocation_url, reasoners, skills,
 			communication_config, health_status, lifecycle_status, last_heartbeat,
-			registered_at, features, metadata, proposed_tags, approved_tags
+			registered_at, features, metadata, proposed_tags, approved_tags, COALESCE(instance_id, '')
 		FROM agent_nodes WHERE id = ? AND version = ?`
 
 	row := ls.db.QueryRowContext(ctx, query, id, version)
@@ -4679,7 +4691,7 @@ func (ls *LocalStorage) ListAgentVersions(ctx context.Context, id string) ([]*ty
 		SELECT
 			id, version, group_id, team_id, base_url, traffic_weight, deployment_type, invocation_url, reasoners, skills,
 			communication_config, health_status, lifecycle_status, last_heartbeat,
-			registered_at, features, metadata, proposed_tags, approved_tags
+			registered_at, features, metadata, proposed_tags, approved_tags, COALESCE(instance_id, '')
 		FROM agent_nodes WHERE id = ? AND version != '' ORDER BY registered_at DESC`
 
 	rows, err := ls.db.QueryContext(ctx, query, id)
@@ -4704,7 +4716,7 @@ func (ls *LocalStorage) scanAgentNode(row *sql.Row) (*types.AgentNode, error) {
 		&agent.ID, &agent.Version, &agent.GroupID, &agent.TeamID, &agent.BaseURL, &agent.TrafficWeight, &agent.DeploymentType, &invocationURL,
 		&reasonersJSON, &skillsJSON, &commConfigJSON, &healthStatusStr, &lifecycleStatusStr,
 		&lastHeartbeat, &registeredAt, &featuresJSON, &metadataJSON,
-		&proposedTagsJSON, &approvedTagsJSON,
+		&proposedTagsJSON, &approvedTagsJSON, &agent.InstanceID,
 	)
 	if err != nil {
 		if err == sql.ErrNoRows {
@@ -4743,7 +4755,7 @@ func (ls *LocalStorage) scanAgentNodes(ctx context.Context, rows *sql.Rows) ([]*
 			&agent.ID, &agent.Version, &agent.GroupID, &agent.TeamID, &agent.BaseURL, &agent.TrafficWeight, &agent.DeploymentType, &invocationURL,
 			&reasonersJSON, &skillsJSON, &commConfigJSON, &healthStatusStr, &lifecycleStatusStr,
 			&lastHeartbeat, &registeredAt, &featuresJSON, &metadataJSON,
-			&proposedTagsJSON, &approvedTagsJSON,
+			&proposedTagsJSON, &approvedTagsJSON, &agent.InstanceID,
 		)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan agent node row: %w", err)
@@ -4792,6 +4804,7 @@ func (ls *LocalStorage) postProcessAgentNode(agent *types.AgentNode, healthStatu
 	if len(metadataJSON) > 0 {
 		_ = json.Unmarshal(metadataJSON, &agent.Metadata)
 	}
+	types.HydrateAgentSessions(agent)
 	if len(proposedTagsJSON) > 0 {
 		_ = json.Unmarshal(proposedTagsJSON, &agent.ProposedTags)
 	}
@@ -4831,7 +4844,7 @@ func (ls *LocalStorage) ListAgents(ctx context.Context, filters types.AgentFilte
 		SELECT
 			id, version, group_id, team_id, base_url, traffic_weight, deployment_type, invocation_url, reasoners, skills,
 			communication_config, health_status, lifecycle_status, last_heartbeat,
-			registered_at, features, metadata, proposed_tags, approved_tags
+			registered_at, features, metadata, proposed_tags, approved_tags, COALESCE(instance_id, '')
 		FROM agent_nodes`
 
 	var conditions []string
@@ -6348,7 +6361,7 @@ func (ls *LocalStorage) StoreAgentFieldServerDID(ctx context.Context, agentfield
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	log.Printf("Successfully stored af server DID: agentfield_server_id=%s, root_did=%s", agentfieldServerID, rootDID)
+	logger.Logger.Debug().Msgf("Successfully stored af server DID: agentfield_server_id=%s, root_did=%s", agentfieldServerID, rootDID)
 	return nil
 }
 
@@ -6458,7 +6471,7 @@ func (ls *LocalStorage) StoreAgentDIDWithComponents(ctx context.Context, agentID
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	log.Printf("Successfully stored agent DID with %d components: agent_id=%s, did=%s", len(components), agentID, agentDID)
+	logger.Logger.Debug().Msgf("Successfully stored agent DID with %d components: agent_id=%s, did=%s", len(components), agentID, agentDID)
 	return nil
 }
 
@@ -6537,7 +6550,7 @@ func (ls *LocalStorage) StoreDID(ctx context.Context, did string, didDocument, p
 	if err != nil {
 		// Check if this is a unique constraint violation (duplicate DID)
 		if strings.Contains(err.Error(), "UNIQUE constraint failed") || strings.Contains(err.Error(), "did_registry.did") {
-			log.Printf("Duplicate DID registry entry detected: %s", did)
+			logger.Logger.Warn().Msgf("Duplicate DID registry entry detected: %s", did)
 			return &DuplicateDIDError{
 				DID:  did,
 				Type: "registry",
@@ -6546,7 +6559,7 @@ func (ls *LocalStorage) StoreDID(ctx context.Context, did string, didDocument, p
 		return fmt.Errorf("failed to store DID: %w", err)
 	}
 
-	log.Printf("Successfully stored DID registry entry: %s", did)
+	logger.Logger.Debug().Msgf("Successfully stored DID registry entry: %s", did)
 	return nil
 }
 
@@ -6772,7 +6785,7 @@ func (ls *LocalStorage) StoreAgentDID(ctx context.Context, agentID, agentDID, ag
 		if execErr != nil {
 			// Check if this is a unique constraint violation (duplicate agent DID)
 			if strings.Contains(execErr.Error(), "UNIQUE constraint failed") || strings.Contains(execErr.Error(), "agent_dids") {
-				log.Printf("Duplicate agent DID entry detected: agent_id=%s, agentfield_server_id=%s", agentID, agentfieldServerDID)
+				logger.Logger.Warn().Msgf("Duplicate agent DID entry detected: agent_id=%s, agentfield_server_id=%s", agentID, agentfieldServerDID)
 				return &DuplicateDIDError{
 					DID:  fmt.Sprintf("agent:%s@%s", agentID, agentfieldServerDID),
 					Type: "agent",
@@ -6802,7 +6815,7 @@ func (ls *LocalStorage) StoreAgentDID(ctx context.Context, agentID, agentDID, ag
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	log.Printf("Successfully stored agent DID entry: agent_id=%s, did=%s", agentID, agentDID)
+	logger.Logger.Debug().Msgf("Successfully stored agent DID entry: agent_id=%s, did=%s", agentID, agentDID)
 	return nil
 }
 
@@ -6980,7 +6993,7 @@ func (ls *LocalStorage) StoreComponentDID(ctx context.Context, componentID, comp
 		if execErr != nil {
 			// Check if this is a unique constraint violation (duplicate component DID)
 			if strings.Contains(execErr.Error(), "UNIQUE constraint failed") || strings.Contains(execErr.Error(), "component_dids") {
-				log.Printf("Duplicate component DID entry detected: agent_did=%s, function_name=%s, component_type=%s", agentDID, componentName, componentType)
+				logger.Logger.Warn().Msgf("Duplicate component DID entry detected: agent_did=%s, function_name=%s, component_type=%s", agentDID, componentName, componentType)
 				return &DuplicateDIDError{
 					DID:  fmt.Sprintf("component:%s/%s@%s", componentType, componentName, agentDID),
 					Type: "component",
@@ -7010,7 +7023,7 @@ func (ls *LocalStorage) StoreComponentDID(ctx context.Context, componentID, comp
 		return fmt.Errorf("failed to commit transaction: %w", err)
 	}
 
-	log.Printf("Successfully stored component DID entry: component_did=%s, agent_did=%s, type=%s", componentDID, agentDID, componentType)
+	logger.Logger.Debug().Msgf("Successfully stored component DID entry: component_did=%s, agent_did=%s, type=%s", componentDID, agentDID, componentType)
 	return nil
 }
 
@@ -7154,6 +7167,58 @@ func (ls *LocalStorage) StoreExecutionVC(ctx context.Context, vcID, executionID,
 	return nil
 }
 
+// StoreExecutionVCRecord persists an ExecutionVC including the kind
+// discriminator, parent_vc_id chain pointer, and trigger-event metadata.
+// Used by all new VC writers — the older scalar StoreExecutionVC stays for
+// backward compatibility with existing call sites.
+func (ls *LocalStorage) StoreExecutionVCRecord(ctx context.Context, vc *types.ExecutionVC) error {
+	if err := ctx.Err(); err != nil {
+		return fmt.Errorf("context cancelled during store execution VC: %w", err)
+	}
+	if vc == nil {
+		return fmt.Errorf("execution VC is nil")
+	}
+	kind := vc.Kind
+	if kind == "" {
+		kind = types.ExecutionVCKindExecution
+	}
+	created := vc.CreatedAt
+	if created.IsZero() {
+		created = time.Now()
+	}
+
+	query := `
+		INSERT INTO execution_vcs (
+			vc_id, execution_id, workflow_id, session_id, issuer_did, target_did,
+			caller_did, vc_document, signature, storage_uri, document_size_bytes,
+			input_hash, output_hash, status, parent_vc_id, kind,
+			trigger_id, source_name, event_type, event_id, created_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		ON CONFLICT(vc_id) DO UPDATE SET
+			status = excluded.status,
+			vc_document = excluded.vc_document,
+			signature = excluded.signature,
+			storage_uri = excluded.storage_uri,
+			document_size_bytes = excluded.document_size_bytes,
+			parent_vc_id = excluded.parent_vc_id,
+			kind = excluded.kind,
+			trigger_id = excluded.trigger_id,
+			source_name = excluded.source_name,
+			event_type = excluded.event_type,
+			event_id = excluded.event_id;`
+
+	_, err := ls.db.ExecContext(ctx, query,
+		vc.VCID, vc.ExecutionID, vc.WorkflowID, vc.SessionID, vc.IssuerDID, vc.TargetDID,
+		vc.CallerDID, []byte(vc.VCDocument), vc.Signature, vc.StorageURI, vc.DocumentSize,
+		vc.InputHash, vc.OutputHash, vc.Status, vc.ParentVCID, kind,
+		vc.TriggerID, vc.SourceName, vc.EventType, vc.EventID, created,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to store execution VC record: %w", err)
+	}
+	return nil
+}
+
 func (ls *LocalStorage) GetExecutionVC(ctx context.Context, vcID string) (*types.ExecutionVCInfo, error) {
 	// Check context cancellation early
 	if err := ctx.Err(); err != nil {
@@ -7162,7 +7227,8 @@ func (ls *LocalStorage) GetExecutionVC(ctx context.Context, vcID string) (*types
 
 	query := `
 		SELECT vc_id, execution_id, workflow_id, session_id, issuer_did, target_did,
-			   caller_did, input_hash, output_hash, status, created_at, storage_uri, document_size_bytes
+			   caller_did, input_hash, output_hash, status, created_at, storage_uri, document_size_bytes,
+			   parent_vc_id, kind, trigger_id, source_name, event_type, event_id
 		FROM execution_vcs WHERE vc_id = ?`
 
 	row := ls.db.QueryRowContext(ctx, query, vcID)
@@ -7170,7 +7236,8 @@ func (ls *LocalStorage) GetExecutionVC(ctx context.Context, vcID string) (*types
 
 	err := row.Scan(&info.VCID, &info.ExecutionID, &info.WorkflowID, &info.SessionID,
 		&info.IssuerDID, &info.TargetDID, &info.CallerDID, &info.InputHash,
-		&info.OutputHash, &info.Status, &info.CreatedAt, &info.StorageURI, &info.DocumentSize)
+		&info.OutputHash, &info.Status, &info.CreatedAt, &info.StorageURI, &info.DocumentSize,
+		&info.ParentVCID, &info.Kind, &info.TriggerID, &info.SourceName, &info.EventType, &info.EventID)
 	if err != nil {
 		if err == sql.ErrNoRows {
 			return nil, fmt.Errorf("execution VC %s not found", vcID)
@@ -7259,7 +7326,8 @@ func (ls *LocalStorage) ListExecutionVCs(ctx context.Context, filters types.VCFi
 		SELECT evc.vc_id, evc.execution_id, evc.workflow_id, evc.session_id,
 		       evc.issuer_did, evc.target_did, evc.caller_did, evc.input_hash,
 		       evc.output_hash, evc.status, evc.created_at, evc.storage_uri,
-		       evc.document_size_bytes, we.agent_node_id, we.workflow_name
+		       evc.document_size_bytes, we.agent_node_id, we.workflow_name,
+		       evc.parent_vc_id, evc.kind, evc.trigger_id, evc.source_name, evc.event_type, evc.event_id
 		FROM execution_vcs evc
 		LEFT JOIN workflow_executions we ON we.execution_id = evc.execution_id`
 
@@ -7295,7 +7363,8 @@ func (ls *LocalStorage) ListExecutionVCs(ctx context.Context, filters types.VCFi
 		err := rows.Scan(&info.VCID, &info.ExecutionID, &info.WorkflowID, &info.SessionID,
 			&info.IssuerDID, &info.TargetDID, &info.CallerDID, &info.InputHash,
 			&info.OutputHash, &info.Status, &info.CreatedAt, &info.StorageURI,
-			&info.DocumentSize, &info.AgentNodeID, &info.WorkflowName)
+			&info.DocumentSize, &info.AgentNodeID, &info.WorkflowName,
+			&info.ParentVCID, &info.Kind, &info.TriggerID, &info.SourceName, &info.EventType, &info.EventID)
 		if err != nil {
 			return nil, fmt.Errorf("failed to scan execution VC: %w", err)
 		}
@@ -7585,11 +7654,17 @@ func (ls *LocalStorage) storeWorkflowExecutionEventTx(ctx context.Context, tx DB
 		payload = "{}"
 	}
 
+	// Persist recorded_at explicitly: the GORM model's autoCreateTime does
+	// not apply to this raw INSERT, and a NULL recorded_at breaks listing.
+	if event.RecordedAt.IsZero() {
+		event.RecordedAt = time.Now().UTC()
+	}
+
 	query := `
 		INSERT INTO workflow_execution_events (
 			execution_id, workflow_id, run_id, parent_execution_id, sequence, previous_sequence,
-			event_type, status, status_reason, payload, emitted_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+			event_type, status, status_reason, payload, emitted_at, recorded_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	result, err := tx.ExecContext(ctx, query,
 		event.ExecutionID,
@@ -7603,6 +7678,7 @@ func (ls *LocalStorage) storeWorkflowExecutionEventTx(ctx context.Context, tx DB
 		event.StatusReason,
 		payload,
 		event.EmittedAt,
+		event.RecordedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to insert workflow execution event: %w", err)
@@ -7610,9 +7686,6 @@ func (ls *LocalStorage) storeWorkflowExecutionEventTx(ctx context.Context, tx DB
 
 	if id, err := result.LastInsertId(); err == nil {
 		event.EventID = id
-	}
-	if event.RecordedAt.IsZero() {
-		event.RecordedAt = time.Now().UTC()
 	}
 
 	return nil
@@ -7651,6 +7724,7 @@ func (ls *LocalStorage) ListWorkflowExecutionEvents(ctx context.Context, executi
 		var status sql.NullString
 		var statusReason sql.NullString
 		var payload sql.NullString
+		var recordedAt sql.NullTime
 
 		if err := rows.Scan(
 			&evt.EventID,
@@ -7665,9 +7739,17 @@ func (ls *LocalStorage) ListWorkflowExecutionEvents(ctx context.Context, executi
 			&statusReason,
 			&payload,
 			&evt.EmittedAt,
-			&evt.RecordedAt,
+			&recordedAt,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan workflow execution event: %w", err)
+		}
+
+		// Rows written before recorded_at was persisted have NULL here;
+		// fall back to emitted_at rather than failing the whole listing.
+		if recordedAt.Valid {
+			evt.RecordedAt = recordedAt.Time
+		} else {
+			evt.RecordedAt = evt.EmittedAt
 		}
 
 		if runID.Valid {
@@ -7799,12 +7881,20 @@ func (ls *LocalStorage) storeExecutionLogEntryTx(ctx context.Context, tx DBTX, e
 		attributes = string(entry.Attributes)
 	}
 
+	// Persist recorded_at explicitly: the GORM model's autoCreateTime does
+	// not apply to this raw INSERT, so omitting the column stores NULL and
+	// every read silently takes the legacy emitted_at fallback.
+	if entry.RecordedAt.IsZero() {
+		entry.RecordedAt = time.Now().UTC()
+	}
+
 	query := `
 		INSERT INTO execution_logs (
 			execution_id, workflow_id, run_id, root_workflow_id, parent_execution_id, sequence,
 			agent_node_id, reasoner_id, level, source, event_type, message, attributes,
-			system_generated, sdk_language, attempt, span_id, step_id, error_category, emitted_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+			system_generated, sdk_language, attempt, span_id, step_id, error_category, emitted_at,
+			recorded_at
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	result, err := tx.ExecContext(ctx, query,
 		entry.ExecutionID,
@@ -7827,15 +7917,13 @@ func (ls *LocalStorage) storeExecutionLogEntryTx(ctx context.Context, tx DBTX, e
 		entry.StepID,
 		entry.ErrorCategory,
 		entry.EmittedAt,
+		entry.RecordedAt,
 	)
 	if err != nil {
 		return fmt.Errorf("failed to insert execution log entry: %w", err)
 	}
 	if id, err := result.LastInsertId(); err == nil {
 		entry.EventID = id
-	}
-	if entry.RecordedAt.IsZero() {
-		entry.RecordedAt = time.Now().UTC()
 	}
 	return nil
 }
@@ -8384,7 +8472,7 @@ func (ls *LocalStorage) ListAgentsByLifecycleStatus(ctx context.Context, status 
 		SELECT
 			id, version, group_id, team_id, base_url, traffic_weight, deployment_type, invocation_url, reasoners, skills,
 			communication_config, health_status, lifecycle_status, last_heartbeat,
-			registered_at, features, metadata, proposed_tags, approved_tags
+			registered_at, features, metadata, proposed_tags, approved_tags, COALESCE(instance_id, '')
 		FROM agent_nodes WHERE lifecycle_status = ? ORDER BY registered_at DESC`
 
 	rows, err := ls.db.QueryContext(ctx, query, string(status))
@@ -8419,6 +8507,15 @@ func reconstructAgentLevelTags(agent *types.AgentNode) {
 				}
 			}
 		}
+		types.HydrateAgentSessions(agent)
+		for _, session := range agent.Sessions {
+			for _, t := range session.ApprovedTags {
+				if _, exists := seen[t]; !exists {
+					seen[t] = struct{}{}
+					agent.ApprovedTags = append(agent.ApprovedTags, t)
+				}
+			}
+		}
 	}
 
 	if len(agent.ProposedTags) == 0 {
@@ -8439,6 +8536,19 @@ func reconstructAgentLevelTags(agent *types.AgentNode) {
 			source := sk.ProposedTags
 			if len(source) == 0 {
 				source = sk.Tags
+			}
+			for _, t := range source {
+				if _, exists := proposedSeen[t]; !exists {
+					proposedSeen[t] = struct{}{}
+					agent.ProposedTags = append(agent.ProposedTags, t)
+				}
+			}
+		}
+		types.HydrateAgentSessions(agent)
+		for _, session := range agent.Sessions {
+			source := session.ProposedTags
+			if len(source) == 0 {
+				source = session.Tags
 			}
 			for _, t := range source {
 				if _, exists := proposedSeen[t]; !exists {

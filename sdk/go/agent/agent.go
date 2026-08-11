@@ -9,11 +9,15 @@ import (
 	"io"
 	"log"
 	"math/rand"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
+	"runtime"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/Agent-Field/agentfield/sdk/go/ai"
@@ -24,6 +28,8 @@ import (
 )
 
 type executionContextKey struct{}
+
+const maxExecutionRequestBytes int64 = 1 << 20
 
 // ExecutionContext captures the headers AgentField sends with each execution request.
 type ExecutionContext struct {
@@ -41,9 +47,12 @@ type ExecutionContext struct {
 	StartedAt         time.Time
 
 	// DID fields — populated when DID authentication is enabled.
-	CallerDID    string
-	TargetDID    string
-	AgentNodeDID string
+	CallerDID           string
+	TargetDID           string
+	AgentNodeDID        string
+	AuthorityHomeID     string
+	AuthorityRunID      string
+	AuthorityLeaseOwner string
 }
 
 func init() {
@@ -96,10 +105,24 @@ func WithCLIFormatter(formatter func(context.Context, any, error)) ReasonerOptio
 	}
 }
 
-// WithDescription adds a human-readable description for help/list commands.
+// WithDescription adds a caller-facing summary for the reasoner. It is shown
+// by local help/list commands AND registered with the control plane, where
+// discovery (`GET /api/v1/discovery/capabilities`) and `af ls` surface it —
+// say what the reasoner does and when a caller should pick it.
 func WithDescription(desc string) ReasonerOption {
 	return func(r *Reasoner) {
 		r.Description = desc
+	}
+}
+
+// WithAcceptsWebhook sets the accepts_webhook flag for UI-managed trigger guardrailing.
+// Pass "true" to explicitly opt in, "false" to refuse, or omit for auto-detect (True if
+// any triggers declared, else "warn").
+func WithAcceptsWebhook(flag string) ReasonerOption {
+	return func(r *Reasoner) {
+		if flag != "" {
+			r.AcceptsWebhook = &flag
+		}
 	}
 }
 
@@ -123,6 +146,148 @@ type Reasoner struct {
 	// RequireRealtimeValidation forces control-plane verification for this
 	// reasoner, skipping local verification even when enabled.
 	RequireRealtimeValidation bool
+
+	// Triggers declares external Sources whose events should invoke this
+	// reasoner. Bindings are sent at registration time; the control plane
+	// upserts a code-managed Trigger per binding. The canonical form is
+	// WithTriggers(...); the WithEventTrigger / WithScheduleTrigger helpers
+	// are sugar that append to this slice.
+	Triggers []types.TriggerBinding
+
+	// AcceptsWebhook controls whether UI-managed triggers can invoke this reasoner.
+	// nil/empty = inherit default ("warn"), "true" = explicitly opt in, "false" = explicitly refuse.
+	// Auto-set to "true" if any Triggers are declared.
+	AcceptsWebhook *string
+}
+
+// EventTrigger describes an external event source binding for a reasoner.
+// Use it as a typed argument to WithTriggers — the control plane registers
+// the binding and minting of the public ingest URL happens server-side.
+type EventTrigger struct {
+	Source    string
+	Types     []string
+	SecretEnv string
+	Config    map[string]any
+}
+
+// ScheduleTrigger describes a cron-style schedule binding for a reasoner.
+// Use it as a typed argument to WithTriggers; the control plane runs the
+// schedule and dispatches a synthetic "tick" event when it fires.
+type ScheduleTrigger struct {
+	Cron     string
+	Timezone string
+}
+
+// captureCodeOrigin captures the file and line number of the caller using runtime.Caller.
+// skip=1 walks past captureCodeOrigin to the immediate caller (e.g., WithEventTrigger).
+// skip=2 walks past captureCodeOrigin and WithEventTrigger to the user's call site.
+func captureCodeOrigin(skip int) string {
+	_, file, line, ok := runtime.Caller(skip)
+	if !ok {
+		return ""
+	}
+	return fmt.Sprintf("%s:%d", file, line)
+}
+
+// WithTriggers is the canonical decorator-equivalent for declaring trigger
+// bindings on a Go reasoner. Pass a mix of EventTrigger and ScheduleTrigger
+// values; unknown types are silently ignored so adding new kinds later is
+// backward compatible.
+func WithTriggers(triggers ...any) ReasonerOption {
+	codeOrigin := captureCodeOrigin(2)
+	return func(r *Reasoner) {
+		for _, t := range triggers {
+			binding, ok := triggerToBinding(t)
+			if !ok {
+				continue
+			}
+			if binding.CodeOrigin == "" {
+				binding.CodeOrigin = codeOrigin
+			}
+			r.Triggers = append(r.Triggers, binding)
+		}
+	}
+}
+
+// WithEventTrigger is sugar that appends a single EventTrigger to the
+// reasoner's bindings. It is equivalent to
+// WithTriggers(EventTrigger{Source: source, Types: types}).
+func WithEventTrigger(source string, eventTypes ...string) ReasonerOption {
+	codeOrigin := captureCodeOrigin(2)
+	return func(r *Reasoner) {
+		b, _ := triggerToBinding(EventTrigger{Source: source, Types: eventTypes})
+		b.CodeOrigin = codeOrigin
+		r.Triggers = append(r.Triggers, b)
+	}
+}
+
+// WithScheduleTrigger is sugar for declaring a single cron schedule. The
+// expression follows the standard 5-field cron format.
+func WithScheduleTrigger(expression string) ReasonerOption {
+	codeOrigin := captureCodeOrigin(2)
+	return func(r *Reasoner) {
+		b, _ := triggerToBinding(ScheduleTrigger{Cron: expression})
+		b.CodeOrigin = codeOrigin
+		r.Triggers = append(r.Triggers, b)
+	}
+}
+
+// WithTriggerSecretEnv attaches a secret env var name to the most recently
+// declared trigger binding on the reasoner. Use it after WithEventTrigger
+// when the source requires a secret (Stripe, GitHub, Slack, generic_hmac).
+func WithTriggerSecretEnv(envVar string) ReasonerOption {
+	return func(r *Reasoner) {
+		if len(r.Triggers) == 0 {
+			return
+		}
+		r.Triggers[len(r.Triggers)-1].SecretEnvVar = envVar
+	}
+}
+
+// WithTriggerConfig attaches a config blob to the most recently declared
+// trigger binding. Source impls validate the config server-side.
+func WithTriggerConfig(cfg map[string]any) ReasonerOption {
+	return func(r *Reasoner) {
+		if len(r.Triggers) == 0 {
+			return
+		}
+		raw, err := json.Marshal(cfg)
+		if err != nil {
+			return
+		}
+		r.Triggers[len(r.Triggers)-1].Config = raw
+	}
+}
+
+// triggerToBinding normalizes typed trigger values into the wire payload.
+func triggerToBinding(t any) (types.TriggerBinding, bool) {
+	switch v := t.(type) {
+	case EventTrigger:
+		var cfg json.RawMessage
+		if len(v.Config) > 0 {
+			if raw, err := json.Marshal(v.Config); err == nil {
+				cfg = raw
+			}
+		}
+		return types.TriggerBinding{
+			Source:       v.Source,
+			EventTypes:   v.Types,
+			Config:       cfg,
+			SecretEnvVar: v.SecretEnv,
+		}, true
+	case ScheduleTrigger:
+		tz := v.Timezone
+		if tz == "" {
+			tz = "UTC"
+		}
+		cfg, _ := json.Marshal(map[string]any{
+			"expression": v.Cron,
+			"timezone":   tz,
+		})
+		return types.TriggerBinding{Source: "cron", Config: cfg}, true
+	default:
+		return types.TriggerBinding{}, false
+	}
 }
 
 // WithVCEnabled overrides VC generation for this specific reasoner.
@@ -197,6 +362,14 @@ type Config struct {
 	// an Authorization: Bearer <token> header on control-plane requests.
 	Token string
 
+	// APIKey authenticates control-plane requests via the X-API-Key header.
+	// Optional. Defaults to the AGENTFIELD_API_KEY environment variable, which
+	// `af run` exports for the agents it starts, so an agent registers against
+	// an authenticated control plane without carrying the key in its code.
+	// Unlike Token this is only ever sent outbound; it is not used to validate
+	// incoming requests.
+	APIKey string
+
 	// DeploymentType describes how the agent runs (affects execution behavior).
 	// Optional. Default: "long_running". Common values: "long_running",
 	// "serverless". Use a descriptive string for custom modes.
@@ -210,6 +383,18 @@ type Config struct {
 	// DisableLeaseLoop is true, "0s" is registered instead so the control
 	// plane does not expect heartbeats.
 	LeaseRefreshInterval time.Duration
+
+	// CallTimeout bounds every INDIVIDUAL outbound HTTP request this agent
+	// makes through its shared client (e.g. memory backend requests).
+	// Optional. Default: 15s.
+	//
+	// NOTE: cross-agent Call() does NOT use this timeout. Its async submit and
+	// status polls run through dedicated clients bounded by
+	// AGENTFIELD_CALL_SUBMIT_TIMEOUT_SECONDS / AGENTFIELD_CALL_POLL_TIMEOUT_SECONDS,
+	// with transient failures retried within AGENTFIELD_CALL_RETRY_WINDOW_SECONDS,
+	// so a child reasoner may run arbitrarily long; bound the overall Call wait
+	// with the ctx passed to Call instead.
+	CallTimeout time.Duration
 
 	// DisableLeaseLoop disables automatic periodic lease refreshes.
 	// Optional. Default: false. When true, node registration reports
@@ -313,9 +498,24 @@ type Agent struct {
 	cfg        Config
 	client     *client.Client
 	httpClient *http.Client
-	reasoners  map[string]*Reasoner
-	aiClient   *ai.Client // AI/LLM client
-	memory     *Memory    // Memory system for state management
+
+	// callSubmitClient and callPollClient are dedicated HTTP clients for the
+	// async Agent.Call path. They are separate from httpClient so the submit
+	// and poll requests carry their own (larger) per-request timeouts without
+	// affecting memory-backend or other client traffic. Resolved once in New()
+	// from AGENTFIELD_CALL_SUBMIT_TIMEOUT_SECONDS / AGENTFIELD_CALL_POLL_TIMEOUT_SECONDS.
+	callSubmitClient *http.Client
+	callPollClient   *http.Client
+	// callRetryWindow bounds how long consecutive transient poll/submit
+	// failures are tolerated before the call is declared failed with an
+	// "unreachable" error. Resolved from AGENTFIELD_CALL_RETRY_WINDOW_SECONDS.
+	callRetryWindow time.Duration
+
+	reasoners map[string]*Reasoner
+	skills    map[string]*Reasoner
+	sessions  map[string]SessionDefinition
+	aiClient  *ai.Client // AI/LLM client
+	memory    *Memory    // Memory system for state management
 
 	// DID/VC subsystem
 	didManager  *did.Manager
@@ -344,6 +544,22 @@ type Agent struct {
 	leaseLoopOnce sync.Once
 
 	defaultCLIReasoner string
+
+	// cancelFuncs tracks the context.CancelFunc for every in-flight reasoner
+	// invocation, keyed by execution_id. The control plane's cancel
+	// dispatcher POSTs to /_internal/executions/:id/cancel and we look up
+	// the matching cancel func to short-circuit the reasoner's context.
+	// Reasoners are responsible for honoring ctx.Done() — most idiomatic
+	// Go code does this through net/http, database/sql, etc.
+	cancelMu    sync.Mutex
+	cancelFuncs map[string]context.CancelFunc
+
+	// pauseManager tracks pending Agent.Pause() calls, keyed by
+	// approval_request_id, and resolves them when the control plane POSTs an
+	// approval resolution to /webhooks/approval.
+	pauseManager *PauseManager
+
+	startTime time.Time
 }
 
 // New constructs an Agent.
@@ -356,6 +572,9 @@ func New(cfg Config) (*Agent, error) {
 	}
 	if cfg.TeamID == "" {
 		cfg.TeamID = "default"
+	}
+	if strings.TrimSpace(cfg.APIKey) == "" {
+		cfg.APIKey = strings.TrimSpace(os.Getenv("AGENTFIELD_API_KEY"))
 	}
 	if cfg.ListenAddress == "" {
 		cfg.ListenAddress = ":8001"
@@ -373,9 +592,23 @@ func New(cfg Config) (*Agent, error) {
 		cfg.Logger = log.New(os.Stdout, "[agent] ", log.LstdFlags)
 	}
 
-	httpClient := &http.Client{
-		Timeout: 15 * time.Second,
+	if cfg.CallTimeout <= 0 {
+		cfg.CallTimeout = 15 * time.Second
 	}
+	httpClient := &http.Client{
+		Timeout: cfg.CallTimeout,
+	}
+
+	// Dedicated clients + retry window for the async Agent.Call path. See the
+	// resolver's doc comment for the env vars and defaults. A slow-but-healthy
+	// control plane must not abort an already-accepted submit, so the submit
+	// client's timeout is intentionally generous (default 120s), and each poll
+	// gets its own (default 60s) rather than inheriting CallTimeout's 15s.
+	callSubmitTimeout := resolveCallDurationEnv(envCallSubmitTimeoutSeconds, defaultCallSubmitTimeout)
+	callPollTimeout := resolveCallDurationEnv(envCallPollTimeoutSeconds, defaultCallPollTimeout)
+	callRetryWindow := resolveCallDurationEnv(envCallRetryWindowSeconds, defaultCallRetryWindow)
+	callSubmitClient := &http.Client{Timeout: callSubmitTimeout}
+	callPollClient := &http.Client{Timeout: callPollTimeout}
 
 	// Initialize AI client if config provided
 	var aiClient *ai.Client
@@ -390,12 +623,20 @@ func New(cfg Config) (*Agent, error) {
 	a := &Agent{
 		cfg:                         cfg,
 		httpClient:                  httpClient,
+		callSubmitClient:            callSubmitClient,
+		callPollClient:              callPollClient,
+		callRetryWindow:             callRetryWindow,
 		reasoners:                   make(map[string]*Reasoner),
+		skills:                      make(map[string]*Reasoner),
+		sessions:                    make(map[string]SessionDefinition),
 		aiClient:                    aiClient,
 		memory:                      NewMemory(cfg.MemoryBackend),
 		stopLease:                   make(chan struct{}),
 		logger:                      cfg.Logger,
 		realtimeValidationFunctions: make(map[string]struct{}),
+		cancelFuncs:                 make(map[string]context.CancelFunc),
+		pauseManager:                NewPauseManager(),
+		startTime:                   time.Now(),
 	}
 
 	// Initialize local verifier if enabled
@@ -404,12 +645,22 @@ func New(cfg Config) (*Agent, error) {
 		if refreshInterval <= 0 {
 			refreshInterval = 5 * time.Minute
 		}
-		a.localVerifier = NewLocalVerifier(cfg.AgentFieldURL, refreshInterval, cfg.Token)
+		// NewLocalVerifier sends its third argument as X-API-Key. Prefer the
+		// dedicated APIKey, falling back to Token so existing callers that
+		// used it as the key keep working.
+		verifierKey := strings.TrimSpace(cfg.APIKey)
+		if verifierKey == "" {
+			verifierKey = cfg.Token
+		}
+		a.localVerifier = NewLocalVerifier(cfg.AgentFieldURL, refreshInterval, verifierKey)
 		cfg.Logger.Printf("Local verification enabled (refresh every %s)", refreshInterval)
 	}
 
 	if strings.TrimSpace(cfg.AgentFieldURL) != "" {
 		opts := []client.Option{client.WithHTTPClient(httpClient), client.WithBearerToken(cfg.Token)}
+		if apiKey := strings.TrimSpace(cfg.APIKey); apiKey != "" {
+			opts = append(opts, client.WithAPIKey(apiKey))
+		}
 		if cfg.DID != "" && cfg.PrivateKeyJWK != "" {
 			opts = append(opts, client.WithDIDAuth(cfg.DID, cfg.PrivateKeyJWK))
 		}
@@ -530,7 +781,10 @@ func (a *Agent) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (a *Agent) Execute(ctx context.Context, reasonerName string, input map[string]any) (any, error) {
 	reasoner, ok := a.reasoners[reasonerName]
 	if !ok {
-		return nil, fmt.Errorf("unknown reasoner %q", reasonerName)
+		reasoner, ok = a.skills[reasonerName]
+	}
+	if !ok {
+		return nil, fmt.Errorf("unknown reasoner or skill %q", reasonerName)
 	}
 	if input == nil {
 		input = make(map[string]any)
@@ -589,6 +843,9 @@ func (a *Agent) HandleServerlessEvent(ctx context.Context, event map[string]any,
 
 	handler, ok := a.reasoners[reasoner]
 	if !ok {
+		handler, ok = a.skills[reasoner]
+	}
+	if !ok {
 		return map[string]any{"error": "reasoner not found"}, http.StatusNotFound, nil
 	}
 
@@ -626,11 +883,15 @@ func (a *Agent) handler() http.Handler {
 	a.handlerOnce.Do(func() {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/health", a.healthHandler)
+		mux.HandleFunc("/status", a.statusHandler)
 		mux.HandleFunc("/discover", a.handleDiscover)
 		mux.HandleFunc("/agentfield/v1/logs", a.handleAgentfieldLogs)
 		mux.HandleFunc("/execute", a.handleExecute)
 		mux.HandleFunc("/execute/", a.handleExecute)
 		mux.HandleFunc("/reasoners/", a.handleReasoner)
+		mux.HandleFunc("/skills/", a.handleSkill)
+		mux.HandleFunc("/_internal/executions/", a.handleInternalCancel)
+		mux.HandleFunc("/webhooks/approval", a.handleApprovalWebhook)
 
 		var handler http.Handler = mux
 
@@ -658,7 +919,16 @@ func (a *Agent) handler() http.Handler {
 func (a *Agent) originAuthMiddleware(next http.Handler, token string) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		path := r.URL.Path
-		if path == "/health" || path == "/discover" || path == "/agentfield/v1/logs" {
+		if path == "/health" || path == "/status" || path == "/discover" || path == "/agentfield/v1/logs" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// /webhooks/approval is a control-plane→worker approval-resolution
+		// callback delivered unauthenticated (see notifyApprovalCallback in the
+		// control plane), analogous to the cancel notification. It only
+		// resolves a pause the agent itself initiated, so treat it as an open
+		// infrastructure route rather than a caller-initiated invocation.
+		if path == "/webhooks/approval" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -682,7 +952,22 @@ func (a *Agent) localVerificationMiddleware(next http.Handler) http.Handler {
 		path := r.URL.Path
 
 		// Only verify execution endpoints
-		if path == "/health" || path == "/discover" || path == "/agentfield/v1/logs" {
+		if path == "/health" || path == "/status" || path == "/discover" || path == "/agentfield/v1/logs" {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// /_internal/executions/.../cancel is a control-plane→worker
+		// notification, not a DID-signed user-initiated call. Bearer-token
+		// origin auth still applies via originAuthMiddleware.
+		if strings.HasPrefix(path, "/_internal/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// /webhooks/approval is a control-plane→worker approval-resolution
+		// callback, delivered unauthenticated by the control plane. It carries
+		// no DID signature; skip local verification (same rationale as the
+		// cancel notification above).
+		if path == "/webhooks/approval" {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -693,6 +978,8 @@ func (a *Agent) localVerificationMiddleware(next http.Handler) http.Handler {
 			funcName = strings.TrimPrefix(path, "/execute/")
 		} else if strings.HasPrefix(path, "/reasoners/") {
 			funcName = strings.TrimPrefix(path, "/reasoners/")
+		} else if strings.HasPrefix(path, "/skills/") {
+			funcName = strings.TrimPrefix(path, "/skills/")
 		}
 		funcName = strings.TrimSuffix(funcName, "/")
 
@@ -811,6 +1098,17 @@ func (a *Agent) healthHandler(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
 }
 
+// statusHandler answers the control plane's HTTP health-monitor poll
+// (GET {base_url}/status), which requires a JSON body with status:"running".
+func (a *Agent) statusHandler(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":         "running",
+		"node_id":        a.cfg.NodeID,
+		"version":        a.cfg.Version,
+		"uptime_seconds": int(time.Since(a.startTime).Seconds()),
+	})
+}
+
 func (a *Agent) handleDiscover(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
@@ -829,6 +1127,14 @@ func (a *Agent) discoveryPayload() map[string]any {
 			"tags":          []string{},
 		})
 	}
+	skills := make([]map[string]any, 0, len(a.skills))
+	for _, skill := range a.skills {
+		skills = append(skills, map[string]any{
+			"id":           skill.Name,
+			"input_schema": rawToMap(skill.InputSchema),
+			"tags":         skill.Tags,
+		})
+	}
 
 	deployment := strings.TrimSpace(a.cfg.DeploymentType)
 	if deployment == "" {
@@ -839,8 +1145,10 @@ func (a *Agent) discoveryPayload() map[string]any {
 		"node_id":         a.cfg.NodeID,
 		"version":         a.cfg.Version,
 		"deployment_type": deployment,
+		"auth_required":   a.cfg.RequireOriginAuth || a.cfg.LocalVerification,
 		"reasoners":       reasoners,
-		"skills":          []map[string]any{},
+		"skills":          skills,
+		"sessions":        a.SessionDefinitions(),
 	}
 }
 
@@ -856,8 +1164,13 @@ func (a *Agent) handleExecute(w http.ResponseWriter, r *http.Request) {
 	var payload map[string]any
 	if r.Body != nil {
 		defer r.Body.Close()
-		if err := json.NewDecoder(r.Body).Decode(&payload); err != nil && !errors.Is(err, io.EOF) {
+		decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxExecutionRequestBytes))
+		if err := decoder.Decode(&payload); err != nil && !errors.Is(err, io.EOF) {
 			http.Error(w, fmt.Sprintf("invalid JSON: %v", err), http.StatusBadRequest)
+			return
+		}
+		if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+			http.Error(w, "invalid JSON: trailing data", http.StatusBadRequest)
 			return
 		}
 	}
@@ -877,6 +1190,9 @@ func (a *Agent) handleExecute(w http.ResponseWriter, r *http.Request) {
 
 	reasoner, ok := a.reasoners[reasonerName]
 	if !ok {
+		reasoner, ok = a.skills[reasonerName]
+	}
+	if !ok {
 		http.NotFound(w, r)
 		return
 	}
@@ -884,7 +1200,14 @@ func (a *Agent) handleExecute(w http.ResponseWriter, r *http.Request) {
 	input := extractInputFromServerless(payload)
 	execCtx := a.buildExecutionContextFromServerless(r, payload, reasonerName)
 	a.fillDIDContext(&execCtx)
-	ctx := contextWithExecution(r.Context(), execCtx)
+	cancellableCtx, releaseCancel := a.registerCancellableExecution(r.Context(), execCtx.ExecutionID)
+	defer releaseCancel()
+	ctx := contextWithExecution(cancellableCtx, execCtx)
+	// Fresh per-execution cost tracker: LLM/harness usage recorded during the
+	// reasoner is isolated to this request (concurrent requests each get
+	// their own tracker) and attached to the 200 body afterward.
+	tracker := NewCostTracker()
+	ctx = contextWithCostTracker(ctx, tracker)
 
 	start := time.Now()
 	a.logExecutionInfo(ctx, "reasoner.invoke.start", "starting reasoner execution", map[string]any{
@@ -920,6 +1243,21 @@ func (a *Agent) handleExecute(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, statusCode, response)
 			return
 		}
+		// A reasoner that ran but failed can return &ReasonerFailed{Result: ...}
+		// to preserve its structured outcome; carry it onto the error response
+		// (mirroring the async status payload) so the result is not lost.
+		var rf *ReasonerFailed
+		if errors.As(err, &rf) {
+			response := map[string]any{"error": rf.Message}
+			if rf.Result != nil {
+				response["result"] = rf.Result
+			}
+			if rf.ErrorDetails != nil {
+				response["error_details"] = rf.ErrorDetails
+			}
+			writeJSON(w, http.StatusInternalServerError, response)
+			return
+		}
 		writeJSON(w, http.StatusInternalServerError, map[string]any{"error": err.Error()})
 		return
 	}
@@ -930,7 +1268,7 @@ func (a *Agent) handleExecute(w http.ResponseWriter, r *http.Request) {
 		"mode":        "http",
 		"duration_ms": durationMS,
 	})
-	writeJSON(w, http.StatusOK, result)
+	writeJSON(w, http.StatusOK, wrapSyncResultWithUsage(result, tracker))
 }
 
 func extractInputFromServerless(payload map[string]any) map[string]any {
@@ -959,18 +1297,21 @@ func extractInputFromServerless(payload map[string]any) map[string]any {
 
 func (a *Agent) buildExecutionContextFromServerless(r *http.Request, payload map[string]any, reasonerName string) ExecutionContext {
 	execCtx := ExecutionContext{
-		RunID:             strings.TrimSpace(r.Header.Get("X-Run-ID")),
-		ExecutionID:       strings.TrimSpace(r.Header.Get("X-Execution-ID")),
-		ParentExecutionID: strings.TrimSpace(r.Header.Get("X-Parent-Execution-ID")),
-		SessionID:         strings.TrimSpace(r.Header.Get("X-Session-ID")),
-		ActorID:           strings.TrimSpace(r.Header.Get("X-Actor-ID")),
-		WorkflowID:        strings.TrimSpace(r.Header.Get("X-Workflow-ID")),
-		AgentNodeID:       a.cfg.NodeID,
-		ReasonerName:      reasonerName,
-		StartedAt:         time.Now(),
-		CallerDID:         strings.TrimSpace(r.Header.Get("X-Caller-DID")),
-		TargetDID:         strings.TrimSpace(r.Header.Get("X-Target-DID")),
-		AgentNodeDID:      strings.TrimSpace(r.Header.Get("X-Agent-Node-DID")),
+		RunID:               strings.TrimSpace(r.Header.Get("X-Run-ID")),
+		ExecutionID:         strings.TrimSpace(r.Header.Get("X-Execution-ID")),
+		ParentExecutionID:   strings.TrimSpace(r.Header.Get("X-Parent-Execution-ID")),
+		SessionID:           strings.TrimSpace(r.Header.Get("X-Session-ID")),
+		ActorID:             strings.TrimSpace(r.Header.Get("X-Actor-ID")),
+		WorkflowID:          strings.TrimSpace(r.Header.Get("X-Workflow-ID")),
+		AgentNodeID:         a.cfg.NodeID,
+		ReasonerName:        reasonerName,
+		StartedAt:           time.Now(),
+		CallerDID:           strings.TrimSpace(r.Header.Get("X-Caller-DID")),
+		TargetDID:           strings.TrimSpace(r.Header.Get("X-Target-DID")),
+		AgentNodeDID:        strings.TrimSpace(r.Header.Get("X-Agent-Node-DID")),
+		AuthorityHomeID:     strings.TrimSpace(r.Header.Get("X-AgentField-Authority-Home-ID")),
+		AuthorityRunID:      strings.TrimSpace(r.Header.Get("X-AgentField-Authority-Run-ID")),
+		AuthorityLeaseOwner: strings.TrimSpace(r.Header.Get("X-AgentField-Authority-Lease-Owner")),
 	}
 
 	if ctxMap, ok := payload["execution_context"].(map[string]any); ok {
@@ -991,6 +1332,21 @@ func (a *Agent) buildExecutionContextFromServerless(r *http.Request, payload map
 		}
 		if execCtx.ActorID == "" {
 			execCtx.ActorID = stringFromMap(ctxMap, "actor_id", "actorId")
+		}
+		authorityMap, _ := ctxMap["run_authority"].(map[string]any)
+		if authorityMap == nil {
+			authorityMap, _ = ctxMap["runAuthority"].(map[string]any)
+		}
+		if authorityMap != nil {
+			if execCtx.AuthorityHomeID == "" {
+				execCtx.AuthorityHomeID = stringFromMap(authorityMap, "home_id", "homeId")
+			}
+			if execCtx.AuthorityRunID == "" {
+				execCtx.AuthorityRunID = stringFromMap(authorityMap, "run_id", "runId")
+			}
+			if execCtx.AuthorityLeaseOwner == "" {
+				execCtx.AuthorityLeaseOwner = stringFromMap(authorityMap, "lease_owner", "leaseOwner")
+			}
 		}
 	}
 
@@ -1033,24 +1389,32 @@ func (a *Agent) handleReasoner(w http.ResponseWriter, r *http.Request) {
 
 	defer r.Body.Close()
 	var input map[string]any
-	if err := json.NewDecoder(r.Body).Decode(&input); err != nil {
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxExecutionRequestBytes))
+	if err := decoder.Decode(&input); err != nil {
 		http.Error(w, fmt.Sprintf("invalid JSON: %v", err), http.StatusBadRequest)
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		http.Error(w, "invalid JSON: trailing data", http.StatusBadRequest)
 		return
 	}
 
 	execCtx := ExecutionContext{
-		RunID:             r.Header.Get("X-Run-ID"),
-		ExecutionID:       r.Header.Get("X-Execution-ID"),
-		ParentExecutionID: r.Header.Get("X-Parent-Execution-ID"),
-		SessionID:         r.Header.Get("X-Session-ID"),
-		ActorID:           r.Header.Get("X-Actor-ID"),
-		WorkflowID:        r.Header.Get("X-Workflow-ID"),
-		AgentNodeID:       a.cfg.NodeID,
-		ReasonerName:      name,
-		StartedAt:         time.Now(),
-		CallerDID:         r.Header.Get("X-Caller-DID"),
-		TargetDID:         r.Header.Get("X-Target-DID"),
-		AgentNodeDID:      r.Header.Get("X-Agent-Node-DID"),
+		RunID:               r.Header.Get("X-Run-ID"),
+		ExecutionID:         r.Header.Get("X-Execution-ID"),
+		ParentExecutionID:   r.Header.Get("X-Parent-Execution-ID"),
+		SessionID:           r.Header.Get("X-Session-ID"),
+		ActorID:             r.Header.Get("X-Actor-ID"),
+		WorkflowID:          r.Header.Get("X-Workflow-ID"),
+		AgentNodeID:         a.cfg.NodeID,
+		ReasonerName:        name,
+		StartedAt:           time.Now(),
+		CallerDID:           r.Header.Get("X-Caller-DID"),
+		TargetDID:           r.Header.Get("X-Target-DID"),
+		AgentNodeDID:        r.Header.Get("X-Agent-Node-DID"),
+		AuthorityHomeID:     r.Header.Get("X-AgentField-Authority-Home-ID"),
+		AuthorityRunID:      r.Header.Get("X-AgentField-Authority-Run-ID"),
+		AuthorityLeaseOwner: r.Header.Get("X-AgentField-Authority-Lease-Owner"),
 	}
 	if execCtx.WorkflowID == "" {
 		execCtx.WorkflowID = execCtx.RunID
@@ -1060,11 +1424,14 @@ func (a *Agent) handleReasoner(w http.ResponseWriter, r *http.Request) {
 	}
 	a.fillDIDContext(&execCtx)
 
-	ctx := contextWithExecution(r.Context(), execCtx)
-
 	// In serverless mode we want a synchronous execution so the control plane can return
 	// the result immediately; skip the async path even if an execution ID is present.
 	if a.cfg.DeploymentType != "serverless" && execCtx.ExecutionID != "" && strings.TrimSpace(a.cfg.AgentFieldURL) != "" {
+		// Async dispatch — handleReasoner returns 202 immediately, the
+		// goroutine owns the lifetime. executeReasonerAsync registers its
+		// own cancellation hook against execution_id, so the cancel
+		// dispatcher can still reach this run.
+		ctx := contextWithExecution(r.Context(), execCtx)
 		a.logExecutionInfo(ctx, "reasoner.invoke.accepted", "accepted asynchronous execution request", map[string]any{
 			"reasoner_id": name,
 			"mode":        "async",
@@ -1078,6 +1445,19 @@ func (a *Agent) handleReasoner(w http.ResponseWriter, r *http.Request) {
 		})
 		return
 	}
+
+	// Sync path — wrap r.Context() with a cancel hook keyed on
+	// execution_id so the control-plane cancel-dispatcher (POST
+	// /_internal/executions/:id/cancel) can short-circuit reasoner code
+	// that honors ctx.Done().
+	cancellableCtx, releaseCancel := a.registerCancellableExecution(r.Context(), execCtx.ExecutionID)
+	defer releaseCancel()
+
+	ctx := contextWithExecution(cancellableCtx, execCtx)
+	// Fresh per-execution cost tracker for the sync path; usage recorded by
+	// the reasoner is attached to the 200 body below.
+	tracker := NewCostTracker()
+	ctx = contextWithCostTracker(ctx, tracker)
 
 	start := time.Now()
 	a.logExecutionInfo(ctx, "reasoner.invoke.start", "starting reasoner execution", map[string]any{
@@ -1111,6 +1491,20 @@ func (a *Agent) handleReasoner(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, statusCode, response)
 			return
 		}
+		// Preserve a ReasonerFailed's structured result/details on the sync
+		// error response, mirroring the async failed-status payload.
+		var rf *ReasonerFailed
+		if errors.As(err, &rf) {
+			response := map[string]any{"error": rf.Message}
+			if rf.Result != nil {
+				response["result"] = rf.Result
+			}
+			if rf.ErrorDetails != nil {
+				response["error_details"] = rf.ErrorDetails
+			}
+			writeJSON(w, http.StatusInternalServerError, response)
+			return
+		}
 
 		writeJSON(w, http.StatusInternalServerError, map[string]any{
 			"error": err.Error(),
@@ -1124,11 +1518,70 @@ func (a *Agent) handleReasoner(w http.ResponseWriter, r *http.Request) {
 		"mode":        "http",
 		"duration_ms": durationMS,
 	})
-	writeJSON(w, http.StatusOK, result)
+	writeJSON(w, http.StatusOK, wrapSyncResultWithUsage(result, tracker))
+}
+
+func (a *Agent) handleSkill(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	name := strings.TrimPrefix(r.URL.Path, "/skills/")
+	if name == "" {
+		http.NotFound(w, r)
+		return
+	}
+
+	skill, ok := a.skills[name]
+	if !ok {
+		http.NotFound(w, r)
+		return
+	}
+
+	defer r.Body.Close()
+	var input map[string]any
+	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxExecutionRequestBytes))
+	if err := decoder.Decode(&input); err != nil {
+		http.Error(w, fmt.Sprintf("invalid JSON: %v", err), http.StatusBadRequest)
+		return
+	}
+	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
+		http.Error(w, "invalid JSON: trailing data", http.StatusBadRequest)
+		return
+	}
+	if input == nil {
+		input = map[string]any{}
+	}
+
+	execCtx := a.buildExecutionContextFromServerless(r, map[string]any{"input": input}, name)
+	a.fillDIDContext(&execCtx)
+	ctx := contextWithExecution(r.Context(), execCtx)
+	// Fresh per-execution cost tracker so concurrent skill invocations are
+	// isolated; usage is attached to the 200 body below.
+	tracker := NewCostTracker()
+	ctx = contextWithCostTracker(ctx, tracker)
+	result, err := skill.Handler(ctx, input)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	writeJSON(w, http.StatusOK, wrapSyncResultWithUsage(result, tracker))
 }
 
 func (a *Agent) executeReasonerAsync(reasoner *Reasoner, input map[string]any, execCtx ExecutionContext) {
-	ctx := contextWithExecution(context.Background(), execCtx)
+	// Register a cancel hook keyed on execution_id so a control-plane
+	// cancel reaches the still-running reasoner. release fires both on
+	// natural completion (deferred) and on cancel (via ctx.Done()).
+	cancellableCtx, release := a.registerCancellableExecution(context.Background(), execCtx.ExecutionID)
+	defer release()
+	ctx := contextWithExecution(cancellableCtx, execCtx)
+	// Fresh per-execution cost tracker: LLM/harness usage recorded while the
+	// reasoner runs is read back below and attached to the terminal status
+	// callback. Concurrent executions each get their own tracker.
+	tracker := NewCostTracker()
+	ctx = contextWithCostTracker(ctx, tracker)
 	start := time.Now()
 	a.logExecutionInfo(ctx, "reasoner.invoke.start", "starting asynchronous reasoner execution", map[string]any{
 		"reasoner_id": reasoner.Name,
@@ -1155,6 +1608,7 @@ func (a *Agent) executeReasonerAsync(reasoner *Reasoner, input map[string]any, e
 				"error":       errMsg,
 			})
 			a.maybeGenerateVC(execCtx, input, nil, "failed", errMsg, durationMS, reasoner)
+			attachUsageToPayload(payload, tracker)
 			if err := a.sendExecutionStatus(execCtx.ExecutionID, payload); err != nil {
 				a.logger.Printf("failed to send panic status: %v", err)
 				a.logExecutionWarn(ctx, "execution.status.failed", "failed to send panic status update", map[string]any{
@@ -1178,6 +1632,21 @@ func (a *Agent) executeReasonerAsync(reasoner *Reasoner, input map[string]any, e
 	if err != nil {
 		payload["status"] = "failed"
 		payload["error"] = err.Error()
+		// A reasoner that ran, determined its own work failed, and wants its
+		// structured outcome preserved returns &ReasonerFailed{Result: ...}.
+		// Carry that result/details onto the failed-status payload so the single
+		// (5x-retried) status post records status=failed WITHOUT discarding the
+		// rich result — the control plane stores the result regardless of
+		// terminal status. Byte-parity with the Python async handler.
+		var rf *ReasonerFailed
+		if errors.As(err, &rf) {
+			if rf.Result != nil {
+				payload["result"] = rf.Result
+			}
+			if rf.ErrorDetails != nil {
+				payload["error_details"] = rf.ErrorDetails
+			}
+		}
 		a.logExecutionError(ctx, "reasoner.invoke.failed", "reasoner execution failed", map[string]any{
 			"reasoner_id": reasoner.Name,
 			"mode":        "async",
@@ -1196,12 +1665,37 @@ func (a *Agent) executeReasonerAsync(reasoner *Reasoner, input map[string]any, e
 		a.maybeGenerateVC(execCtx, input, result, "succeeded", "", durationMS, reasoner)
 	}
 
+	// Attach the execution's usage rollup to the terminal status payload —
+	// success AND failure both carry it (usage was spent either way). The key
+	// is omitted entirely when nothing was recorded, per the usage contract.
+	attachUsageToPayload(payload, tracker)
+
 	if err := a.sendExecutionStatus(execCtx.ExecutionID, payload); err != nil {
 		a.logger.Printf("async status update failed: %v", err)
 		a.logExecutionWarn(ctx, "execution.status.failed", "failed to send execution status update", map[string]any{
 			"reasoner_id": reasoner.Name,
 			"error":       err.Error(),
 		})
+	}
+}
+
+// applyControlPlaneAuth sets the auth headers a control plane accepts on a
+// request this package builds by hand.
+//
+// Everything that goes through the shared client (sdk/go/client) already gets
+// these — see client.do. A handful of paths construct their own *http.Request
+// and have to mirror it, or a control plane running with an API key rejects
+// them with 401. Token and APIKey are separate settings and either may be set
+// alone, so both headers are applied independently.
+func (a *Agent) applyControlPlaneAuth(req *http.Request) {
+	if req == nil {
+		return
+	}
+	if token := strings.TrimSpace(a.cfg.Token); token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	if apiKey := strings.TrimSpace(a.cfg.APIKey); apiKey != "" {
+		req.Header.Set("X-API-Key", apiKey)
 	}
 }
 
@@ -1230,9 +1724,7 @@ func (a *Agent) postExecutionStatus(ctx context.Context, callbackURL string, pay
 		req.Header.Set("Content-Type", "application/json")
 
 		// Include API auth headers (Bearer token / API key)
-		if a.cfg.Token != "" {
-			req.Header.Set("Authorization", "Bearer "+a.cfg.Token)
-		}
+		a.applyControlPlaneAuth(req)
 
 		// Sign request with DID auth headers if configured
 		if a.client != nil {
@@ -1259,7 +1751,179 @@ func (a *Agent) postExecutionStatus(ctx context.Context, callbackURL string, pay
 	return lastErr
 }
 
+// Poll pacing for Call's async-submit + wait loop. Mirrors the Python SDK's
+// _await_execution_sync (sdk/python/agentfield/client.py:970-1011) with the
+// AsyncConfig defaults from sdk/python/agentfield/async_config.py:
+// interval starts at max(initial_poll_interval, 0.25s), doubles per poll
+// capped at max_poll_interval (4s), and each sleep is jittered by
+// uniform(0.8, 1.2) clamped to [50ms, 4s] (client.py:1141-1143).
+const (
+	callInitialPollInterval = 250 * time.Millisecond
+	callMaxPollInterval     = 4 * time.Second
+	callMinPollInterval     = 50 * time.Millisecond
+)
+
+// Env vars controlling Agent.Call resilience to transient control-plane
+// outages. They follow the AGENTFIELD_* integer-seconds convention used by
+// AGENTFIELD_HARNESS_IDLE_SECONDS (sdk/go/harness/cli.go). All are read once
+// per Agent in New() and cached on the struct.
+const (
+	// envCallPollTimeoutSeconds bounds each individual status-poll HTTP
+	// request. Default 60s.
+	envCallPollTimeoutSeconds = "AGENTFIELD_CALL_POLL_TIMEOUT_SECONDS"
+	// envCallSubmitTimeoutSeconds bounds the async-submit POST. Default 120s —
+	// deliberately generous so a slow-but-healthy CP does not abort a request
+	// that may already have been accepted (re-POSTing is not idempotent).
+	envCallSubmitTimeoutSeconds = "AGENTFIELD_CALL_SUBMIT_TIMEOUT_SECONDS"
+	// envCallRetryWindowSeconds bounds how long consecutive transient failures
+	// (poll timeouts/5xx, or submit dial failures) are tolerated before the
+	// call fails with an "unreachable" error. Default 300s. A single success
+	// resets the window.
+	envCallRetryWindowSeconds = "AGENTFIELD_CALL_RETRY_WINDOW_SECONDS"
+)
+
+const (
+	defaultCallPollTimeout   = 60 * time.Second
+	defaultCallSubmitTimeout = 120 * time.Second
+	defaultCallRetryWindow   = 5 * time.Minute
+
+	// callRetryBackoffMin/Max bound the exponential backoff BETWEEN consecutive
+	// failed submit/poll attempts (distinct from the healthy poll pacing above).
+	callRetryBackoffMin = 500 * time.Millisecond
+	callRetryBackoffMax = 15 * time.Second
+
+	// callNotFoundRetryWindow bounds how long a 404 on a just-submitted
+	// execution is retried before failing with a distinct error. The control
+	// plane can briefly lag between accepting a submit and making the execution
+	// row queryable, so a 404 is treated as transient for a SHORTER window than
+	// a general outage. The effective window is min(this, callRetryWindow) so a
+	// shrunk retry window (tests) shrinks the 404 window too.
+	callNotFoundRetryWindow = 30 * time.Second
+)
+
+// resolveCallDurationEnv reads an integer-seconds env var, falling back to def
+// when unset, unparseable, or non-positive. Mirrors resolveIdleSeconds' laxity.
+func resolveCallDurationEnv(name string, def time.Duration) time.Duration {
+	raw := strings.TrimSpace(os.Getenv(name))
+	if raw == "" {
+		return def
+	}
+	v, err := strconv.Atoi(raw)
+	if err != nil || v <= 0 {
+		return def
+	}
+	return time.Duration(v) * time.Second
+}
+
+// requestNeverReachedServer reports whether an HTTP client error proves the
+// request never reached the server, so re-sending it cannot cause a duplicate
+// side effect. Only dial-phase failures qualify: the connection was never
+// established, hence no bytes of the request body were delivered. Ambiguous
+// failures (a timeout while awaiting response headers — the server may have
+// accepted and be processing the request) and caller cancellation return
+// false, so a non-idempotent submit is never blindly retried.
+func requestNeverReachedServer(err error) bool {
+	if err == nil {
+		return false
+	}
+	// Caller-driven cancellation / deadline is not a "never reached" signal:
+	// the request may have been sent before the caller gave up.
+	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+		return false
+	}
+	// Connection actively refused: nothing is listening, so no request landed.
+	if errors.Is(err, syscall.ECONNREFUSED) {
+		return true
+	}
+	// DNS resolution failed: the request never left the client.
+	var dnsErr *net.DNSError
+	if errors.As(err, &dnsErr) {
+		return true
+	}
+	// A net.OpError whose Op is "dial" means the failure happened while
+	// establishing the connection, before any request bytes were written.
+	var opErr *net.OpError
+	if errors.As(err, &opErr) && opErr.Op == "dial" {
+		return true
+	}
+	return false
+}
+
+// isTransientPollStatus reports whether an HTTP status returned by a status
+// poll is a transient control-plane condition worth retrying (overload, gateway
+// hiccups) rather than a permanent client error. 404 is handled separately
+// (bounded, distinct message) because it means "not visible yet", and other 4xx
+// (auth, bad request) are permanent and abort immediately.
+func isTransientPollStatus(code int) bool {
+	switch code {
+	case http.StatusRequestTimeout, // 408
+		http.StatusTooManyRequests: // 429
+		return true
+	}
+	return code >= 500
+}
+
+// nextRetryBackoff doubles the failure backoff, clamped to
+// [callRetryBackoffMin, callRetryBackoffMax].
+func nextRetryBackoff(current time.Duration) time.Duration {
+	next := current * 2
+	if next > callRetryBackoffMax {
+		return callRetryBackoffMax
+	}
+	if next < callRetryBackoffMin {
+		return callRetryBackoffMin
+	}
+	return next
+}
+
+// sleepCtx sleeps for d unless ctx is cancelled first. It returns true if the
+// full duration elapsed, false if ctx was cancelled during the wait.
+func sleepCtx(ctx context.Context, d time.Duration) bool {
+	if d <= 0 {
+		return ctx.Err() == nil
+	}
+	t := time.NewTimer(d)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
+	}
+}
+
+// nextCallPollInterval applies the Python _next_poll_interval jitter:
+// uniform(0.8, 1.2) * current, clamped to [callMinPollInterval, callMaxPollInterval].
+func nextCallPollInterval(current time.Duration) time.Duration {
+	jittered := time.Duration(float64(current) * (0.8 + 0.4*rand.Float64()))
+	if jittered < callMinPollInterval {
+		return callMinPollInterval
+	}
+	if jittered > callMaxPollInterval {
+		return callMaxPollInterval
+	}
+	return jittered
+}
+
 // Call invokes another reasoner via the AgentField control plane, preserving execution context.
+//
+// The call is submitted to the asynchronous execute endpoint
+// (POST /api/v1/execute/async/{target}) and the result is awaited by polling
+// GET /api/v1/executions/{execution_id} until the execution reaches a terminal
+// status — mirroring the Python SDK's app.call
+// (sdk/python/agentfield/client.py _submit_execution_sync/_await_execution_sync).
+//
+// Timeout semantics: each submit and each poll is an independent HTTP request
+// bounded by its own dedicated client timeout
+// (AGENTFIELD_CALL_SUBMIT_TIMEOUT_SECONDS / AGENTFIELD_CALL_POLL_TIMEOUT_SECONDS),
+// NOT by Config.CallTimeout and NOT by the end-to-end call. Transient submit
+// and poll failures are retried within AGENTFIELD_CALL_RETRY_WINDOW_SECONDS
+// (see submitAsyncExecution / awaitExecutionResult), so a brief control-plane
+// outage does not kill a long-running call. A child reasoner may run
+// arbitrarily long; the overall wait is bounded only by ctx. Cancelling ctx
+// aborts the wait but does NOT cancel the child execution server-side — the
+// child keeps running on its node and the control plane records its result
+// (the Python SDK behaves the same way when the caller stops waiting).
 func (a *Agent) Call(ctx context.Context, target string, input map[string]any) (map[string]any, error) {
 	if strings.TrimSpace(a.cfg.AgentFieldURL) == "" {
 		return nil, errors.New("AgentFieldURL is required to call other reasoners")
@@ -1276,6 +1940,11 @@ func (a *Agent) Call(ctx context.Context, target string, input map[string]any) (
 	}
 
 	payload := map[string]any{"input": input}
+	if execCtx.AuthorityHomeID != "" && execCtx.AuthorityRunID != "" && execCtx.AuthorityLeaseOwner != "" {
+		payload["authority"] = map[string]any{
+			"home_id": execCtx.AuthorityHomeID, "run_id": execCtx.AuthorityRunID, "lease_owner": execCtx.AuthorityLeaseOwner,
+		}
+	}
 	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, fmt.Errorf("marshal call payload: %w", err)
@@ -1285,16 +1954,26 @@ func (a *Agent) Call(ctx context.Context, target string, input map[string]any) (
 		"target":      target,
 		"reasoner_id": strings.TrimPrefix(target, a.cfg.NodeID+"."),
 	})
-	url := fmt.Sprintf("%s/api/v1/execute/%s", strings.TrimSuffix(a.cfg.AgentFieldURL, "/"), strings.TrimPrefix(target, "/"))
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+
+	base := strings.TrimSuffix(a.cfg.AgentFieldURL, "/")
+
+	executionID, submittedRunID, err := a.submitAsyncExecution(ctx, base, target, body, execCtx, runID)
 	if err != nil {
-		a.logExecutionError(ctx, "call.outbound.failed", "failed to build cross-node call request", map[string]any{
-			"target": target,
-			"error":  err.Error(),
-		})
-		return nil, fmt.Errorf("build request: %w", err)
+		return nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
+	if submittedRunID != "" {
+		runID = submittedRunID
+	}
+
+	return a.awaitExecutionResult(ctx, base, target, executionID, runID, execCtx)
+}
+
+// applyCallHeaders sets the execution-context lineage headers shared by the
+// async submit and every status poll. The control plane reads these via
+// readExecutionHeaders (control-plane/internal/handlers/execute.go) through
+// the same prepareExecution path for both the sync and async endpoints, so
+// workflow DAG parentage is recorded identically.
+func (a *Agent) applyCallHeaders(req *http.Request, execCtx ExecutionContext, runID string) {
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("X-Run-ID", runID)
 	if execCtx.ExecutionID != "" {
@@ -1319,31 +1998,109 @@ func (a *Agent) Call(ctx context.Context, target string, input map[string]any) (
 	// Include caller agent identity for permission middleware
 	req.Header.Set("X-Caller-Agent-ID", a.cfg.NodeID)
 
-	if a.cfg.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+a.cfg.Token)
-	}
+	a.applyControlPlaneAuth(req)
+}
 
-	// Sign request with DID auth headers if configured
-	if a.client != nil {
-		a.client.SignHTTPRequest(req, body)
-	}
+// submitAsyncExecution POSTs to /api/v1/execute/async/{target} and returns the
+// accepted execution's identifiers. Mirrors Python _submit_execution_sync
+// (client.py:866-905): any HTTP status >= 400 is an ExecuteError, and a
+// response without an execution_id is rejected.
+func (a *Agent) submitAsyncExecution(
+	ctx context.Context,
+	base, target string,
+	body []byte,
+	execCtx ExecutionContext,
+	runID string,
+) (executionID, submittedRunID string, err error) {
+	url := fmt.Sprintf("%s/api/v1/execute/async/%s", base, strings.TrimPrefix(target, "/"))
 
-	resp, err := a.httpClient.Do(req)
-	if err != nil {
-		a.logExecutionError(ctx, "call.outbound.failed", "cross-node call failed", map[string]any{
-			"target": target,
-			"error":  err.Error(),
+	var (
+		resp        *http.Response
+		streakStart time.Time
+		backoff     = callRetryBackoffMin
+		attempt     int
+	)
+	for {
+		attempt++
+		req, buildErr := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body))
+		if buildErr != nil {
+			a.logExecutionError(ctx, "call.outbound.failed", "failed to build cross-node call request", map[string]any{
+				"target": target,
+				"error":  buildErr.Error(),
+			})
+			return "", "", fmt.Errorf("build request: %w", buildErr)
+		}
+		req.Header.Set("Content-Type", "application/json")
+		a.applyCallHeaders(req, execCtx, runID)
+
+		// Sign request with DID auth headers if configured. Re-signed on every
+		// attempt so a retry carries a fresh signature timestamp.
+		if a.client != nil {
+			a.client.SignHTTPRequest(req, body)
+		}
+
+		var doErr error
+		resp, doErr = a.callSubmitClient.Do(req)
+		if doErr == nil {
+			break
+		}
+		// Caller-driven cancellation/deadline: surface verbatim, never retry.
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			a.logExecutionError(ctx, "call.outbound.failed", "cross-node call submit cancelled", map[string]any{
+				"target": target,
+				"error":  ctxErr.Error(),
+			})
+			return "", "", ctxErr
+		}
+		// Re-POSTing execute/async is NOT idempotent — a duplicate would
+		// double-run the target reasoner. Retry ONLY when the request provably
+		// never reached the server (dial/DNS/connection-refused); every
+		// ambiguous failure (e.g. a timeout awaiting headers, where the CP may
+		// already have accepted the request) fails without a retry. The submit
+		// client's generous timeout (default 120s) is what protects a
+		// slow-but-healthy CP from a premature abort.
+		if !requestNeverReachedServer(doErr) {
+			a.logExecutionError(ctx, "call.outbound.failed", "cross-node call failed", map[string]any{
+				"target": target,
+				"error":  doErr.Error(),
+			})
+			return "", "", fmt.Errorf("perform execute call (not retried to avoid double-execution): %w", doErr)
+		}
+		now := time.Now()
+		if streakStart.IsZero() {
+			streakStart = now
+		}
+		elapsed := now.Sub(streakStart)
+		if elapsed >= a.callRetryWindow {
+			a.logExecutionError(ctx, "call.outbound.failed", "cross-node call submit unreachable", map[string]any{
+				"target":     target,
+				"attempts":   attempt,
+				"elapsed_ms": elapsed.Milliseconds(),
+				"error":      doErr.Error(),
+			})
+			return "", "", fmt.Errorf("control plane unreachable for %s: submit to %s never connected after %d attempts: %w",
+				elapsed.Round(time.Second), target, attempt, doErr)
+		}
+		a.logExecutionWarn(ctx, "call.outbound.submit_retry", "cross-node call submit failed to connect, retrying", map[string]any{
+			"target":     target,
+			"attempt":    attempt,
+			"elapsed_ms": elapsed.Milliseconds(),
+			"window_ms":  a.callRetryWindow.Milliseconds(),
+			"error":      doErr.Error(),
 		})
-		return nil, fmt.Errorf("perform execute call: %w", err)
+		if !sleepCtx(ctx, backoff) {
+			return "", "", ctx.Err()
+		}
+		backoff = nextRetryBackoff(backoff)
 	}
 	defer resp.Body.Close()
 
 	bodyBytes, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read execute response: %w", err)
+		return "", "", fmt.Errorf("read execute response: %w", err)
 	}
 
-	if resp.StatusCode != http.StatusOK {
+	if resp.StatusCode >= 400 {
 		// Try to parse structured error from control plane response.
 		var errResp struct {
 			Error        string      `json:"error"`
@@ -1355,7 +2112,7 @@ func (a *Agent) Call(ctx context.Context, target string, input map[string]any) (
 				"status": resp.StatusCode,
 				"error":  errResp.Error,
 			})
-			return nil, &ExecuteError{
+			return "", "", &ExecuteError{
 				StatusCode:   resp.StatusCode,
 				Message:      errResp.Error,
 				ErrorDetails: errResp.ErrorDetails,
@@ -1365,57 +2122,335 @@ func (a *Agent) Call(ctx context.Context, target string, input map[string]any) (
 			"target": target,
 			"status": resp.StatusCode,
 		})
-		return nil, &ExecuteError{
+		return "", "", &ExecuteError{
 			StatusCode: resp.StatusCode,
 			Message:    fmt.Sprintf("execute failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes))),
 		}
 	}
 
-	var execResp struct {
-		ExecutionID  string         `json:"execution_id"`
-		RunID        string         `json:"run_id"`
-		Status       string         `json:"status"`
-		Result       map[string]any `json:"result"`
-		ErrorMessage *string        `json:"error_message"`
-		ErrorDetails interface{}    `json:"error_details"`
+	var submitResp struct {
+		ExecutionID string `json:"execution_id"`
+		RunID       string `json:"run_id"`
+		Status      string `json:"status"`
 	}
-	if err := json.Unmarshal(bodyBytes, &execResp); err != nil {
+	if err := json.Unmarshal(bodyBytes, &submitResp); err != nil {
 		a.logExecutionError(ctx, "call.outbound.failed", "failed to decode cross-node call response", map[string]any{
 			"target": target,
 			"error":  err.Error(),
 		})
-		return nil, fmt.Errorf("decode execute response: %w", err)
+		return "", "", fmt.Errorf("decode execute response: %w", err)
+	}
+	if submitResp.ExecutionID == "" {
+		a.logExecutionError(ctx, "call.outbound.failed", "async submission missing execution id", map[string]any{
+			"target": target,
+		})
+		return "", "", errors.New("execution submission missing identifiers")
 	}
 
-	if execResp.ErrorMessage != nil && *execResp.ErrorMessage != "" {
-		a.logExecutionError(ctx, "call.outbound.failed", "cross-node call returned execution error", map[string]any{
-			"target": target,
-			"error":  *execResp.ErrorMessage,
-		})
-		return nil, &ExecuteError{
-			StatusCode:   resp.StatusCode,
-			Message:      *execResp.ErrorMessage,
-			ErrorDetails: execResp.ErrorDetails,
-		}
-	}
-	if !strings.EqualFold(execResp.Status, "succeeded") {
-		a.logExecutionError(ctx, "call.outbound.failed", "cross-node call did not succeed", map[string]any{
-			"target": target,
-			"status": execResp.Status,
-		})
-		return nil, &ExecuteError{
-			StatusCode:   resp.StatusCode,
-			Message:      fmt.Sprintf("execute status %s", execResp.Status),
-			ErrorDetails: execResp.ErrorDetails,
-		}
+	return submitResp.ExecutionID, submitResp.RunID, nil
+}
+
+// awaitExecutionResult polls GET /api/v1/executions/{execution_id} until the
+// execution reaches a terminal status. Statuses are normalized, "succeeded"
+// returns the result, and {failed, cancelled, timeout} surface the execution
+// error (with the status endpoint's "error" field coalesced into the message —
+// Python parity, client.py:1000-1002).
+//
+// Resilience to transient control-plane outages (this is the key departure from
+// the Python SDK, whose _await_execution_sync raise_for_status()es on every
+// poll and so lets a single blip kill a 30-minute call): a transient poll
+// failure — a transport error/timeout, or a 408/429/5xx — does NOT fail the
+// call. Consecutive failures are retried with exponential backoff (capped at
+// callRetryBackoffMax) for up to a.callRetryWindow of UNBROKEN failure; a single
+// successful poll resets that window. Only when the window is exceeded does the
+// call fail with a "control plane unreachable for Xs" error. A 404 (execution
+// not yet queryable right after submit) is retried within a shorter bounded
+// window and then fails with a distinct message. Other 4xx are permanent and
+// abort immediately. Each poll request is bounded by callPollClient's timeout;
+// the overall wait is otherwise bounded only by ctx.
+func (a *Agent) awaitExecutionResult(
+	ctx context.Context,
+	base, target, executionID, runID string,
+	execCtx ExecutionContext,
+) (map[string]any, error) {
+	pollURL := fmt.Sprintf("%s/api/v1/executions/%s", base, url.PathEscape(executionID))
+	interval := callInitialPollInterval
+
+	var (
+		transientStreakStart time.Time
+		notFoundStreakStart  time.Time
+		failCount            int
+		failBackoff          = callRetryBackoffMin
+	)
+
+	// resetFailureStreak clears the consecutive-failure bookkeeping — called
+	// after any successful poll, honoring "a successful poll resets the window".
+	resetFailureStreak := func() {
+		transientStreakStart = time.Time{}
+		notFoundStreakStart = time.Time{}
+		failCount = 0
+		failBackoff = callRetryBackoffMin
 	}
 
-	a.logExecutionInfo(ctx, "call.outbound.complete", "cross-node call completed", map[string]any{
-		"target":       target,
-		"execution_id": execResp.ExecutionID,
-		"run_id":       execResp.RunID,
-	})
-	return execResp.Result, nil
+	// recordTransientFailure advances the transient-failure window. It returns
+	// retry=true (keep polling after a backoff) until the window is exceeded,
+	// at which point it returns the terminal "unreachable" error.
+	recordTransientFailure := func(cause error) (bool, error) {
+		now := time.Now()
+		if transientStreakStart.IsZero() {
+			transientStreakStart = now
+		}
+		notFoundStreakStart = time.Time{}
+		failCount++
+		elapsed := now.Sub(transientStreakStart)
+		if elapsed >= a.callRetryWindow {
+			a.logExecutionError(ctx, "call.outbound.failed", "cross-node call control plane unreachable", map[string]any{
+				"target":       target,
+				"execution_id": executionID,
+				"attempts":     failCount,
+				"elapsed_ms":   elapsed.Milliseconds(),
+				"error":        cause.Error(),
+			})
+			return false, fmt.Errorf("control plane unreachable for %s: %d consecutive failed polls of execution %s: %w",
+				elapsed.Round(time.Second), failCount, executionID, cause)
+		}
+		a.logExecutionWarn(ctx, "call.outbound.poll_retry", "cross-node call status poll failed, retrying", map[string]any{
+			"target":       target,
+			"execution_id": executionID,
+			"attempt":      failCount,
+			"elapsed_ms":   elapsed.Milliseconds(),
+			"window_ms":    a.callRetryWindow.Milliseconds(),
+			"error":        cause.Error(),
+		})
+		return true, nil
+	}
+
+	// recordNotFound advances the shorter 404 window (the CP may briefly lag
+	// between accepting a submit and making the execution row queryable).
+	recordNotFound := func() (bool, error) {
+		now := time.Now()
+		if notFoundStreakStart.IsZero() {
+			notFoundStreakStart = now
+		}
+		transientStreakStart = time.Time{}
+		failCount++
+		window := callNotFoundRetryWindow
+		if a.callRetryWindow < window {
+			window = a.callRetryWindow
+		}
+		elapsed := now.Sub(notFoundStreakStart)
+		if elapsed >= window {
+			a.logExecutionError(ctx, "call.outbound.failed", "cross-node call execution not found", map[string]any{
+				"target":       target,
+				"execution_id": executionID,
+				"attempts":     failCount,
+				"elapsed_ms":   elapsed.Milliseconds(),
+			})
+			return false, &ExecuteError{
+				StatusCode: http.StatusNotFound,
+				Message: fmt.Sprintf("execution %s not found on control plane after %s (submit was accepted but the execution never became queryable)",
+					executionID, elapsed.Round(time.Second)),
+			}
+		}
+		a.logExecutionWarn(ctx, "call.outbound.poll_retry", "cross-node call execution not yet visible, retrying", map[string]any{
+			"target":       target,
+			"execution_id": executionID,
+			"attempt":      failCount,
+			"elapsed_ms":   elapsed.Milliseconds(),
+			"reason":       "not_found",
+		})
+		return true, nil
+	}
+
+	// backoffAfterFailure sleeps the current failure backoff (honoring ctx) and
+	// advances it. Returns false if ctx was cancelled during the wait.
+	backoffAfterFailure := func() bool {
+		if !sleepCtx(ctx, failBackoff) {
+			return false
+		}
+		failBackoff = nextRetryBackoff(failBackoff)
+		return true
+	}
+
+	for {
+		if err := ctx.Err(); err != nil {
+			a.logExecutionError(ctx, "call.outbound.failed", "cross-node call wait cancelled", map[string]any{
+				"target":       target,
+				"execution_id": executionID,
+				"error":        err.Error(),
+			})
+			return nil, err
+		}
+
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, pollURL, nil)
+		if err != nil {
+			return nil, fmt.Errorf("build status request: %w", err)
+		}
+		a.applyCallHeaders(req, execCtx, runID)
+		if a.client != nil {
+			a.client.SignHTTPRequest(req, nil)
+		}
+
+		resp, err := a.callPollClient.Do(req)
+		if err != nil {
+			// Distinguish caller cancellation from transport failures so the
+			// ctx-cancel contract surfaces context.Canceled/DeadlineExceeded.
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				a.logExecutionError(ctx, "call.outbound.failed", "cross-node call wait cancelled", map[string]any{
+					"target":       target,
+					"execution_id": executionID,
+					"error":        ctxErr.Error(),
+				})
+				return nil, ctxErr
+			}
+			// A transport error/timeout is transient: retry within the window
+			// instead of killing a call that may have been running for a long
+			// time (the observed real-world failure — one timed-out poll aborted
+			// a 30-minute call).
+			retry, failErr := recordTransientFailure(fmt.Errorf("poll execution status: %w", err))
+			if !retry {
+				return nil, failErr
+			}
+			if !backoffAfterFailure() {
+				return nil, ctx.Err()
+			}
+			continue
+		}
+
+		bodyBytes, readErr := io.ReadAll(resp.Body)
+		_ = resp.Body.Close()
+		if readErr != nil {
+			return nil, fmt.Errorf("read execution status: %w", readErr)
+		}
+
+		// 404: the execution row may not be queryable yet right after submit.
+		// Retry within a bounded (shorter) window, then fail distinctly.
+		if resp.StatusCode == http.StatusNotFound {
+			retry, failErr := recordNotFound()
+			if !retry {
+				return nil, failErr
+			}
+			if !backoffAfterFailure() {
+				return nil, ctx.Err()
+			}
+			continue
+		}
+
+		// Transient server-side conditions (408/429/5xx): retry within the
+		// failure window rather than aborting the call.
+		if isTransientPollStatus(resp.StatusCode) {
+			retry, failErr := recordTransientFailure(fmt.Errorf("poll execution status %d: %s",
+				resp.StatusCode, strings.TrimSpace(string(bodyBytes))))
+			if !retry {
+				return nil, failErr
+			}
+			if !backoffAfterFailure() {
+				return nil, ctx.Err()
+			}
+			continue
+		}
+
+		// Other 4xx (auth, bad request): a persistent client error retrying
+		// cannot fix — abort with the status.
+		if resp.StatusCode >= 400 {
+			a.logExecutionError(ctx, "call.outbound.failed", "cross-node call status poll returned error status", map[string]any{
+				"target":       target,
+				"execution_id": executionID,
+				"status":       resp.StatusCode,
+			})
+			return nil, &ExecuteError{
+				StatusCode: resp.StatusCode,
+				Message:    fmt.Sprintf("execution status failed (%d): %s", resp.StatusCode, strings.TrimSpace(string(bodyBytes))),
+			}
+		}
+
+		// A genuine 2xx answer from the CP resets the failure window.
+		resetFailureStreak()
+
+		var statusResp struct {
+			ExecutionID  string          `json:"execution_id"`
+			RunID        string          `json:"run_id"`
+			Status       string          `json:"status"`
+			Result       json.RawMessage `json:"result"`
+			Error        *string         `json:"error"`
+			ErrorMessage *string         `json:"error_message"`
+			ErrorDetails interface{}     `json:"error_details"`
+		}
+		if err := json.Unmarshal(bodyBytes, &statusResp); err != nil {
+			a.logExecutionError(ctx, "call.outbound.failed", "failed to decode execution status response", map[string]any{
+				"target":       target,
+				"execution_id": executionID,
+				"error":        err.Error(),
+			})
+			return nil, fmt.Errorf("decode execute response: %w", err)
+		}
+
+		status := types.NormalizeStatus(statusResp.Status)
+
+		if status == types.ExecutionStatusSucceeded {
+			var result map[string]any
+			if len(statusResp.Result) > 0 && string(statusResp.Result) != "null" {
+				if err := json.Unmarshal(statusResp.Result, &result); err != nil {
+					a.logExecutionError(ctx, "call.outbound.failed", "failed to decode cross-node call result", map[string]any{
+						"target":       target,
+						"execution_id": executionID,
+						"error":        err.Error(),
+					})
+					return nil, fmt.Errorf("decode execute response: %w", err)
+				}
+			}
+			a.logExecutionInfo(ctx, "call.outbound.complete", "cross-node call completed", map[string]any{
+				"target":       target,
+				"execution_id": executionID,
+				"run_id":       runID,
+			})
+			return result, nil
+		}
+
+		if types.TerminalStatuses[status] {
+			// error_message, falling back to the status endpoint's "error"
+			// field — Python parity (client.py:1000-1002).
+			message := ""
+			if statusResp.ErrorMessage != nil && *statusResp.ErrorMessage != "" {
+				message = *statusResp.ErrorMessage
+			} else if statusResp.Error != nil && *statusResp.Error != "" {
+				message = *statusResp.Error
+			}
+			if message == "" {
+				message = fmt.Sprintf("execute status %s", status)
+			}
+			a.logExecutionError(ctx, "call.outbound.failed", "cross-node call did not succeed", map[string]any{
+				"target":       target,
+				"execution_id": executionID,
+				"status":       status,
+				"error":        message,
+			})
+			// StatusBadGateway matches what the synchronous execute endpoint
+			// returns for failed executions, so ExecuteError.StatusCode keeps
+			// its pre-async meaning for callers that inspect it.
+			return nil, &ExecuteError{
+				StatusCode:   http.StatusBadGateway,
+				Message:      message,
+				ErrorDetails: statusResp.ErrorDetails,
+			}
+		}
+
+		// Non-terminal: sleep with jittered exponential backoff, honoring ctx.
+		select {
+		case <-ctx.Done():
+			a.logExecutionError(ctx, "call.outbound.failed", "cross-node call wait cancelled", map[string]any{
+				"target":       target,
+				"execution_id": executionID,
+				"error":        ctx.Err().Error(),
+			})
+			return nil, ctx.Err()
+		case <-time.After(nextCallPollInterval(interval)):
+		}
+		interval *= 2
+		if interval > callMaxPollInterval {
+			interval = callMaxPollInterval
+		}
+	}
 }
 
 // emitWorkflowEvent sends a workflow event to the control plane asynchronously.
@@ -1483,9 +2518,7 @@ func (a *Agent) sendWorkflowEvent(event types.WorkflowExecutionEvent) error {
 	}
 
 	req.Header.Set("Content-Type", "application/json")
-	if a.cfg.Token != "" {
-		req.Header.Set("Authorization", "Bearer "+a.cfg.Token)
-	}
+	a.applyControlPlaneAuth(req)
 
 	// Sign request with DID auth headers if configured
 	if a.client != nil {
@@ -1513,7 +2546,10 @@ func (a *Agent) sendWorkflowEvent(event types.WorkflowExecutionEvent) error {
 func (a *Agent) CallLocal(ctx context.Context, reasonerName string, input map[string]any) (any, error) {
 	reasoner, ok := a.reasoners[reasonerName]
 	if !ok {
-		return nil, fmt.Errorf("unknown reasoner %q", reasonerName)
+		reasoner, ok = a.skills[reasonerName]
+	}
+	if !ok {
+		return nil, fmt.Errorf("unknown reasoner or skill %q", reasonerName)
 	}
 
 	parentCtx := executionContextFrom(ctx)
@@ -1593,7 +2629,11 @@ func (a *Agent) AI(ctx context.Context, prompt string, opts ...ai.Option) (*ai.R
 	if a.aiClient == nil {
 		return nil, errors.New("AI not configured for this agent; set AIConfig in agent Config")
 	}
-	return a.aiClient.Complete(ctx, prompt, opts...)
+	resp, err := a.aiClient.Complete(ctx, prompt, opts...)
+	if err == nil {
+		a.recordAIUsage(ctx, resp)
+	}
+	return resp, err
 }
 
 // AIWithTools makes an AI call with tool-calling support.
@@ -1635,18 +2675,40 @@ func (a *Agent) AIWithTools(ctx context.Context, prompt string, config ai.ToolCa
 		},
 	}
 
+	allowedTargets := make(map[string]struct{}, len(tools))
+	for _, tool := range tools {
+		allowedTargets[normalizeToolInvocationTarget(agentToolNameToInvocationTarget(tool.Function.Name))] = struct{}{}
+	}
+
 	callFn := func(ctx context.Context, target string, input map[string]interface{}) (map[string]interface{}, error) {
-		if strings.Contains(target, ":skill:") {
-			parts := strings.SplitN(target, ":skill:", 2)
-			target = parts[0] + "." + parts[1]
-		} else if strings.Contains(target, ":") {
-			parts := strings.SplitN(target, ":", 2)
-			target = parts[0] + "." + parts[1]
+		target = normalizeToolInvocationTarget(target)
+		if _, ok := allowedTargets[target]; !ok {
+			return nil, fmt.Errorf("tool call target %q is not a discovered capability", target)
 		}
 		return a.Call(ctx, target, input)
 	}
 
-	return a.aiClient.ExecuteToolCallLoop(ctx, messages, tools, config, callFn)
+	resp, trace, err := a.aiClient.ExecuteToolCallLoop(ctx, messages, tools, config, callFn)
+	// Record usage even on error: intermediate turns that completed before
+	// the failure still consumed tokens.
+	a.recordToolLoopUsage(ctx, resp, trace)
+	return resp, trace, err
+}
+
+func normalizeToolInvocationTarget(target string) string {
+	if strings.Contains(target, ":skill:") {
+		parts := strings.SplitN(target, ":skill:", 2)
+		return parts[0] + "." + parts[1]
+	}
+	if strings.Contains(target, ":") {
+		parts := strings.SplitN(target, ":", 2)
+		return parts[0] + "." + parts[1]
+	}
+	return target
+}
+
+func agentToolNameToInvocationTarget(name string) string {
+	return strings.ReplaceAll(name, "__", ":")
 }
 
 // AIStream makes a streaming AI/LLM call.
@@ -1670,7 +2732,41 @@ func (a *Agent) AIStream(ctx context.Context, prompt string, opts ...ai.Option) 
 		close(chunkCh)
 		return chunkCh, errCh
 	}
-	return a.aiClient.StreamComplete(ctx, prompt, opts...)
+	chunks, errs := a.aiClient.StreamComplete(ctx, prompt, opts...)
+	tracker := costTrackerFromContext(ctx)
+	if tracker == nil {
+		return chunks, errs
+	}
+
+	// Forward chunks unchanged while watching for the terminal usage chunk
+	// (providers that stream usage accounting — e.g. OpenRouter with
+	// usage.include — attach it to the final chunk). Usage is recorded once
+	// the stream ends; when the provider streams no usage, nothing is
+	// recorded (best-effort, the stream itself is never disturbed).
+	out := make(chan ai.StreamChunk)
+	go func() {
+		defer close(out)
+		var usage *ai.Usage
+		model := ""
+	forward:
+		for chunk := range chunks {
+			if chunk.Model != "" {
+				model = chunk.Model
+			}
+			if chunk.Usage != nil {
+				usage = chunk.Usage
+			}
+			select {
+			case out <- chunk:
+			case <-ctx.Done():
+				break forward
+			}
+		}
+		if usage != nil {
+			a.recordLLMUsage(ctx, model, usage)
+		}
+	}()
+	return out, errs
 }
 
 // ExecutionContextFrom returns the execution context embedded in the provided context, if any.

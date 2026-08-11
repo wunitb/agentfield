@@ -31,7 +31,8 @@ import "embed"
 // for every shipped skill. Files live under skill_data/<skill-name>/ and are
 // copied from the repo-root skills/ directory at build time.
 //
-//go:embed skill_data/agentfield-multi-reasoner-builder/SKILL.md
-//go:embed skill_data/agentfield-multi-reasoner-builder/references/*.md
-//go:embed skill_data/agentfield-multi-reasoner-builder/commands/*.md
+//go:embed skill_data/agentfield/SKILL.md
+//go:embed skill_data/agentfield/references/*.md
+//go:embed skill_data/agentfield-personal/SKILL.md
+//go:embed skill_data/agentfield-use/SKILL.md
 var SkillData embed.FS

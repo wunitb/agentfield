@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"os"
 	"time"
 
 	"github.com/Agent-Field/agentfield/control-plane/internal/config"
@@ -33,6 +34,7 @@ func (s *AgentFieldServer) registerCoreRoutes(agentAPI *gin.RouterGroup) {
 	{
 		discovery.GET("/capabilities", handlers.DiscoveryCapabilitiesHandler(s.storage))
 	}
+	agentAPI.GET("/reasoners", handlers.ListReasonersHandler(s.storage))
 
 	// Node management endpoints
 	agentAPI.POST("/nodes/register", handlers.RegisterNodeHandler(s.storage, s.uiService, s.didService, s.presenceManager, s.didWebService, s.tagApprovalService))
@@ -53,21 +55,29 @@ func (s *AgentFieldServer) registerCoreRoutes(agentAPI *gin.RouterGroup) {
 	agentAPI.POST("/nodes/:node_id/start", handlers.StartNodeHandler(s.statusManager, s.storage))
 	agentAPI.POST("/nodes/:node_id/stop", handlers.StopNodeHandler(s.statusManager, s.storage))
 	agentAPI.POST("/nodes/:node_id/lifecycle/status", handlers.UpdateLifecycleStatusHandler(s.storage, s.uiService, s.statusManager))
-	agentAPI.PATCH("/nodes/:node_id/status", handlers.NodeStatusLeaseHandler(s.storage, s.statusManager, s.presenceManager, handlers.DefaultLeaseTTL))
+	agentAPI.PATCH("/nodes/:node_id/status", handlers.NodeStatusLeaseHandler(s.storage, s.statusManager, s.healthMonitor, s.presenceManager, handlers.DefaultLeaseTTL))
 	agentAPI.POST("/nodes/:node_id/actions/ack", handlers.NodeActionAckHandler(s.storage, s.presenceManager, handlers.DefaultLeaseTTL))
 	agentAPI.POST("/nodes/:node_id/shutdown", handlers.NodeShutdownHandler(s.storage, s.statusManager, s.presenceManager))
 	agentAPI.POST("/actions/claim", handlers.ClaimActionsHandler(s.storage, s.presenceManager, handlers.DefaultLeaseTTL))
 
 	// TODO: Add other node routes (DeleteNode)
 
-	// Reasoner and skill execution endpoints (legacy)
+	// Reasoner and skill execution endpoints (legacy). These routes cannot carry
+	// an outer lifecycle lease, so authority-enabled deployments fail closed.
+	legacyReasonerHandler := handlers.ExecuteReasonerHandler(s.storage)
+	legacySkillHandler := handlers.ExecuteSkillHandler(s.storage)
+	if s.runAuthority != nil {
+		legacyReasonerHandler = handlers.RunAuthorityUnsupportedHandler("legacy reasoner")
+		legacySkillHandler = handlers.RunAuthorityUnsupportedHandler("legacy skill")
+	}
 	// When authorization is enabled, these require the same permission middleware
 	// as the unified execute endpoints to prevent policy bypass.
 	if s.config.Features.DID.Authorization.Enabled && s.accessPolicyService != nil && s.didWebService != nil {
 		legacyReasonerGroup := agentAPI.Group("/reasoners")
 		legacySkillGroup := agentAPI.Group("/skills")
 		permConfigLegacy := middleware.PermissionConfig{
-			Enabled: true,
+			Enabled:     true,
+			DefaultDeny: s.config.Features.DID.Authorization.DefaultDeny,
 		}
 		legacyMiddleware := middleware.PermissionCheckMiddleware(
 			s.accessPolicyService,
@@ -78,12 +88,12 @@ func (s *AgentFieldServer) registerCoreRoutes(agentAPI *gin.RouterGroup) {
 		)
 		legacyReasonerGroup.Use(legacyMiddleware)
 		legacySkillGroup.Use(legacyMiddleware)
-		legacyReasonerGroup.POST("/:reasoner_id", handlers.ExecuteReasonerHandler(s.storage))
-		legacySkillGroup.POST("/:skill_id", handlers.ExecuteSkillHandler(s.storage))
+		legacyReasonerGroup.POST("/:reasoner_id", legacyReasonerHandler)
+		legacySkillGroup.POST("/:skill_id", legacySkillHandler)
 		logger.Logger.Info().Msg("🔒 Permission checking enabled on legacy reasoner/skill endpoints")
 	} else {
-		agentAPI.POST("/reasoners/:reasoner_id", handlers.ExecuteReasonerHandler(s.storage))
-		agentAPI.POST("/skills/:skill_id", handlers.ExecuteSkillHandler(s.storage))
+		agentAPI.POST("/reasoners/:reasoner_id", legacyReasonerHandler)
+		agentAPI.POST("/skills/:skill_id", legacySkillHandler)
 	}
 
 	// Unified execution endpoints (path-based)
@@ -92,7 +102,8 @@ func (s *AgentFieldServer) registerCoreRoutes(agentAPI *gin.RouterGroup) {
 	{
 		if s.config.Features.DID.Authorization.Enabled && s.accessPolicyService != nil && s.didWebService != nil {
 			permConfig := middleware.PermissionConfig{
-				Enabled: true,
+				Enabled:     true,
+				DefaultDeny: s.config.Features.DID.Authorization.DefaultDeny,
 			}
 			executeGroup.Use(middleware.PermissionCheckMiddleware(
 				s.accessPolicyService,
@@ -104,10 +115,18 @@ func (s *AgentFieldServer) registerCoreRoutes(agentAPI *gin.RouterGroup) {
 			logger.Logger.Info().Msg("🔒 Permission checking enabled on execute endpoints")
 		}
 
-		executeGroup.POST("/:target", handlers.ExecuteHandler(s.storage, s.payloadStore, s.webhookDispatcher, s.config.AgentField.ExecutionQueue.AgentCallTimeout, s.config.Features.DID.Authorization.InternalToken))
-		executeGroup.POST("/async/:target", handlers.ExecuteAsyncHandler(s.storage, s.payloadStore, s.webhookDispatcher, s.config.AgentField.ExecutionQueue.AgentCallTimeout, s.config.Features.DID.Authorization.InternalToken))
+		executeGroup.POST("/:target", handlers.ExecuteHandlerWithARDAndRunAuthority(s.storage, s.payloadStore, s.webhookDispatcher, s.config.AgentField.ExecutionQueue.AgentCallTimeout, s.config.Features.DID.Authorization.InternalToken, func() config.ARDConfig {
+			s.configMu.RLock()
+			defer s.configMu.RUnlock()
+			return s.config.AgentField.ARD
+		}, s.runAuthority))
+		executeGroup.POST("/async/:target", handlers.ExecuteAsyncHandlerWithRunAuthority(s.storage, s.payloadStore, s.webhookDispatcher, s.config.AgentField.ExecutionQueue.AgentCallTimeout, s.config.Features.DID.Authorization.InternalToken, s.runAuthority))
 	}
+	// Static "active" coexists with the :execution_id param route (same
+	// pattern as POST /executions/batch-status); gin matches static first.
+	agentAPI.GET("/executions/active", handlers.ActiveExecutionsHandler(s.storage))
 	agentAPI.GET("/executions/:execution_id", handlers.GetExecutionStatusHandler(s.storage))
+	agentAPI.GET("/executions/:execution_id/events", handlers.StreamExecutionEventsHandler(s.storage))
 	agentAPI.POST("/executions/batch-status", handlers.BatchExecutionStatusHandler(s.storage))
 	agentAPI.POST("/executions/:execution_id/status", handlers.UpdateExecutionStatusHandler(s.storage, s.payloadStore, s.webhookDispatcher, s.config.AgentField.ExecutionQueue.AgentCallTimeout))
 	agentAPI.POST("/executions/:execution_id/logs", handlers.StructuredExecutionLogsHandler(s.storage, func() config.ExecutionLogsConfig {
@@ -116,23 +135,64 @@ func (s *AgentFieldServer) registerCoreRoutes(agentAPI *gin.RouterGroup) {
 	agentAPI.POST("/executions/:execution_id/cancel", handlers.CancelExecutionHandler(s.storage))
 	agentAPI.POST("/executions/:execution_id/pause", handlers.PauseExecutionHandler(s.storage))
 	agentAPI.POST("/executions/:execution_id/resume", handlers.ResumeExecutionHandler(s.storage))
+	restartHandler := handlers.RestartExecutionHandler(s.storage, s.payloadStore, s.webhookDispatcher, s.config.AgentField.ExecutionQueue.AgentCallTimeout, s.config.Features.DID.Authorization.InternalToken)
+	if s.runAuthority != nil {
+		restartHandler = handlers.RunAuthorityUnsupportedHandler("restart")
+	}
+	agentAPI.POST("/executions/:execution_id/restart", restartHandler)
+	agentAPI.POST("/workflows/:workflowId/cancel-tree", handlers.CancelWorkflowTreeHandler(s.storage))
 
 	// Approval workflow endpoints — CP manages execution state only;
 	// agents handle external approval service communication directly.
 	agentAPI.POST("/executions/:execution_id/request-approval", handlers.RequestApprovalHandler(s.storage))
 	agentAPI.GET("/executions/:execution_id/approval-status", handlers.GetApprovalStatusHandler(s.storage))
+	// Authenticated approval resolution by execution ID — same resolution
+	// logic as the HMAC webhook below, for operators/CLIs that hold an API
+	// key rather than the webhook secret.
+	agentAPI.POST("/executions/:execution_id/approval-response", handlers.ResolveApprovalHandler(s.storage))
 
 	// Agent-scoped approval routes — enforce that the execution belongs to the requesting agent.
 	agentAPI.POST("/agents/:node_id/executions/:execution_id/request-approval", handlers.AgentScopedRequestApprovalHandler(s.storage))
 	agentAPI.GET("/agents/:node_id/executions/:execution_id/approval-status", handlers.AgentScopedGetApprovalStatusHandler(s.storage))
 
+	// Multi-hop pause propagation: an agent's app.call wait loop pushes its
+	// OWN status to WAITING when its awaited child enters WAITING, so any
+	// further ancestor sees WAITING transitively. Without this, pause only
+	// propagates one hop up the call tree and 3+-deep chains time out at
+	// wallclock on the great-grandparent.
+	agentAPI.POST("/agents/:node_id/executions/:execution_id/awaiter-status", handlers.UpdateAwaiterStatusHandler(s.storage))
+
 	// Approval resolution webhook (called by agents or external services when approval resolves)
 	agentAPI.POST("/webhooks/approval-response", handlers.ApprovalWebhookHandler(s.storage, s.config.AgentField.Approval.WebhookSecret))
 
 	// Execution notes endpoints for app.note() feature
-	agentAPI.POST("/executions/note", handlers.AddExecutionNoteHandler(s.storage))
-	agentAPI.GET("/executions/:execution_id/notes", handlers.GetExecutionNotesHandler(s.storage))
+	agentAPI.POST("/executions/note", handlers.AddExecutionNoteHandler(s.storage, s.noteOwnershipEnforced()))
+	agentAPI.GET("/executions/:execution_id/notes", handlers.GetExecutionNotesHandler(s.storage, s.noteOwnershipEnforced()))
 	agentAPI.POST("/workflow/executions/events", handlers.WorkflowExecutionEventHandler(s.storage))
+
+	sessionTargetGroup := agentAPI.Group("/session-targets")
+	{
+		if s.config.Features.DID.Authorization.Enabled && s.accessPolicyService != nil && s.didWebService != nil {
+			permConfig := middleware.PermissionConfig{
+				Enabled:     true,
+				DefaultDeny: s.config.Features.DID.Authorization.DefaultDeny,
+			}
+			sessionTargetGroup.Use(middleware.PermissionCheckMiddleware(
+				s.accessPolicyService,
+				s.tagVCVerifier,
+				s.storage,
+				s.didWebService,
+				permConfig,
+			))
+			logger.Logger.Info().Msg("🔒 Permission checking enabled on session target endpoints")
+		}
+		sessionTargetGroup.POST("/:target/start", handlers.StartSessionHandler(s.storage))
+	}
+	sessionInstanceGroup := agentAPI.Group("/session-instances")
+	{
+		sessionInstanceGroup.POST("/:session_id/realtime-offer", handlers.SessionRealtimeOfferHandler(s.storage))
+		sessionInstanceGroup.POST("/:session_id/tools/:tool", handlers.SessionToolHandler(s.storage, s.config.AgentField.ExecutionQueue.AgentCallTimeout, s.config.Features.DID.Authorization.InternalToken))
+	}
 
 	// Workflow endpoints will be reintroduced once the simplified execution pipeline lands.
 }
@@ -167,6 +227,9 @@ func (s *AgentFieldServer) healthCheckHandler(c *gin.Context) {
 		"timestamp": time.Now().UTC().Format(time.RFC3339),
 		"version":   "1.0.0", // TODO: Get from build info
 		"checks":    gin.H{},
+	}
+	if furrowPublicAddr := os.Getenv("FURROW_PUBLIC_ADDR"); furrowPublicAddr != "" {
+		healthStatus["furrow_public_addr"] = furrowPublicAddr
 	}
 
 	allHealthy := true

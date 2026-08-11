@@ -10,6 +10,7 @@ import (
 	"github.com/Agent-Field/agentfield/control-plane/internal/cli/commands"
 	"github.com/Agent-Field/agentfield/control-plane/internal/config"
 	"github.com/Agent-Field/agentfield/control-plane/internal/logger"
+	"github.com/Agent-Field/agentfield/control-plane/internal/packages"
 	"github.com/spf13/cobra"
 	"github.com/spf13/viper"
 )
@@ -40,12 +41,23 @@ func NewRootCommand(runServerFunc func(cmd *cobra.Command, args []string), versi
 		Long: `AgentField is a comprehensive AI agent platform for building, managing, and deploying AI agent capabilities.
 
 AI Agent? Run "af agent help" for structured JSON output optimized for programmatic use.`,
+		// Don't dump the full usage/help block when a command fails at runtime
+		// (e.g. `af run` failing to start an agent). Usage text is for
+		// mis-invocation, not runtime errors; main.go already surfaces the
+		// error message itself. Set on the root so it applies to every
+		// subcommand (cobra suppresses usage when the root has this set).
+		SilenceUsage: true,
 		PersistentPreRunE: func(cmd *cobra.Command, args []string) error {
 			// Initialize logging based on verbose flag
 			logger.InitLogger(verbose)
 			if verbose {
 				logger.Logger.Debug().Msg("Verbose logging enabled.")
 			}
+			// Hand the flag-supplied key to the package layer so agent child
+			// processes spawned by `af run` inherit the same credential the
+			// CLI itself is using. Env vars and stored credentials are read
+			// there directly; only the flag has to be pushed across.
+			packages.SetAPIKeyOverride(apiKey)
 			return nil
 		},
 		// Default to server mode when no subcommand is provided (backward compatibility)
@@ -92,9 +104,11 @@ AI Agent? Run "af agent help" for structured JSON output optimized for programma
 
 	// Add doctor command — environment introspection for skills/coding agents
 	RootCmd.AddCommand(NewDoctorCommand())
+	RootCmd.AddCommand(NewHarnessCommand())
 
 	// Add skill command — install/manage AgentField skills across coding agents
 	RootCmd.AddCommand(NewSkillCommand())
+	RootCmd.AddCommand(NewFurrowCommand())
 
 	// Create service container for framework commands
 	cfg := &config.Config{} // Use default config for now
@@ -112,13 +126,26 @@ AI Agent? Run "af agent help" for structured JSON output optimized for programma
 
 	// Add remaining old commands (not yet migrated)
 	RootCmd.AddCommand(NewUninstallCommand())
+	RootCmd.AddCommand(NewAuthCommand())
+	RootCmd.AddCommand(NewSecretsCommand())
 	RootCmd.AddCommand(NewListCommand())
 	RootCmd.AddCommand(NewStopCommand())
 	RootCmd.AddCommand(NewLogsCommand())
 	RootCmd.AddCommand(NewConfigCommand())
-RootCmd.AddCommand(NewVCCommand())
+	RootCmd.AddCommand(NewShowRequirementsCommand())
+	RootCmd.AddCommand(NewVCCommand())
+	RootCmd.AddCommand(NewVerifyAliasCommand())
 	RootCmd.AddCommand(NewNodesCommand())
 	RootCmd.AddCommand(NewExecutionCommand())
+	RootCmd.AddCommand(NewSessionCommand())
+	RootCmd.AddCommand(NewCallCommand())
+	RootCmd.AddCommand(NewReasonerListCommand())
+	RootCmd.AddCommand(NewPsCommand())
+	RootCmd.AddCommand(NewTailCommand())
+	RootCmd.AddCommand(NewWaitCommand())
+	RootCmd.AddCommand(NewCatalogCommand())
+	RootCmd.AddCommand(NewShareCommand())
+	RootCmd.AddCommand(NewServiceCommand())
 
 	// Add version command
 	RootCmd.AddCommand(NewVersionCommand(versionInfo))
@@ -206,11 +233,13 @@ func GetServerURL() string {
 	return "http://localhost:8080"
 }
 
+// GetAPIKey returns the API key to send to the control plane: the --api-key
+// flag, then AGENTFIELD_API_KEY, then the key `af auth login` stored for the
+// current server. Empty means no key is configured anywhere, which is the
+// default local setup and stays unauthenticated.
 func GetAPIKey() string {
-	if apiKey != "" {
-		return apiKey
-	}
-	return os.Getenv("AGENTFIELD_API_KEY")
+	key, _ := resolveAPIKeyWithSource()
+	return key
 }
 
 func GetOutputFormat() string {

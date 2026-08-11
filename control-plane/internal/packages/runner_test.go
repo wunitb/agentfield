@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,8 +30,6 @@ func waitForHTTPServer(t *testing.T, addr string) {
 }
 
 func TestAgentNodeRunnerPortEnvAndRegistry(t *testing.T) {
-	t.Parallel()
-
 	home := t.TempDir()
 	runner := &AgentNodeRunner{AgentFieldHome: home}
 
@@ -51,32 +50,6 @@ func TestAgentNodeRunnerPortEnvAndRegistry(t *testing.T) {
 		t.Fatalf("expected port %d to be unavailable while listening", port)
 	}
 	_ = listener.Close()
-
-	pkgPath := filepath.Join(t.TempDir(), "pkg")
-	if err := os.MkdirAll(pkgPath, 0755); err != nil {
-		t.Fatalf("mkdir: %v", err)
-	}
-	if err := os.WriteFile(filepath.Join(pkgPath, ".env"), []byte(strings.Join([]string{
-		"PLAIN=value",
-		`QUOTED="double"`,
-		"SINGLE='single'",
-		"# comment",
-		"",
-	}, "\n")), 0644); err != nil {
-		t.Fatalf("write env: %v", err)
-	}
-
-	envVars, err := runner.loadPackageEnvFile(pkgPath)
-	if err != nil {
-		t.Fatalf("loadPackageEnvFile: %v", err)
-	}
-	if envVars["PLAIN"] != "value" || envVars["QUOTED"] != "double" || envVars["SINGLE"] != "single" {
-		t.Fatalf("unexpected env vars: %#v", envVars)
-	}
-
-	if _, err := runner.loadPackageEnvFile(filepath.Join(t.TempDir(), "missing")); err == nil {
-		t.Fatalf("expected missing env error")
-	}
 
 	registry := &InstallationRegistry{
 		Installed: map[string]InstalledPackage{
@@ -105,6 +78,23 @@ func TestAgentNodeRunnerPortEnvAndRegistry(t *testing.T) {
 	if loaded.Installed["demo"].Runtime.Port == nil || *loaded.Installed["demo"].Runtime.Port != 8123 {
 		t.Fatalf("unexpected port: %#v", loaded.Installed["demo"].Runtime.Port)
 	}
+}
+
+func TestPythonUTF8Env(t *testing.T) {
+	t.Run("appends PYTHONUTF8=1 when unset", func(t *testing.T) {
+		env := PythonUTF8Env([]string{"PORT=8001", "PATH=/usr/bin"})
+		if env[len(env)-1] != "PYTHONUTF8=1" {
+			t.Fatalf("expected PYTHONUTF8=1 appended, got %v", env)
+		}
+	})
+
+	t.Run("respects an explicit caller value", func(t *testing.T) {
+		in := []string{"PYTHONUTF8=0", "PORT=8001"}
+		env := PythonUTF8Env(in)
+		if len(env) != len(in) {
+			t.Fatalf("caller's PYTHONUTF8 must win, got %v", env)
+		}
+	})
 }
 
 func TestAgentNodeRunnerWaitDisplayAndStartProcess(t *testing.T) {
@@ -137,7 +127,7 @@ func TestAgentNodeRunnerWaitDisplayAndStartProcess(t *testing.T) {
 	})
 	waitForHTTPServer(t, fmt.Sprintf("127.0.0.1:%d", port))
 
-	if err := runner.waitForAgentNode(port, 2*time.Second); err != nil {
+	if err := runner.waitForAgentNode(port, "/health", "", 2*time.Second); err != nil {
 		t.Fatalf("waitForAgentNode: %v", err)
 	}
 	if err := runner.displayCapabilities(InstalledPackage{Name: "demo"}, port); err != nil {
@@ -150,7 +140,7 @@ func TestAgentNodeRunnerWaitDisplayAndStartProcess(t *testing.T) {
 	}
 	unusedPort := unusedPortListener.Addr().(*net.TCPAddr).Port
 	_ = unusedPortListener.Close()
-	if err := runner.waitForAgentNode(unusedPort, 600*time.Millisecond); err == nil || !strings.Contains(err.Error(), "did not become ready") {
+	if err := runner.waitForAgentNode(unusedPort, "/health", "", 600*time.Millisecond); err == nil || !strings.Contains(err.Error(), "did not become ready") {
 		t.Fatalf("expected timeout error, got %v", err)
 	}
 
@@ -205,6 +195,25 @@ func TestAgentNodeRunnerWaitDisplayAndStartProcess(t *testing.T) {
 	}
 	if err == nil || !strings.Contains(err.Error(), "failed to open log file") {
 		t.Fatalf("expected log file error, got %v", err)
+	}
+}
+
+func TestDisplayCapabilitiesUsesDiscoveryDocument(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/discover" {
+			t.Errorf("unexpected legacy capability request: %s", r.URL.Path)
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"reasoners":[{"id":"echo"}],"skills":[]}`))
+	}))
+	defer server.Close()
+
+	port := server.Listener.Addr().(*net.TCPAddr).Port
+	runner := &AgentNodeRunner{}
+	if err := runner.displayCapabilities(InstalledPackage{Name: "go-demo"}, port); err != nil {
+		t.Fatalf("displayCapabilities: %v", err)
 	}
 }
 

@@ -6,10 +6,15 @@ loaded when the claude-code provider is actually used.
 
 from __future__ import annotations
 
+import logging
 import time
 from typing import Any, Dict, List, Optional
 
+from agentfield.harness._cli import resolve_model_and_variant
 from agentfield.harness._result import Metrics, RawResult
+from agentfield.exceptions import HarnessProviderUnavailable
+
+logger = logging.getLogger("agentfield.harness.claude")
 
 
 def _get_claude_sdk() -> Any:
@@ -31,18 +36,61 @@ _PERMISSION_MAP = {
 }
 
 
+def _parse_usage(usage: dict) -> Dict[str, int]:
+    """Normalize a Claude Code result-message ``usage`` object into token counts.
+
+    Claude Code emits Anthropic-native fields: ``input_tokens``,
+    ``output_tokens``, ``cache_read_input_tokens``,
+    ``cache_creation_input_tokens``.
+    """
+
+    def _int(name: str) -> int:
+        val = usage.get(name)
+        try:
+            return int(val) if val is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
+    return {
+        "input_tokens": _int("input_tokens"),
+        "output_tokens": _int("output_tokens"),
+        "cache_read_tokens": _int("cache_read_input_tokens"),
+        "cache_creation_tokens": _int("cache_creation_input_tokens"),
+    }
+
+
 class ClaudeCodeProvider:
     """Claude Code provider using the native claude_agent_sdk."""
 
     async def execute(self, prompt: str, options: dict[str, object]) -> RawResult:
         """Execute a prompt via Claude Code SDK."""
-        sdk = _get_claude_sdk()
+        try:
+            sdk = _get_claude_sdk()
+        except ImportError as exc:
+            raise HarnessProviderUnavailable(
+                "claude-code",
+                binary="claude_agent_sdk",
+                install_command="pip install 'agentfield[harness-claude]'",
+            ) from exc
 
         agent_options: dict[str, object] = {}
-        if options.get("model") is not None:
-            agent_options["model"] = options["model"]
-        if options.get("cwd") is not None:
-            agent_options["cwd"] = options["cwd"]
+        model_value, variant_value = resolve_model_and_variant(options)
+        if model_value is not None:
+            agent_options["model"] = model_value
+        if variant_value:
+            # claude_agent_sdk has no reasoning-effort knob; drop the variant
+            # rather than passing an invalid "model#variant" model id.
+            logger.debug(
+                "Ignoring model variant %r: claude-code has no effort flag",
+                variant_value,
+            )
+        # Agent root: project_dir is the canonical field, fall back to cwd
+        # (agentfield#686). The SDK's cwd is both the process dir and the root
+        # the agent operates in; the runner places the schema output file under
+        # this same root.
+        root = options.get("project_dir") or options.get("cwd")
+        if root is not None:
+            agent_options["cwd"] = root
         if options.get("max_turns") is not None:
             agent_options["max_turns"] = options["max_turns"]
         if options.get("tools") is not None:
@@ -66,6 +114,8 @@ class ClaudeCodeProvider:
         total_cost: Optional[float] = None
         num_turns = 0
         session_id = ""
+        usage_tokens: Dict[str, int] = {}
+        result_model: Optional[str] = None
         start_api = time.monotonic()
 
         try:
@@ -111,6 +161,15 @@ class ClaudeCodeProvider:
                     )
                     if cost_info is not None:
                         total_cost = float(cost_info)
+                    # Claude Code result messages carry a full usage object:
+                    # input_tokens, output_tokens, cache_read_input_tokens,
+                    # cache_creation_input_tokens.
+                    usage_obj = msg_dict.get("usage")
+                    if isinstance(usage_obj, dict):
+                        usage_tokens = _parse_usage(usage_obj)
+                    model_field = msg_dict.get("model") or msg_dict.get("modelUsage")
+                    if isinstance(model_field, str):
+                        result_model = model_field
                     turns = msg_dict.get("num_turns")
                     num_turns = (
                         int(turns) if isinstance(turns, (int, float)) else len(messages)
@@ -141,6 +200,12 @@ class ClaudeCodeProvider:
                     num_turns=num_turns,
                     total_cost_usd=total_cost,
                     session_id=session_id,
+                    usage=usage_tokens or None,
+                    input_tokens=usage_tokens.get("input_tokens", 0),
+                    output_tokens=usage_tokens.get("output_tokens", 0),
+                    cache_read_tokens=usage_tokens.get("cache_read_tokens", 0),
+                    cache_creation_tokens=usage_tokens.get("cache_creation_tokens", 0),
+                    model=result_model,
                 ),
                 is_error=False,
             )

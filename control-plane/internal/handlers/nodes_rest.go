@@ -18,7 +18,7 @@ import (
 const DefaultLeaseTTL = 5 * time.Minute
 
 // NodeStatusLeaseHandler processes lease-based status updates from agents.
-func NodeStatusLeaseHandler(storageProvider storage.StorageProvider, statusManager *services.StatusManager, presenceManager *services.PresenceManager, leaseTTL time.Duration) gin.HandlerFunc {
+func NodeStatusLeaseHandler(storageProvider storage.StorageProvider, statusManager *services.StatusManager, healthMonitor *services.HealthMonitor, presenceManager *services.PresenceManager, leaseTTL time.Duration) gin.HandlerFunc {
 	if leaseTTL <= 0 {
 		leaseTTL = DefaultLeaseTTL
 	}
@@ -61,6 +61,9 @@ func NodeStatusLeaseHandler(storageProvider storage.StorageProvider, statusManag
 		if agent.LifecycleStatus == types.AgentStatusPendingApproval {
 			logger.Logger.Debug().Str("node_id", nodeID).Msg("ignoring status update: agent is pending_approval")
 			now := time.Now().UTC()
+			if statusManager != nil {
+				statusManager.RecordLease(nodeID, now.Add(leaseTTL))
+			}
 			_ = storageProvider.UpdateAgentHeartbeat(ctx, nodeID, agent.Version, now)
 			if presenceManager != nil {
 				presenceManager.Touch(nodeID, agent.Version, now)
@@ -72,8 +75,20 @@ func NodeStatusLeaseHandler(storageProvider storage.StorageProvider, statusManag
 			return
 		}
 
+		// Lease renewals are these nodes' only keep-alive (the Go SDK never
+		// POSTs /heartbeat), so this is also where they must enter HTTP health
+		// monitoring — otherwise the monitor never polls them and their
+		// health_status never leaves "unknown". Serverless nodes are excluded
+		// for the same reason as in RecoverFromDatabase: no /status endpoint.
+		if healthMonitor != nil && agent.BaseURL != "" && agent.DeploymentType != "serverless" {
+			healthMonitor.RegisterAgent(nodeID, agent.BaseURL)
+		}
+
 		update := &types.AgentStatusUpdate{
-			Source:  types.StatusSourceManual,
+			// A lease renewal is the Go SDK's proof-of-life signal. Classifying it
+			// as a heartbeat keeps the status snapshot and persisted heartbeat in
+			// sync without changing the public lease wire contract.
+			Source:  types.StatusSourceHeartbeat,
 			Version: agent.Version,
 		}
 
@@ -104,6 +119,9 @@ func NodeStatusLeaseHandler(storageProvider storage.StorageProvider, statusManag
 		}
 
 		now := time.Now().UTC()
+		if statusManager != nil {
+			statusManager.RecordLease(nodeID, now.Add(leaseTTL))
+		}
 		if err := storageProvider.UpdateAgentHeartbeat(ctx, nodeID, agent.Version, now); err != nil {
 			logger.Logger.Warn().Err(err).Str("node_id", nodeID).Msg("failed to persist heartbeat during status update")
 		}

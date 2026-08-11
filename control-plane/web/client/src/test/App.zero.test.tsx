@@ -1,14 +1,15 @@
 // @ts-nocheck
 import React from "react";
 import { render, screen } from "@testing-library/react";
-import { describe, expect, it, vi, beforeEach } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 
 const routeState = vi.hoisted(() => ({
   path: "/dashboard",
   reasonerId: "planner-1",
 }));
 
-vi.mock("react-router-dom", () => {
+vi.mock("react-router", () => {
+  const navigate = vi.fn();
   const ReactRouterDom = {
     BrowserRouter: ({ children }: React.PropsWithChildren) => <>{children}</>,
     Routes: ({ children }: React.PropsWithChildren) => <div>{children}</div>,
@@ -22,7 +23,13 @@ vi.mock("react-router-dom", () => {
       </>
     ),
     Navigate: ({ to }: { to: string }) => <div>navigate:{to}</div>,
+    Link: ({ children, to }: React.PropsWithChildren<{ to: string }>) => (
+      <a href={to}>{children}</a>
+    ),
     useParams: () => ({ reasonerId: routeState.reasonerId }),
+    useNavigate: () => navigate,
+    useLocation: () => ({ pathname: routeState.path, search: "", hash: "" }),
+    useSearchParams: () => [new URLSearchParams(), vi.fn()],
   };
   return ReactRouterDom;
 });
@@ -79,6 +86,10 @@ vi.mock("@/pages/AgentsPage", () => ({
   AgentsPage: () => <div>AgentsPage</div>,
 }));
 
+vi.mock("@/pages/DiscoveryPage", () => ({
+  DiscoveryPage: () => <div>DiscoveryPage</div>,
+}));
+
 vi.mock("@/pages/RunsPage", () => ({
   RunsPage: () => <div>RunsPage</div>,
 }));
@@ -103,11 +114,15 @@ vi.mock("@/pages/AccessManagementPage", () => ({
   AccessManagementPage: () => <div>AccessManagementPage</div>,
 }));
 
-describe("App", () => {
-  beforeEach(() => {
-    vi.resetModules();
-  });
+vi.mock("@/pages/TriggersPage", () => ({
+  TriggersPage: () => <div>TriggersPage</div>,
+}));
 
+vi.mock("@/pages/IntegrationsPage", () => ({
+  IntegrationsPage: () => <div>IntegrationsPage</div>,
+}));
+
+describe("App", () => {
   it("renders the routed application tree", async () => {
     const { default: App } = await import("@/App");
     render(<App />);
@@ -117,6 +132,7 @@ describe("App", () => {
     expect(screen.getByText("NewDashboardPage")).toBeInTheDocument();
     expect(screen.getByText("NewSettingsPage")).toBeInTheDocument();
     expect(screen.getByText("AgentsPage")).toBeInTheDocument();
+    expect(screen.getByText("DiscoveryPage")).toBeInTheDocument();
     expect(screen.getByText("RunsPage")).toBeInTheDocument();
     expect(screen.getByText("RunDetailPage")).toBeInTheDocument();
     expect(screen.getByText("VerifyProvenancePage")).toBeInTheDocument();

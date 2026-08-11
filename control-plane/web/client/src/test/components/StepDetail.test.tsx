@@ -18,6 +18,18 @@ vi.mock("@tanstack/react-query", () => ({
   }),
 }));
 
+vi.mock("react-router", () => ({
+  Link: ({
+    to,
+    children,
+    ...props
+  }: React.PropsWithChildren<{ to: string } & React.AnchorHTMLAttributes<HTMLAnchorElement>>) => (
+    <a href={to} {...props}>
+      {children}
+    </a>
+  ),
+}));
+
 vi.mock("@/hooks/queries", () => ({
   useStepDetail: (executionId: string) => state.useStepDetail(executionId),
 }));
@@ -123,6 +135,7 @@ vi.mock("@/components/StepProvenanceCard", () => ({
 
 vi.mock("@/components/ui/icon-bridge", () => ({
   ChevronDown: () => <span>chevron-down</span>,
+  Network: () => <span>network</span>,
 }));
 
 vi.mock("lucide-react", () => ({
@@ -246,6 +259,91 @@ describe("StepDetail", () => {
 
   });
 
+  it("renders external capability metadata and ignores non-boundary borrowed summaries", () => {
+    state.useStepDetail.mockReturnValue({
+      data: buildExecution({
+        output_data: {
+          external: {
+            kind: "ard",
+            logical_id: " external.market_data.pricing_benchmark ",
+            publisher: " MarketDataCo ",
+            identifier: "urn:ai:marketdata.local:agentfield:market-data:reasoner:pricing_benchmark",
+            adapter: "agentfield",
+            policy: "aggregate-only",
+            transport: "agentfield.execute",
+            mode: "ard-imported-execute",
+            provider_run_id: "run-provider",
+            provider_execution_id: "exec-provider",
+            provider_control_plane_url: "http://market-control-plane:8080",
+          },
+        },
+      }),
+      isLoading: false,
+    });
+
+    const { rerender } = render(<StepDetail executionId="exec-1" />);
+
+    expect(screen.getByText("External capability")).toBeInTheDocument();
+    expect(screen.getByText("MarketDataCo")).toBeInTheDocument();
+    expect(screen.getByText("external.market_data.pricing_benchmark")).toBeInTheDocument();
+    expect(screen.getByText("urn:ai:marketdata.local:agentfield:market-data:reasoner:pricing_benchmark")).toBeInTheDocument();
+    expect(screen.getByText("ard-imported-execute · agentfield.execute")).toBeInTheDocument();
+    expect(screen.getByText("run-provider")).toBeInTheDocument();
+    expect(screen.getByText("http://market-control-plane:8080")).toBeInTheDocument();
+
+    state.useStepDetail.mockReturnValue({
+      data: buildExecution({
+        output_data: {
+          borrowed_capability: {
+            provider: "MarketDataCo",
+            local_target: "external.market_data.pricing_benchmark",
+          },
+        },
+      }),
+      isLoading: false,
+    });
+    rerender(<StepDetail executionId="exec-1" />);
+    expect(screen.queryByText("External capability")).not.toBeInTheDocument();
+
+    state.useStepDetail.mockReturnValue({
+      data: buildExecution({
+        output_data: {
+          external_call_boundary: true,
+          borrowed_capability: {
+            provider_name: "BoundaryProvider",
+            callable: "external.boundary.capability",
+          },
+        },
+      }),
+      isLoading: false,
+    });
+    rerender(<StepDetail executionId="exec-1" />);
+    expect(screen.getByText("BoundaryProvider")).toBeInTheDocument();
+    expect(screen.getByText("external.boundary.capability")).toBeInTheDocument();
+
+    state.useStepDetail.mockReturnValue({
+      data: buildExecution({
+        output_data: "not-an-object",
+      }),
+      isLoading: false,
+    });
+    rerender(<StepDetail executionId="exec-1" />);
+    expect(screen.queryByText("External capability")).not.toBeInTheDocument();
+
+    state.useStepDetail.mockReturnValue({
+      data: buildExecution({
+        output_data: {
+          external: {
+            kind: "ard",
+          },
+        },
+      }),
+      isLoading: false,
+    });
+    rerender(<StepDetail executionId="exec-1" />);
+    expect(screen.queryByText("External capability")).not.toBeInTheDocument();
+  });
+
   it("submits approval actions and invalidates related queries", async () => {
     const user = userEvent.setup();
     state.useStepDetail.mockReturnValue({
@@ -307,5 +405,41 @@ describe("StepDetail", () => {
     expect(screen.getByText("Error")).toBeInTheDocument();
     expect(screen.getByText("boom")).toBeInTheDocument();
     expect(screen.queryByLabelText("Copy output JSON")).not.toBeInTheDocument();
+  });
+
+  it("shows error category guidance and diagnostics links", () => {
+    state.useStepDetail.mockReturnValue({
+      data: buildExecution({
+        error_message: "provider down",
+        error_category: "llm_unavailable",
+      }),
+      isLoading: false,
+    });
+
+    render(<StepDetail executionId="exec-1" />);
+
+    expect(screen.getByText("LLM unavailable")).toBeInTheDocument();
+    expect(screen.getByText("LLM backend circuit breaker is open.")).toBeInTheDocument();
+    expect(screen.getByText("Open LLM health")).toHaveAttribute("href", "/dashboard");
+  });
+
+  it("renders Input and Output above Provenance (issue #526)", () => {
+    state.useStepDetail.mockReturnValue({
+      data: buildExecution(),
+      isLoading: false,
+    });
+
+    const { container } = render(<StepDetail executionId="exec-1" />);
+
+    const text = container.textContent ?? "";
+    const inputIdx = text.indexOf("Input");
+    const outputIdx = text.indexOf("Output");
+    const provenanceIdx = text.indexOf("Provenance did:caller:1");
+
+    expect(inputIdx).toBeGreaterThanOrEqual(0);
+    expect(outputIdx).toBeGreaterThanOrEqual(0);
+    expect(provenanceIdx).toBeGreaterThanOrEqual(0);
+    expect(inputIdx).toBeLessThan(provenanceIdx);
+    expect(outputIdx).toBeLessThan(provenanceIdx);
   });
 });

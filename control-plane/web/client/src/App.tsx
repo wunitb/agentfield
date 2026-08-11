@@ -1,4 +1,4 @@
-import { Navigate, Route, BrowserRouter as Router, Routes, useParams } from "react-router-dom";
+import { Navigate, Route, BrowserRouter as Router, Routes, useParams } from 'react-router';
 import { QueryClientProvider } from "@tanstack/react-query";
 import { RootRedirect } from "./components/RootRedirect";
 import { ModeProvider } from "./contexts/ModeContext";
@@ -13,11 +13,27 @@ import { VerifyProvenancePage } from "./pages/VerifyProvenancePage";
 import { ComparisonPage } from "./pages/ComparisonPage";
 import { PlaygroundPage } from "./pages/PlaygroundPage";
 import { AccessManagementPage } from "./pages/AccessManagementPage";
+import { TriggersPage } from "./pages/TriggersPage";
+import { IntegrationsPage } from "./pages/IntegrationsPage";
+import { DiscoveryPage } from "./pages/DiscoveryPage";
 import { AuthProvider } from "./contexts/AuthContext";
 import { AuthGuard } from "./components/AuthGuard";
 import { queryClient } from "./lib/query-client";
 import { ErrorBoundary } from "./components/ErrorBoundary";
 import { NotificationProvider } from "./components/ui/notification";
+
+function getRouterBasename(): string {
+  const configuredBase = import.meta.env.VITE_BASE_PATH;
+  if (configuredBase && configuredBase !== "/") {
+    return configuredBase;
+  }
+
+  if (typeof window !== "undefined" && window.location.pathname.startsWith("/ui")) {
+    return "/ui";
+  }
+
+  return "/";
+}
 
 function NavigateToPlayground() {
   const { reasonerId } = useParams();
@@ -40,6 +56,10 @@ function AppContent() {
         <Route path="/playground" element={<PlaygroundPage />} />
         <Route path="/playground/:reasonerId" element={<PlaygroundPage />} />
         <Route path="/access" element={<AccessManagementPage />} />
+        <Route path="/triggers" element={<TriggersPage />} />
+        <Route path="/integrations" element={<IntegrationsPage />} />
+        <Route path="/discovery" element={<DiscoveryPage />} />
+        <Route path="/settings/ard" element={<Navigate to="/discovery" replace />} />
 
         {/* Old → New redirects */}
         <Route path="/executions" element={<Navigate to="/runs" replace />} />
@@ -61,6 +81,8 @@ function AppContent() {
 }
 
 function App() {
+  const basename = getRouterBasename();
+
   return (
     <QueryClientProvider client={queryClient}>
       <ThemeProvider
@@ -73,7 +95,7 @@ function App() {
           <NotificationProvider>
             <AuthProvider>
               <AuthGuard>
-                <Router basename={import.meta.env.VITE_BASE_PATH || "/ui"}>
+                <Router basename={basename}>
                   <ErrorBoundary>
                     <AppContent />
                   </ErrorBoundary>

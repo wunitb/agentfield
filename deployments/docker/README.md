@@ -16,6 +16,25 @@ docker compose --profile python-demo up --build
 Open the UI:
 - `http://localhost:8080/ui/`
 
+### Managing agents from the host
+
+Running agents, browsing workflows and the observability APIs work as-is. But
+installing packages and reading or writing credentials (the secret store, agent
+`env`, agent `config`) require the caller to be local, and a client on your host
+reaches this container through Docker's bridge — from the control plane's point
+of view that is another machine, so those calls come back `401`. Publishing the
+port to `127.0.0.1` does not change it; the connection still arrives from the
+bridge address.
+
+Set an API key to manage the stack from the host:
+
+```bash
+AGENTFIELD_API_KEY=$(openssl rand -hex 24) docker compose up --build
+```
+
+Clients send it as `X-API-Key`; for the CLI, run `af auth login --server
+http://localhost:8080` once and it is sent automatically.
+
 ## Execute an agent via the control plane
 
 Python demo agent (deterministic; no LLM keys required):
@@ -49,6 +68,16 @@ curl -s http://localhost:8080/api/v1/did/workflow/$run_id/vc-chain | head -c 120
 ## Defaults (PostgreSQL)
 
 - User / password / database: `agentfield` / `agentfield` / `agentfield`
+
+## Anonymous Telemetry
+
+The Docker stack enables anonymous usage telemetry by default to help us improve AgentField. It records coarse product signals such as startup, agent registration, SDK language, runtime type, and execution status buckets. The pseudonymous identifier represents the persisted installation, not a person or account.
+
+The telemetry payload does not include prompts, inputs, outputs, logs, secrets, API keys, IP addresses, hostnames, user IDs, DIDs, or raw error text. Disable it with:
+
+```bash
+AGENTFIELD_TELEMETRY_ENABLED=false docker compose up
+```
 
 ## Docker networking note (callback URL)
 

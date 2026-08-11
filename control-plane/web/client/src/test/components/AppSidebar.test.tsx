@@ -1,7 +1,7 @@
 // @ts-nocheck
 import React from "react";
 import { render, screen } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter } from 'react-router';
 import { describe, expect, it, vi } from "vitest";
 import { AppSidebar } from "@/components/AppSidebar";
 import { Home, Link as LinkIcon, LucideProps } from "lucide-react";
@@ -32,6 +32,7 @@ vi.mock("@/config/navigation", () => ({
       icon: (props: LucideProps) => <LinkIcon {...props} />,
     },
   ],
+  isNavBranch: (item: any) => !!item.children,
 }));
 
 // Mock UI components

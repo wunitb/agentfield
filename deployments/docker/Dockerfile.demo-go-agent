@@ -1,12 +1,18 @@
 FROM --platform=$BUILDPLATFORM golang:1.25-alpine AS builder
 WORKDIR /workspace
 
+ARG AGENTFIELD_SOURCE_COMMIT
+
 COPY sdk/go ./sdk/go
 COPY examples/go_agent_nodes ./examples/go_agent_nodes
 
-RUN --mount=type=cache,target=/root/.cache/go-build --mount=type=cache,target=/go/pkg/mod \
+RUN --mount=type=cache,target=/root/.cache/go-build \
+    --mount=type=cache,target=/go/pkg/mod \
+    case "$AGENTFIELD_SOURCE_COMMIT" in (*[!0-9a-f]*|"") exit 1;; esac && \
+    test "${#AGENTFIELD_SOURCE_COMMIT}" -eq 40 && \
     cd examples/go_agent_nodes && go mod download && \
-    CGO_ENABLED=0 go build -o /out/agentfield-demo-go-agent ./main.go
+    CGO_ENABLED=0 go build -ldflags "-X main.securityTriageSourceCommit=$AGENTFIELD_SOURCE_COMMIT" \
+      -o /out/agentfield-demo-go-agent .
 
 FROM gcr.io/distroless/static-debian12:nonroot
 COPY --from=builder /out/agentfield-demo-go-agent /usr/local/bin/agentfield-demo-go-agent

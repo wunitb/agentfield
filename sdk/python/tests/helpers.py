@@ -1,6 +1,9 @@
 """Shared testing utilities for AgentField SDK unit tests."""
 
 from __future__ import annotations
+from typing import Callable
+from typing import Coroutine
+
 
 import asyncio
 import threading
@@ -31,6 +34,7 @@ class DummyAgentFieldClient:
         version: str = "1.0.0",
         agent_metadata=None,
         tags=None,
+        instance_id: Optional[str] = None,
     ) -> Tuple[bool, Optional[Dict[str, Any]]]:
         self.register_calls.append(
             {
@@ -43,6 +47,7 @@ class DummyAgentFieldClient:
                 "version": version,
                 "agent_metadata": agent_metadata,
                 "tags": tags,
+                "instance_id": instance_id,
             }
         )
         return True, {"resolved_base_url": base_url}
@@ -59,6 +64,8 @@ class DummyAgentFieldClient:
         vc_metadata=None,
         version: str = "1.0.0",
         agent_metadata=None,
+        tags=None,
+        instance_id: Optional[str] = None,
     ) -> Tuple[bool, Optional[Dict[str, Any]]]:
         return await self.register_agent(
             node_id=node_id,
@@ -69,6 +76,8 @@ class DummyAgentFieldClient:
             vc_metadata=vc_metadata,
             version=version,
             agent_metadata=agent_metadata,
+            tags=tags,
+            instance_id=instance_id,
         )
 
     async def send_enhanced_heartbeat(
@@ -84,6 +93,26 @@ class DummyAgentFieldClient:
     def notify_graceful_shutdown_sync(self, node_id: str) -> bool:
         self.shutdown_calls.append(node_id)
         return True
+
+
+class InlineTestingDispatcher:
+    def __init__(self):
+        self._started = True
+
+    def start(self):
+        self._started = True
+
+    def submit(self, coro_factory: Callable[[], Coroutine[Any, Any, None]]):
+        coro = coro_factory()
+        try:
+            coro.send(None)
+        except StopIteration:
+            pass
+        except RuntimeWarning:
+            pass
+
+    async def shutdown(self, timeout: int = 5):
+        self._started = False
 
 
 @dataclass
@@ -107,6 +136,9 @@ class StubAgent:
     agentfield_connected: bool = True
     _current_status: AgentStatus = AgentStatus.STARTING
     callback_candidates: List[str] = field(default_factory=list)
+    _notification_dispatcher: InlineTestingDispatcher = field(
+        default_factory=InlineTestingDispatcher
+    )
 
     def _build_vc_metadata(self):
         return {"agent_default": True}
@@ -403,6 +435,7 @@ def create_test_agent(
             session_id: str,
             caller: str,
             target: str,
+            parent_vc_id: Optional[str] = None,
         ) -> Any:
             return SimpleNamespace(
                 execution_id=execution_id,
@@ -411,6 +444,7 @@ def create_test_agent(
                 caller_did=f"did:caller:{caller}",
                 target_did=f"did:target:{target}",
                 agent_node_did=f"did:agent:{self.node_id}",
+                parent_vc_id=parent_vc_id,
             )
 
         def get_agent_did(self) -> str:

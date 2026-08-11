@@ -7,6 +7,26 @@ The TypeScript SDK provides an idiomatic Node.js interface for building and runn
 npm install @agentfield/sdk
 ```
 
+## Memory event subscriptions
+
+Pass filters when starting a memory event client to apply them on the server before events are sent over the WebSocket:
+
+```ts
+import { MemoryEventClient } from '@agentfield/sdk';
+
+const events = new MemoryEventClient('http://localhost:8080');
+events.onEvent((event) => console.log(event.key));
+events.start({
+  patterns: ['user_*', 'session.*'],
+  scope: 'session',
+  scopeId: 'session-123'
+});
+```
+
+`patterns` is a list of memory-key globs and is sent as a comma-separated query parameter. `scope` accepts `workflow`, `session`, `actor`, or `global`, while `scopeId` maps to the server's `scope_id` parameter. All filters are optional, and automatic reconnects reuse the original filters. Omitting them keeps the existing behavior of receiving all events.
+
+Server-side filtering reduces WebSocket traffic and client-side processing for high-volume event streams.
+
 ## Rate limiting
 AI calls are wrapped with a stateless rate limiter that matches the Python SDK: exponential backoff, container-scoped jitter, Retry-After support, and a circuit breaker.
 
@@ -113,12 +133,13 @@ const approvalClient = new ApprovalClient({
 
 agent.reasoner<{ task: string }, { status: string }>('deploy', async (ctx) => {
   const plan = await ctx.ai(`Create deployment plan for: ${ctx.input.task}`);
+  const approvalRequestId = `req-${ctx.executionId}`;
 
-  // Request approval — transitions execution to "waiting"
+  // Create the human-facing approval request in your approval service first,
+  // then pass its ID/URL to AgentField so the execution transitions to "waiting".
   await approvalClient.requestApproval(ctx.executionId, {
-    projectId: 'my-project',
-    title: `Deploy: ${ctx.input.task}`,
-    description: String(plan),
+    approvalRequestId,
+    approvalRequestUrl: `https://approvals.example.com/review/${approvalRequestId}`,
     expiresInHours: 24,
   });
 

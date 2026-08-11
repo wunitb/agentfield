@@ -247,7 +247,7 @@ func ExecuteReasonerHandler(storageProvider storage.StorageProvider) gin.Handler
 			}
 			agentURL = buildAgentURL(targetNode, target)
 
-			serverlessPayload, err := json.Marshal(buildServerlessPayload(target, exec, headers, req.Input))
+			serverlessPayload, err := json.Marshal(buildServerlessPayload(target, exec, headers, req.Input, nil))
 			if err != nil {
 				endTime := time.Now()
 				workflowExecution.Status = types.ExecutionStatusFailed

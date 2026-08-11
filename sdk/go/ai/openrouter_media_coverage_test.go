@@ -20,6 +20,36 @@ func TestBaseURLEmptyUsesDefault(t *testing.T) {
 	assert.Equal(t, defaultOpenRouterBaseURL, p.baseURL())
 }
 
+func TestOpenRouterMediaProviderHeadersIncludeAttribution(t *testing.T) {
+	var received http.Header
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		received = r.Header
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]any{
+			"data": map[string]any{
+				"architecture": map[string]any{
+					"output_modalities": []string{"image"},
+				},
+			},
+		})
+	}))
+	defer srv.Close()
+
+	p := &OpenRouterMediaProvider{
+		APIKey:   "k",
+		BaseURL:  srv.URL,
+		Client:   srv.Client(),
+		SiteURL:  "https://media.example",
+		SiteName: "Media App",
+	}
+	meta := p.fetchModelMeta(context.Background(), "openrouter/example/model")
+
+	require.Equal(t, []string{"image"}, meta.OutputModalities)
+	assert.Equal(t, "https://media.example", received.Get("HTTP-Referer"))
+	assert.Equal(t, "Media App", received.Get("X-OpenRouter-Title"))
+	assert.Equal(t, "Media App", received.Get("X-Title"))
+}
+
 // GenerateVideo exercises every optional payload field.
 func TestGenerateVideoAllOptionalFields(t *testing.T) {
 	var captured map[string]any
@@ -161,6 +191,7 @@ func TestGenerateImageWithImageConfig(t *testing.T) {
 		ImageConfig: &ImageConfig{AspectRatio: "1:1", ImageSize: "512"},
 	})
 	require.NoError(t, err)
+	assert.Equal(t, defaultOpenRouterImageModel, got["model"])
 	assert.NotNil(t, got["image_config"])
 }
 
@@ -236,7 +267,10 @@ func TestGenerateAudioDefaultVoice(t *testing.T) {
 	defer srv.Close()
 
 	p := &OpenRouterMediaProvider{APIKey: "k", BaseURL: srv.URL, Client: srv.Client()}
-	_, err := p.GenerateAudio(context.Background(), AudioRequest{Text: "hi"})
+	p.SeedModelMeta("openai/gpt-audio-mini", []string{"text", "audio"}, []string{"text"})
+	_, err := p.GenerateAudio(context.Background(), AudioRequest{
+		Text: "hi", Model: "openai/gpt-audio-mini", Format: "mp3",
+	})
 	require.NoError(t, err)
 	audioConf := got["audio"].(map[string]any)
 	assert.Equal(t, "alloy", audioConf["voice"])
@@ -251,7 +285,10 @@ func TestGenerateAudioHTTPError(t *testing.T) {
 	defer srv.Close()
 
 	p := &OpenRouterMediaProvider{APIKey: "k", BaseURL: srv.URL, Client: srv.Client()}
-	_, err := p.GenerateAudio(context.Background(), AudioRequest{Text: "hi"})
+	p.SeedModelMeta("openai/gpt-audio-mini", []string{"text", "audio"}, []string{"text"})
+	_, err := p.GenerateAudio(context.Background(), AudioRequest{
+		Text: "hi", Model: "openai/gpt-audio-mini", Format: "mp3",
+	})
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "401")
 }
@@ -273,7 +310,10 @@ func TestGenerateAudioSkipsInvalidSSELines(t *testing.T) {
 	defer srv.Close()
 
 	p := &OpenRouterMediaProvider{APIKey: "k", BaseURL: srv.URL, Client: srv.Client()}
-	resp, err := p.GenerateAudio(context.Background(), AudioRequest{Text: "hi"})
+	p.SeedModelMeta("openai/gpt-audio-mini", []string{"text", "audio"}, []string{"text"})
+	resp, err := p.GenerateAudio(context.Background(), AudioRequest{
+		Text: "hi", Model: "openai/gpt-audio-mini", Format: "mp3",
+	})
 	require.NoError(t, err)
 	assert.Equal(t, "ok", resp.Text)
 }
@@ -291,7 +331,10 @@ func TestGenerateAudioInvalidBase64Chunk(t *testing.T) {
 	defer srv.Close()
 
 	p := &OpenRouterMediaProvider{APIKey: "k", BaseURL: srv.URL, Client: srv.Client()}
-	_, err := p.GenerateAudio(context.Background(), AudioRequest{Text: "hi"})
+	p.SeedModelMeta("openai/gpt-audio-mini", []string{"text", "audio"}, []string{"text"})
+	_, err := p.GenerateAudio(context.Background(), AudioRequest{
+		Text: "hi", Model: "openai/gpt-audio-mini", Format: "mp3",
+	})
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "decode audio chunk")
 }
@@ -312,7 +355,10 @@ func TestGenerateAudioRawStdBase64Fallback(t *testing.T) {
 	defer srv.Close()
 
 	p := &OpenRouterMediaProvider{APIKey: "k", BaseURL: srv.URL, Client: srv.Client()}
-	resp, err := p.GenerateAudio(context.Background(), AudioRequest{Text: "hi"})
+	p.SeedModelMeta("openai/gpt-audio-mini", []string{"text", "audio"}, []string{"text"})
+	resp, err := p.GenerateAudio(context.Background(), AudioRequest{
+		Text: "hi", Model: "openai/gpt-audio-mini", Format: "mp3",
+	})
 	require.NoError(t, err)
 	decoded, err := base64.StdEncoding.DecodeString(resp.Audio.Data)
 	require.NoError(t, err)

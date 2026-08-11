@@ -168,6 +168,53 @@ func TestLoadConfig(t *testing.T) {
 	})
 }
 
+func TestTelemetryConfigDefaultsAndEnvOverrides(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "agentfield.yaml")
+	if err := os.WriteFile(path, []byte("agentfield:\n  port: 8080\n"), 0o644); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	cfg, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig returned error: %v", err)
+	}
+	if !cfg.Telemetry.IsEnabled() {
+		t.Fatal("expected telemetry enabled by default")
+	}
+	if cfg.Telemetry.Endpoint != "https://agentfield.ai/api/oss/telemetry" {
+		t.Fatalf("unexpected endpoint %q", cfg.Telemetry.Endpoint)
+	}
+	if cfg.Telemetry.Timeout != 800*time.Millisecond {
+		t.Fatalf("unexpected timeout %s", cfg.Telemetry.Timeout)
+	}
+	if cfg.Telemetry.InstallIDPath != "" {
+		t.Fatalf("default install ID path must resolve under AgentField home, got %q", cfg.Telemetry.InstallIDPath)
+	}
+
+	t.Setenv("AGENTFIELD_TELEMETRY_ENABLED", "false")
+	t.Setenv("AGENTFIELD_TELEMETRY_ENDPOINT", "https://example.test/telemetry")
+	t.Setenv("AGENTFIELD_TELEMETRY_INSTALL_ID", "external-install")
+	t.Setenv("AGENTFIELD_TELEMETRY_TIMEOUT", "250ms")
+
+	cfg, err = LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig with env returned error: %v", err)
+	}
+	if cfg.Telemetry.IsEnabled() {
+		t.Fatal("expected telemetry disabled by env")
+	}
+	if cfg.Telemetry.Endpoint != "https://example.test/telemetry" {
+		t.Fatalf("unexpected endpoint override %q", cfg.Telemetry.Endpoint)
+	}
+	if cfg.Telemetry.InstallID != "external-install" {
+		t.Fatalf("unexpected install id override %q", cfg.Telemetry.InstallID)
+	}
+	if cfg.Telemetry.Timeout != 250*time.Millisecond {
+		t.Fatalf("unexpected timeout override %s", cfg.Telemetry.Timeout)
+	}
+}
+
 func TestApplyEnvOverrides(t *testing.T) {
 	cfg := &Config{
 		API: APIConfig{
@@ -249,6 +296,7 @@ func TestApplyEnvOverrides(t *testing.T) {
 		"AGENTFIELD_AUTHORIZATION_DOMAIN":                            "auth.local",
 		"AGENTFIELD_AUTHORIZATION_ADMIN_TOKEN":                       "admin-token",
 		"AGENTFIELD_AUTHORIZATION_INTERNAL_TOKEN":                    "internal-token",
+		"AGENTFIELD_AUTHORIZATION_DEFAULT_DENY":                      "true",
 		"AGENTFIELD_NODE_LOG_PROXY_CONNECT_TIMEOUT":                  "21s",
 		"AGENTFIELD_NODE_LOG_PROXY_STREAM_IDLE_TIMEOUT":              "22s",
 		"AGENTFIELD_NODE_LOG_PROXY_MAX_DURATION":                     "23s",
@@ -269,6 +317,15 @@ func TestApplyEnvOverrides(t *testing.T) {
 		"AGENTFIELD_CONNECTOR_CAP_POLICY_MANAGEMENT":                 "true",
 		"AGENTFIELD_CONNECTOR_CAP_TAG_MANAGEMENT":                    "readonly",
 		"AGENTFIELD_CONNECTOR_CAP_DID_MANAGEMENT":                    "false",
+		"AGENTFIELD_ARD_ENABLED":                                     "true",
+		"AGENTFIELD_ARD_PUBLIC_BASE_URL":                             " https://cp.example.com/ ",
+		"AGENTFIELD_ARD_PUBLISHER_DOMAIN":                            " example.com ",
+		"AGENTFIELD_ARD_PUBLISH_ENABLED":                             "true",
+		"AGENTFIELD_ARD_REGISTRY_ENABLED":                            "true",
+		"AGENTFIELD_ARD_REGISTRY_PUBLIC":                             "false",
+		"AGENTFIELD_ARD_EXTERNAL_SEARCH_ENABLED":                     "true",
+		"AGENTFIELD_ARD_EXTERNAL_INVOCATION_ENABLED":                 "true",
+		"AGENTFIELD_ARD_EXTERNAL_ALLOWED_REGISTRIES":                 " https://registry.example.com/api/v1/ard, ,https://other.example.com/ard ",
 	}
 	for k, v := range env {
 		t.Setenv(k, v)
@@ -281,6 +338,19 @@ func TestApplyEnvOverrides(t *testing.T) {
 	}
 	if got := cfg.AgentField.Registration.ServerlessDiscoveryAllowedHosts; len(got) != 2 || got[0] != "a.example.com" || got[1] != "b.example.com" {
 		t.Fatalf("unexpected allowed hosts: %#v", got)
+	}
+	if !cfg.AgentField.ARD.Enabled ||
+		cfg.AgentField.ARD.PublicBaseURL != "https://cp.example.com" ||
+		cfg.AgentField.ARD.PublisherDomain != "example.com" ||
+		!cfg.AgentField.ARD.Publish.Enabled ||
+		!cfg.AgentField.ARD.Registry.Enabled ||
+		cfg.AgentField.ARD.Registry.Public ||
+		!cfg.AgentField.ARD.External.SearchEnabled ||
+		!cfg.AgentField.ARD.External.InvocationEnabled {
+		t.Fatalf("unexpected ARD env overrides: %+v", cfg.AgentField.ARD)
+	}
+	if got := cfg.AgentField.ARD.External.AllowedRegistries; len(got) != 2 || got[0] != "https://registry.example.com/api/v1/ard" || got[1] != "https://other.example.com/ard" {
+		t.Fatalf("unexpected ARD registries: %#v", got)
 	}
 	if cfg.AgentField.NodeHealth.CheckInterval != 45*time.Second ||
 		cfg.AgentField.NodeHealth.CheckTimeout != 7*time.Second ||
@@ -309,7 +379,8 @@ func TestApplyEnvOverrides(t *testing.T) {
 		!cfg.Features.DID.Authorization.DIDAuthEnabled ||
 		cfg.Features.DID.Authorization.Domain != "auth.local" ||
 		cfg.Features.DID.Authorization.AdminToken != "admin-token" ||
-		cfg.Features.DID.Authorization.InternalToken != "internal-token" {
+		cfg.Features.DID.Authorization.InternalToken != "internal-token" ||
+		!cfg.Features.DID.Authorization.DefaultDeny {
 		t.Fatalf("unexpected authorization overrides: %+v", cfg.Features.DID.Authorization)
 	}
 	if cfg.AgentField.NodeLogProxy.ConnectTimeout != 21*time.Second ||
@@ -421,5 +492,117 @@ func TestApplyEnvOverridesIgnoresInvalidValues(t *testing.T) {
 	}
 	if cfg.Features.Connector.Enabled {
 		t.Fatalf("expected connector enabled to become false for non-true value")
+	}
+}
+
+func TestLoggingConfigShouldRedactPayloads(t *testing.T) {
+	t.Parallel()
+
+	// Default (nil pointer) should redact
+	cfg := LoggingConfig{}
+	if !cfg.ShouldRedactPayloads() {
+		t.Fatal("expected ShouldRedactPayloads() to return true when RedactPayloads is nil")
+	}
+
+	// Explicitly true
+	true_ := true
+	cfg.RedactPayloads = &true_
+	if !cfg.ShouldRedactPayloads() {
+		t.Fatal("expected ShouldRedactPayloads() to return true when RedactPayloads is true")
+	}
+
+	// Explicitly false
+	false_ := false
+	cfg.RedactPayloads = &false_
+	if cfg.ShouldRedactPayloads() {
+		t.Fatal("expected ShouldRedactPayloads() to return false when RedactPayloads is false")
+	}
+}
+
+func TestLoggingApplyDefaults(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{}
+	ApplyDefaults(&cfg)
+
+	if cfg.Logging.Level != "info" {
+		t.Fatalf("expected default logging level 'info', got %q", cfg.Logging.Level)
+	}
+}
+
+func TestLoggingEnvOverrides(t *testing.T) {
+	// Test log level override
+	t.Run("log_level", func(t *testing.T) {
+		os.Setenv("AGENTFIELD_LOG_LEVEL", "debug")
+		defer os.Unsetenv("AGENTFIELD_LOG_LEVEL")
+
+		cfg := Config{}
+		ApplyEnvOverrides(&cfg)
+
+		if cfg.Logging.Level != "debug" {
+			t.Fatalf("expected log level 'debug', got %q", cfg.Logging.Level)
+		}
+	})
+
+	// Test redact payloads override
+	t.Run("redact_payloads_false", func(t *testing.T) {
+		os.Setenv("AGENTFIELD_LOG_REDACT_PAYLOADS", "false")
+		defer os.Unsetenv("AGENTFIELD_LOG_REDACT_PAYLOADS")
+
+		cfg := Config{}
+		ApplyEnvOverrides(&cfg)
+
+		if cfg.Logging.RedactPayloads == nil || *cfg.Logging.RedactPayloads != false {
+			t.Fatal("expected RedactPayloads to be false")
+		}
+	})
+
+	// Test redact payloads override (true)
+	t.Run("redact_payloads_true", func(t *testing.T) {
+		os.Setenv("AGENTFIELD_LOG_REDACT_PAYLOADS", "true")
+		defer os.Unsetenv("AGENTFIELD_LOG_REDACT_PAYLOADS")
+
+		cfg := Config{}
+		ApplyEnvOverrides(&cfg)
+
+		if cfg.Logging.RedactPayloads == nil || *cfg.Logging.RedactPayloads != true {
+			t.Fatal("expected RedactPayloads to be true")
+		}
+	})
+}
+
+func TestShutdownTimeoutDefaults(t *testing.T) {
+	t.Parallel()
+
+	cfg := Config{}
+	ApplyDefaults(&cfg)
+
+	if cfg.AgentField.ShutdownTimeout != 30*time.Second {
+		t.Fatalf("expected default shutdown timeout 30s, got %v", cfg.AgentField.ShutdownTimeout)
+	}
+}
+
+func TestShutdownTimeoutEnvOverride(t *testing.T) {
+	os.Setenv("AGENTFIELD_SHUTDOWN_TIMEOUT", "45s")
+	defer os.Unsetenv("AGENTFIELD_SHUTDOWN_TIMEOUT")
+
+	cfg := Config{}
+	ApplyEnvOverrides(&cfg)
+
+	if cfg.AgentField.ShutdownTimeout != 45*time.Second {
+		t.Fatalf("expected shutdown timeout 45s, got %v", cfg.AgentField.ShutdownTimeout)
+	}
+}
+
+func TestShutdownTimeoutEnvOverrideIgnoresInvalidValue(t *testing.T) {
+	os.Setenv("AGENTFIELD_SHUTDOWN_TIMEOUT", "not-a-duration")
+	defer os.Unsetenv("AGENTFIELD_SHUTDOWN_TIMEOUT")
+
+	cfg := Config{}
+	cfg.AgentField.ShutdownTimeout = 15 * time.Second
+	ApplyEnvOverrides(&cfg)
+
+	if cfg.AgentField.ShutdownTimeout != 15*time.Second {
+		t.Fatalf("expected invalid shutdown timeout env value to be ignored, got %v", cfg.AgentField.ShutdownTimeout)
 	}
 }

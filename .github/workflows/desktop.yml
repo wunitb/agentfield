@@ -1,0 +1,117 @@
+name: Desktop CI
+
+# The desktop app ships to macOS and Windows, so it is checked on both: the
+# pure logic is covered by vitest anywhere, but packaging (electron-builder
+# config, extraResources, icons) and platform-guarded code paths only prove
+# out on their own runners.
+
+on:
+  pull_request:
+    paths:
+      - 'desktop/**'
+      - '.github/workflows/desktop.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'desktop/**'
+      - '.github/workflows/desktop.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-and-package:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-14, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      # No signing identities in CI; validate packaging unsigned.
+      CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: 'npm'
+          cache-dependency-path: desktop/package-lock.json
+
+      - name: Install dependencies
+        working-directory: desktop
+        run: npm ci
+
+      - name: Typecheck
+        working-directory: desktop
+        run: npm run typecheck
+
+      - name: Unit tests
+        working-directory: desktop
+        run: npm test
+
+      - name: Stub bundled CLI
+        working-directory: desktop
+        shell: bash
+        # A placeholder is enough to validate the extraResources wiring; the
+        # release pipeline drops the real per-platform af binary into vendor/.
+        run: |
+          if [ "$RUNNER_OS" = "Windows" ]; then
+            printf 'stub' > vendor/af.exe
+          else
+            printf 'stub' > vendor/af
+          fi
+
+      - name: Package (unsigned, unpacked)
+        working-directory: desktop
+        run: npm run dist:dir
+
+  # Manual-dispatch-only: prove the macOS signing/notarization secrets work
+  # without cutting a release. Imports the Developer ID cert into a keychain
+  # (the same thing electron-builder does with CSC_LINK) and authenticates
+  # against Apple's notary service. Run it after rotating the cert or the
+  # app-specific password.
+  verify-signing-secrets:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: macos-14
+    steps:
+      - name: Import Developer ID cert into a temporary keychain
+        env:
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+        run: |
+          set -euo pipefail
+          if [ -z "$CSC_LINK" ] || [ -z "$CSC_KEY_PASSWORD" ]; then
+            echo "CSC_LINK / CSC_KEY_PASSWORD secrets not set" >&2
+            exit 1
+          fi
+          printf '%s' "$CSC_LINK" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security create-keychain -p ci-temp verify.keychain
+          security unlock-keychain -p ci-temp verify.keychain
+          security import "$RUNNER_TEMP/cert.p12" -k verify.keychain \
+            -P "$CSC_KEY_PASSWORD" -T /usr/bin/codesign
+          # -v lists only identities whose full chain verifies; an import that
+          # yields zero valid identities would also break electron-builder.
+          security find-identity -v -p codesigning verify.keychain | tee identities.txt
+          grep -q "Developer ID Application" identities.txt
+
+      - name: Authenticate against the Apple notary service
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -euo pipefail
+          if [ -z "$APPLE_ID" ] || [ -z "$APPLE_APP_SPECIFIC_PASSWORD" ] || [ -z "$APPLE_TEAM_ID" ]; then
+            echo "APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID secrets not set" >&2
+            exit 1
+          fi
+          # history performs a real authenticated API call; bad credentials
+          # fail with HTTP 401 and a non-zero exit.
+          xcrun notarytool history \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID"

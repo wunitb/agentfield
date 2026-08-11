@@ -11,12 +11,14 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/Agent-Field/agentfield/control-plane/internal/core/domain"
 	"github.com/Agent-Field/agentfield/control-plane/internal/core/interfaces"
+	"github.com/Agent-Field/agentfield/control-plane/internal/packages"
 )
 
 type DefaultDevService struct {
@@ -24,6 +26,12 @@ type DefaultDevService struct {
 	portManager    interfaces.PortManager
 	fileSystem     interfaces.FileSystemAdapter
 }
+
+var (
+	absPathForDevMode = filepath.Abs
+	agentPortStart    = 8001
+	agentPortEnd      = 8999
+)
 
 func NewDevService(
 	processManager interfaces.ProcessManager,
@@ -39,7 +47,7 @@ func NewDevService(
 
 func (ds *DefaultDevService) RunInDevMode(path string, options domain.DevOptions) error {
 	// Convert to absolute path
-	absPath, err := filepath.Abs(path)
+	absPath, err := absPathForDevMode(path)
 	if err != nil {
 		return fmt.Errorf("failed to resolve path: %w", err)
 	}
@@ -153,7 +161,7 @@ func (ds *DefaultDevService) getFreePort() (int, error) {
 	}
 
 	// Fallback: direct port checking
-	for port := 8001; port <= 8999; port++ {
+	for port := agentPortStart; port <= agentPortEnd; port++ {
 		if ds.isPortAvailable(port) {
 			return port, nil
 		}
@@ -171,7 +179,7 @@ func (ds *DefaultDevService) isPortAvailable(port int) bool {
 	}
 
 	// Fallback: direct port checking
-	conn, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	conn, err := net.Listen("tcp", fmt.Sprintf("127.0.0.1:%d", port))
 	if err != nil {
 		return false
 	}
@@ -189,6 +197,11 @@ func (ds *DefaultDevService) startDevProcess(packagePath string, port int, optio
 	}
 	env = append(env, fmt.Sprintf("AGENTFIELD_SERVER_URL=%s", resolveServerURL()))
 	env = append(env, "AGENTFIELD_DEV_MODE=true")
+	// Same contract as `af run`: pass the resolved API key through so the agent
+	// can register against a control plane with authentication enabled.
+	if key := packages.ResolveAPIKey(); key != "" {
+		env = append(env, fmt.Sprintf("AGENTFIELD_API_KEY=%s", key))
+	}
 
 	// Load environment variables from package .env file
 	if envVars, err := ds.loadDevEnvFile(packagePath); err == nil {
@@ -257,8 +270,7 @@ func (ds *DefaultDevService) discoverAgentPort(timeout time.Duration) (int, erro
 	for time.Now().Before(deadline) {
 		checkCount++
 
-		// Try ports in range 8001-8999
-		for port := 8001; port <= 8999; port++ {
+		for port := agentPortStart; port <= agentPortEnd; port++ {
 			if time.Now().After(deadline) {
 				break
 			}
@@ -415,9 +427,13 @@ func (ds *DefaultDevService) loadDevEnvFile(packagePath string) (map[string]stri
 			key := strings.TrimSpace(parts[0])
 			value := strings.TrimSpace(parts[1])
 
-			// Remove quotes if present
-			if (strings.HasPrefix(value, "\"") && strings.HasSuffix(value, "\"")) ||
-				(strings.HasPrefix(value, "'") && strings.HasSuffix(value, "'")) {
+			// Match the config writer: decode quoted escape sequences instead of
+			// passing them through to the launched process.
+			if strings.HasPrefix(value, "\"") && strings.HasSuffix(value, "\"") {
+				if unquoted, err := strconv.Unquote(value); err == nil {
+					value = unquoted
+				}
+			} else if strings.HasPrefix(value, "'") && strings.HasSuffix(value, "'") {
 				value = value[1 : len(value)-1]
 			}
 

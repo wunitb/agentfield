@@ -8,10 +8,13 @@ from typing import Any, Dict, List, Optional
 from agentfield.harness._cli import (
     estimate_cli_cost,
     extract_final_text,
+    extract_token_usage,
     parse_jsonl,
+    resolve_model_and_variant,
     run_cli,
     strip_ansi,
 )
+from agentfield.harness._availability import ensure_cli_available, provider_unavailable
 from agentfield.harness._result import FailureType, Metrics, RawResult
 
 
@@ -22,12 +25,36 @@ class CodexProvider:
         self._bin = bin_path
 
     async def execute(self, prompt: str, options: dict[str, object]) -> RawResult:
-        cmd = [self._bin, "exec", "--json"]
+        ensure_cli_available("codex", self._bin)
+        # --skip-git-repo-check lets the harness run in arbitrary working dirs
+        # (temp dirs, non-repo project roots); codex exec otherwise refuses to
+        # start outside a git repo.
+        cmd = [self._bin, "exec", "--json", "--skip-git-repo-check"]
 
-        if options.get("cwd"):
-            cmd.extend(["-C", str(options["cwd"])])
-        if options.get("permission_mode") == "auto":
-            cmd.append("--full-auto")
+        # Agent root: project_dir is the canonical field, fall back to cwd. -C is
+        # codex's single working-root flag (agentfield#686).
+        root = options.get("project_dir") or options.get("cwd")
+        if isinstance(root, str):
+            cmd.extend(["-C", root])
+
+        # permission_mode → sandbox policy (agentfield#687). codex exec never
+        # prompts (approval policy is always Never); the sandbox controls what it
+        # may write. --full-auto is deprecated in favour of --sandbox.
+        permission_mode = options.get("permission_mode")
+        if permission_mode == "auto":
+            cmd.extend(["--sandbox", "workspace-write"])
+        elif permission_mode == "plan":
+            cmd.extend(["--sandbox", "read-only"])
+
+        # Model via -m; reasoning effort has no dedicated flag — it's the
+        # model_reasoning_effort config key. The effort comes from a
+        # "#variant" suffix on the model (or an explicit options["variant"]),
+        # e.g. "gpt-5.3-codex#high".
+        model_value, variant_value = resolve_model_and_variant(options)
+        if model_value:
+            cmd.extend(["-m", model_value])
+        if variant_value:
+            cmd.extend(["-c", f"model_reasoning_effort={variant_value}"])
 
         cmd.append(prompt)
 
@@ -40,24 +67,13 @@ class CodexProvider:
                 if isinstance(key, str) and isinstance(value, str)
             }
 
-        cwd: Optional[str] = None
-        cwd_value = options.get("cwd")
-        if isinstance(cwd_value, str):
-            cwd = cwd_value
+        cwd: Optional[str] = root if isinstance(root, str) else None
         start_api = time.monotonic()
 
         try:
             stdout, stderr, returncode = await run_cli(cmd, env=env, cwd=cwd)
-        except FileNotFoundError:
-            return RawResult(
-                is_error=True,
-                error_message=(
-                    f"Codex binary not found at '{self._bin}'. "
-                    "Install Codex CLI: https://github.com/openai/codex"
-                ),
-                failure_type=FailureType.CRASH,
-                metrics=Metrics(),
-            )
+        except FileNotFoundError as exc:
+            raise provider_unavailable("codex", self._bin) from exc
         except TimeoutError as exc:
             return RawResult(
                 is_error=True,
@@ -72,7 +88,7 @@ class CodexProvider:
 
         num_turns = 0
         total_cost: Optional[float] = estimate_cli_cost(
-            model=str(options.get("model", "")),
+            model=model_value or "",
             prompt=prompt,
             result_text=result_text,
         )
@@ -84,6 +100,8 @@ class CodexProvider:
                 num_turns += 1
             elif event.get("type") == "thread.started":
                 session_id = str(event.get("thread_id", ""))
+
+        tokens = extract_token_usage(events)
 
         clean_stderr = strip_ansi(stderr.strip()) if stderr else ""
 
@@ -116,6 +134,11 @@ class CodexProvider:
                 num_turns=num_turns,
                 total_cost_usd=total_cost,
                 session_id=session_id,
+                input_tokens=tokens["input_tokens"],
+                output_tokens=tokens["output_tokens"],
+                cache_read_tokens=tokens["cache_read_tokens"],
+                cache_creation_tokens=tokens["cache_creation_tokens"],
+                model=model_value,
             ),
             is_error=is_error,
             error_message=error_message,

@@ -11,11 +11,16 @@ import (
 // is the only place new skills get registered. Bump Version on every change
 // so `af skill update` knows there's a new build.
 type Skill struct {
-	Name        string // canonical skill name (kebab-case, used as directory name)
-	Version     string // semver-ish version string baked into the binary
-	Description string // one-line description for `af skill list`
-	EmbedRoot   string // root path inside SkillData where this skill's files live
-	EntryFile   string // relative path to the skill's main file (usually SKILL.md)
+	Name        string   // canonical skill name (kebab-case, used as directory name)
+	Aliases     []string // legacy names that should resolve to this skill (back-compat)
+	Version     string   // semver-ish version string baked into the binary
+	Description string   // one-line description for `af skill list`
+	EmbedRoot   string   // root path inside SkillData where this skill's files live
+	EntryFile   string   // relative path to the skill's main file (usually SKILL.md)
+	// Trigger is the "when must the agent read this skill" sentence rendered
+	// into marker-block targets' rules files (see renderPointerBlock) — each
+	// skill fires on different requests, so each carries its own trigger.
+	Trigger string
 }
 
 // Catalog is the registry of every skill the binary ships. Add a new entry
@@ -23,20 +28,52 @@ type Skill struct {
 // skill_data/<name>/ so the embed picks them up.
 var Catalog = []Skill{
 	{
-		Name:        "agentfield-multi-reasoner-builder",
-		Version:     "0.3.0",
-		Description: "Architect and ship complete multi-agent backends on AgentField — composite intelligence from five foundational principles, deep dynamic call graphs, async-first smoke tests, and hard runtime-contract rules.",
-		EmbedRoot:   "skill_data/agentfield-multi-reasoner-builder",
+		Name:        "agentfield",
+		Aliases:     []string{"agentfield-multi-reasoner-builder"},
+		Version:     "0.5.2",
+		Description: "Design and ship a multi-agent system on AgentField. Derive the orchestration from the problem: decompose by cognitive jobs, place each slot on the autonomy spectrum, assign a verification rung, choose the dynamism rung with budgets. Composite intelligence, deep dynamic call graphs, live SDK docs from agentfield.ai, async-first smoke tests. For an agent installed on this machine via af/Desktop, use agentfield-personal instead.",
+		EmbedRoot:   "skill_data/agentfield",
 		EntryFile:   "SKILL.md",
+		Trigger: `When the user asks you to architect or build a multi-agent system on
+AgentField (composite-intelligence backends, multi-reasoner pipelines,
+financial reviewer / clinical triage / research agent / etc.), you MUST
+read this skill first`,
+	},
+	{
+		Name:        "agentfield-personal",
+		Version:     "0.1.0",
+		Description: "Build and install a personal AI agent on this machine's AgentField: real source in ~/agentfield-agents, an agentfield-package.yaml manifest, af install + af run, verified control-plane registration and a live reasoner call, visible in AgentField Desktop with a keys form and auto-start toggle. For a standalone project repository with Docker Compose, use the agentfield skill instead.",
+		EmbedRoot:   "skill_data/agentfield-personal",
+		EntryFile:   "SKILL.md",
+		Trigger: `When the user asks you to build an agent that lives on this machine —
+installed through af, managed in AgentField Desktop, available as a
+persistent local capability rather than a project repository — you MUST
+read this skill first`,
+	},
+	{
+		Name:        "agentfield-use",
+		Version:     "0.5.0",
+		Description: "Discover and call agents already running on a local AgentField control plane. Zero-setup MCP endpoint at <server>/mcp, health check, capability discovery, ranked reasoner search (af agent search), concurrent sync/async execution, load-aware pacing (meta.load), in-flight visibility (af ps / executions/active), wedged-run triage (cancel-tree), sessions, and the af CLI ops (run/stop/logs/secrets) that keep installed agents answering.",
+		EmbedRoot:   "skill_data/agentfield-use",
+		EntryFile:   "SKILL.md",
+		Trigger: `When the user asks you to use, call, query, or delegate work to an
+installed AgentField agent, to list available agents or reasoners, or to
+check on a running execution, you MUST read this skill first`,
 	},
 }
 
 // CatalogByName returns the skill with the given name, or an error if it
-// is not in the registry.
+// is not in the registry. Aliases are resolved transparently — a query for a
+// legacy name returns the current canonical skill.
 func CatalogByName(name string) (Skill, error) {
 	for _, s := range Catalog {
 		if s.Name == name {
 			return s, nil
+		}
+		for _, alias := range s.Aliases {
+			if alias == name {
+				return s, nil
+			}
 		}
 	}
 	available := make([]string, len(Catalog))

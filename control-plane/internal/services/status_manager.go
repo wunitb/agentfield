@@ -37,6 +37,10 @@ type StatusManager struct {
 	activeTransitions map[string]*types.StateTransition
 	transitionMutex   sync.RWMutex
 
+	// Granted status leases, keyed by node ID.
+	leaseExpiries map[string]time.Time
+	leaseMutex    sync.RWMutex
+
 	// Control channels
 	stopCh chan struct{}
 
@@ -98,9 +102,40 @@ func NewStatusManager(storage storage.StorageProvider, config StatusManagerConfi
 		agentClient:       agentClient,
 		statusCache:       make(map[string]*cachedAgentStatus),
 		activeTransitions: make(map[string]*types.StateTransition),
+		leaseExpiries:     make(map[string]time.Time),
 		stopCh:            make(chan struct{}),
 		eventHandlers:     make([]StatusEventHandler, 0),
 	}
+}
+
+const grantedLeaseGrace = 30 * time.Second
+
+// RecordLease records the expiry of a status lease granted to a node.
+func (sm *StatusManager) RecordLease(nodeID string, expiresAt time.Time) {
+	sm.leaseMutex.Lock()
+	sm.leaseExpiries[nodeID] = expiresAt
+	sm.leaseMutex.Unlock()
+}
+
+func (sm *StatusManager) hasUnexpiredLease(nodeID string, now time.Time) bool {
+	sm.leaseMutex.RLock()
+	expiresAt, ok := sm.leaseExpiries[nodeID]
+	sm.leaseMutex.RUnlock()
+	if !ok {
+		return false
+	}
+
+	if now.Before(expiresAt.Add(grantedLeaseGrace)) {
+		return true
+	}
+
+	// Lease entries need no sweeper; discard them lazily once their grace period ends.
+	sm.leaseMutex.Lock()
+	if current, exists := sm.leaseExpiries[nodeID]; exists && current.Equal(expiresAt) {
+		delete(sm.leaseExpiries, nodeID)
+	}
+	sm.leaseMutex.Unlock()
+	return false
 }
 
 // Start begins the status manager background processes
@@ -529,23 +564,18 @@ func (sm *StatusManager) handleStateTransition(nodeID string, status *types.Agen
 		return fmt.Errorf("invalid state transition from %s to %s", status.State, newState)
 	}
 
-	// Start transition
+	// Record and complete in one step. Every update that requests a state does
+	// so on direct evidence — a ready heartbeat or lease renewal, a health
+	// check result, reconciliation of a fresh heartbeat — so there is nothing
+	// to hold open. starting→active used to be left pending here, which kept
+	// State=starting (persisted as health_status "unknown") while the same
+	// update set lifecycle to "ready". SDKs whose only keep-alive carries
+	// phase=ready (the Go SDK renews its status lease every 2 minutes, exactly
+	// MaxTransitionTime) re-created the pending transition on every renewal, so
+	// the transition-timeout sweeper never completed it and the node reported
+	// health "unknown" indefinitely.
 	status.StartTransition(newState, reason)
-
-	// Track active transition
-	sm.transitionMutex.Lock()
-	sm.activeTransitions[nodeID] = status.StateTransition
-	sm.transitionMutex.Unlock()
-
-	// For immediate transitions, complete right away
-	if sm.isImmediateTransition(status.State, newState) {
-		status.CompleteTransition()
-
-		// Remove from active transitions
-		sm.transitionMutex.Lock()
-		delete(sm.activeTransitions, nodeID)
-		sm.transitionMutex.Unlock()
-	}
+	status.CompleteTransition()
 
 	return nil
 }
@@ -571,12 +601,6 @@ func (sm *StatusManager) isValidTransition(from, to types.AgentState) bool {
 	}
 
 	return false
-}
-
-// isImmediateTransition checks if a transition should complete immediately
-func (sm *StatusManager) isImmediateTransition(from, to types.AgentState) bool {
-	// Most transitions are immediate except starting->active which may take time
-	return !(from == types.AgentStateStarting && to == types.AgentStateActive)
 }
 
 // persistStatus persists the status to storage.
@@ -746,9 +770,17 @@ func (sm *StatusManager) performReconciliation() {
 
 // needsReconciliation checks if an agent needs status reconciliation
 func (sm *StatusManager) needsReconciliation(agent *types.AgentNode) bool {
-	// Check if last heartbeat is too old (uses configurable threshold, default 60s)
-	timeSinceHeartbeat := time.Since(agent.LastHeartbeat)
-	if timeSinceHeartbeat > sm.config.HeartbeatStaleThreshold && agent.HealthStatus == types.HealthStatusActive {
+	now := time.Now()
+	timeSinceHeartbeat := now.Sub(agent.LastHeartbeat)
+
+	// A granted lease is the server's promise that it will not declare the node
+	// dead while that lease (plus a small scheduling grace) is still running.
+	// Lease-holder liveness is still guarded by the HTTP health monitor, whose
+	// consecutive probe failures can mark a dead node inactive before lease expiry.
+	// Nodes without granted leases continue to use heartbeat staleness unchanged.
+	if timeSinceHeartbeat > sm.config.HeartbeatStaleThreshold &&
+		agent.HealthStatus == types.HealthStatusActive &&
+		!sm.hasUnexpiredLease(agent.ID, now) {
 		return true
 	}
 
@@ -773,6 +805,21 @@ func (sm *StatusManager) needsReconciliation(agent *types.AgentNode) bool {
 	// wedged in "starting" indefinitely, and the staleness branch above never fires
 	// because the heartbeat is always fresh.
 	if agent.LifecycleStatus == types.AgentStatusStarting &&
+		timeSinceHeartbeat <= sm.config.HeartbeatStaleThreshold &&
+		!agent.RegisteredAt.IsZero() &&
+		time.Since(agent.RegisteredAt) > sm.config.MaxTransitionTime {
+		return true
+	}
+
+	// Agents whose health_status is still "unknown" despite a FRESH heartbeat
+	// past the startup grace period are wedged and must be reconciled. This is
+	// the lease-renewal variant of the stuck-"starting" case above: nodes whose
+	// only keep-alive is the status lease (PATCH /nodes/:id/status — the Go
+	// SDK) used to trap in a never-completing starting→active transition that
+	// persisted health "unknown" alongside lifecycle "ready". The fresh
+	// heartbeat proves liveness, so reconciliation promotes them. Serverless
+	// nodes never heartbeat, so the freshness requirement keeps them out.
+	if agent.HealthStatus == types.HealthStatusUnknown &&
 		timeSinceHeartbeat <= sm.config.HeartbeatStaleThreshold &&
 		!agent.RegisteredAt.IsZero() &&
 		time.Since(agent.RegisteredAt) > sm.config.MaxTransitionTime {

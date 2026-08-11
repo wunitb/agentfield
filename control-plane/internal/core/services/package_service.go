@@ -3,10 +3,9 @@ package services
 
 import (
 	"fmt"
-	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -39,25 +38,152 @@ func NewPackageService(
 
 // InstallPackage installs a package from the given source
 func (ps *DefaultPackageService) InstallPackage(source string, options domain.InstallOptions) error {
+	_, err := ps.InstallPackageWithResult(source, options)
+	return err
+}
+
+// InstallPackageWithResult installs a package and reports the package name
+// selected by the installer. For superseded packages this is the final
+// successor, including when it replaces an existing package under the same
+// name.
+func (ps *DefaultPackageService) InstallPackageWithResult(source string, options domain.InstallOptions) (string, error) {
+	installedName, err := ps.installOne(source, options)
+	if err != nil {
+		return "", err
+	}
+
+	// The --path selector targets a subdirectory of THIS source only. Node
+	// dependencies are their own installable sources, so never carry the selector
+	// into recursive dependency installs.
+	depOptions := options
+	depOptions.Path = ""
+	if err := ps.installNodeDependencies(installedName, depOptions, map[string]bool{installedName: true}); err != nil {
+		return "", err
+	}
+	return installedName, nil
+}
+
+// installOne installs a single package from a git URL or local path.
+func (ps *DefaultPackageService) installOne(source string, options domain.InstallOptions) (string, error) {
 	// Check if it's a Git URL (GitHub, GitLab, Bitbucket, etc.)
 	if packages.IsGitURL(source) {
 		installer := &packages.GitInstaller{
 			AgentFieldHome: ps.agentfieldHome,
 			Verbose:        options.Verbose,
+			Subdir:         options.Path,
 		}
-		return installer.InstallFromGit(source, options.Force)
+		if err := installer.InstallFromGit(source, options.Force); err != nil {
+			return "", err
+		}
+		return installer.InstalledName(), nil
 	}
 
 	// Handle local package installation
-	return ps.installLocalPackage(source, options.Force, options.Verbose)
+	return ps.installLocalPackageWithName(source, options.Path, options.Force, options.Verbose)
 }
 
-// installLocalPackage installs a package from a local source path
-func (ps *DefaultPackageService) installLocalPackage(sourcePath string, force bool, verbose bool) error {
+// installedNames returns the set of currently-installed package names.
+func (ps *DefaultPackageService) installedNames() map[string]bool {
+	names := map[string]bool{}
+	registry, err := ps.loadRegistryDirect()
+	if err != nil {
+		return names
+	}
+	for name := range registry.Installed {
+		names[name] = true
+	}
+	return names
+}
+
+// installNodeDependencies installs the node-to-node dependencies declared by
+// packageName, recursively.
+//
+// `visited` holds every package this install pass has already walked, and it is
+// what terminates a dependency cycle. The already-installed check below cannot
+// do that on its own: it only knows a dependency's name for `af://registry/…`
+// refs, and a forced install — which every update is — reinstalls whatever is
+// already there. So a cycle expressed with bare git URLs or local paths has
+// nothing else stopping it.
+func (ps *DefaultPackageService) installNodeDependencies(packageName string, options domain.InstallOptions, visited map[string]bool) error {
+	registry, err := ps.loadRegistryDirect()
+	if err != nil {
+		return nil // base install already succeeded; don't fail on dep discovery
+	}
+
+	for name, pkg := range registry.Installed {
+		if name != packageName {
+			continue
+		}
+		metadata, err := packages.ParsePackageMetadata(pkg.Path)
+		if err != nil {
+			continue
+		}
+		for _, dep := range metadata.Dependencies.Nodes {
+			depSource, depName := resolveNodeRef(dep)
+			if depName != "" && ps.isPackageInstalled(depName) {
+				continue // already present — also handles cycles
+			}
+			fmt.Printf("\n%s Installing node dependency: %s\n", ps.blue("→"), dep)
+			installedName, err := ps.installOne(depSource, options)
+			if err != nil {
+				fmt.Printf("%s Failed to install node dependency %s: %v\n", ps.statusError(), dep, err)
+				continue
+			}
+			if visited[installedName] {
+				continue // a cycle: this pass has already walked that package
+			}
+			visited[installedName] = true
+			// Recurse for the dependency's own node deps.
+			if err := ps.installNodeDependencies(installedName, options, visited); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+// resolveNodeRef maps a node dependency reference to an installable source and,
+// when known, the resulting package name. Supported forms:
+//
+//	af://registry/<name>[@version]  -> https://github.com/Agent-Field/<name>
+//	https://github.com/org/repo      -> used as-is
+//	<git url> / <local path>         -> used as-is
+func resolveNodeRef(ref string) (source string, name string) {
+	const afPrefix = "af://registry/"
+	if strings.HasPrefix(ref, afPrefix) {
+		spec := strings.TrimPrefix(ref, afPrefix)
+		if at := strings.Index(spec, "@"); at >= 0 {
+			spec = spec[:at] // drop version constraint (not yet enforced)
+		}
+		spec = strings.TrimSuffix(spec, "/")
+		return "https://github.com/Agent-Field/" + spec, spec
+	}
+	return ref, ""
+}
+
+// installLocalPackage installs a package from a local source path. When subdir is
+// non-empty (the --path selector) the package root is resolved to
+// <sourcePath>/<subdir>, which must contain an agentfield-package.yaml; that
+// subdirectory is what gets validated, copied, and installed. Resolution happens
+// before any copy or registry mutation, so a bad selector fails cleanly.
+func (ps *DefaultPackageService) installLocalPackage(sourcePath string, subdir string, force bool, verbose bool) error {
+	_, err := ps.installLocalPackageWithName(sourcePath, subdir, force, verbose)
+	return err
+}
+
+func (ps *DefaultPackageService) installLocalPackageWithName(sourcePath string, subdir string, force bool, verbose bool) (string, error) {
+	if strings.TrimSpace(subdir) != "" {
+		resolved, err := packages.ResolvePackageSubdir(sourcePath, subdir)
+		if err != nil {
+			return "", err
+		}
+		sourcePath = resolved
+	}
+
 	// Get package name first for better messaging
 	metadata, err := ps.parsePackageMetadata(sourcePath)
 	if err != nil {
-		return fmt.Errorf("failed to parse package metadata: %w", err)
+		return "", fmt.Errorf("failed to parse package metadata: %w", err)
 	}
 
 	fmt.Printf("Installing %s...\n", metadata.Name)
@@ -67,13 +193,13 @@ func (ps *DefaultPackageService) installLocalPackage(sourcePath string, force bo
 	spinner.Start()
 	if err := ps.validatePackage(sourcePath); err != nil {
 		spinner.Error("Package validation failed")
-		return fmt.Errorf("package validation failed: %w", err)
+		return "", fmt.Errorf("package validation failed: %w", err)
 	}
 	spinner.Success("Package structure validated")
 
 	// 2. Check if already installed
 	if !force && ps.isPackageInstalled(metadata.Name) {
-		return fmt.Errorf("package %s already installed (use --force to reinstall)", metadata.Name)
+		return "", fmt.Errorf("package %s already installed (use --force to reinstall)", metadata.Name)
 	}
 
 	// 3. Copy package to global location
@@ -82,7 +208,7 @@ func (ps *DefaultPackageService) installLocalPackage(sourcePath string, force bo
 	spinner.Start()
 	if err := ps.copyPackage(sourcePath, destPath); err != nil {
 		spinner.Error("Failed to copy package")
-		return fmt.Errorf("failed to copy package: %w", err)
+		return "", fmt.Errorf("failed to copy package: %w", err)
 	}
 	spinner.Success("Environment configured")
 
@@ -91,13 +217,13 @@ func (ps *DefaultPackageService) installLocalPackage(sourcePath string, force bo
 	spinner.Start()
 	if err := ps.installDependencies(destPath, metadata); err != nil {
 		spinner.Error("Failed to install dependencies")
-		return fmt.Errorf("failed to install dependencies: %w", err)
+		return "", fmt.Errorf("failed to install dependencies: %w", err)
 	}
 	spinner.Success("Dependencies installed")
 
 	// 5. Update installation registry
 	if err := ps.updateRegistry(metadata, sourcePath, destPath); err != nil {
-		return fmt.Errorf("failed to update registry: %w", err)
+		return "", fmt.Errorf("failed to update registry: %w", err)
 	}
 
 	fmt.Printf("%s Installed %s v%s\n", ps.green(ps.statusSuccess()), ps.bold(metadata.Name), ps.gray(metadata.Version))
@@ -108,7 +234,7 @@ func (ps *DefaultPackageService) installLocalPackage(sourcePath string, force bo
 
 	fmt.Printf("\n%s %s\n", ps.blue("→"), ps.bold(fmt.Sprintf("Run: af run %s", metadata.Name)))
 
-	return nil
+	return metadata.Name, nil
 }
 
 // UninstallPackage removes an installed package
@@ -377,47 +503,12 @@ func (s *Spinner) Error(message string) {
 
 // validatePackage checks if the package has required files
 func (ps *DefaultPackageService) validatePackage(sourcePath string) error {
-	// Check if agentfield-package.yaml exists
-	packageYamlPath := filepath.Join(sourcePath, "agentfield-package.yaml")
-	if _, err := os.Stat(packageYamlPath); os.IsNotExist(err) {
-		return fmt.Errorf("agentfield-package.yaml not found in %s", sourcePath)
-	}
-
-	// Check if main.py exists
-	mainPyPath := filepath.Join(sourcePath, "main.py")
-	if _, err := os.Stat(mainPyPath); os.IsNotExist(err) {
-		return fmt.Errorf("main.py not found in %s", sourcePath)
-	}
-
-	return nil
+	return packages.ValidatePackage(sourcePath)
 }
 
 // parsePackageMetadata parses the agentfield-package.yaml file
 func (ps *DefaultPackageService) parsePackageMetadata(sourcePath string) (*packages.PackageMetadata, error) {
-	packageYamlPath := filepath.Join(sourcePath, "agentfield-package.yaml")
-
-	data, err := os.ReadFile(packageYamlPath)
-	if err != nil {
-		return nil, fmt.Errorf("failed to read agentfield-package.yaml: %w", err)
-	}
-
-	var metadata packages.PackageMetadata
-	if err := yaml.Unmarshal(data, &metadata); err != nil {
-		return nil, fmt.Errorf("failed to parse agentfield-package.yaml: %w", err)
-	}
-
-	// Validate required fields
-	if metadata.Name == "" {
-		return nil, fmt.Errorf("package name is required in agentfield-package.yaml")
-	}
-	if metadata.Version == "" {
-		return nil, fmt.Errorf("package version is required in agentfield-package.yaml")
-	}
-	if metadata.Main == "" {
-		metadata.Main = "main.py" // Default
-	}
-
-	return &metadata, nil
+	return packages.ParsePackageMetadata(sourcePath)
 }
 
 // isPackageInstalled checks if a package is already installed
@@ -461,6 +552,14 @@ func (ps *DefaultPackageService) copyPackage(sourcePath, destPath string) error 
 			return err
 		}
 
+		// Skip VCS, build artifacts, local venvs and plaintext secrets.
+		if packages.ShouldSkipCopy(relPath, info) {
+			if info.IsDir() {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+
 		destFilePath := filepath.Join(destPath, relPath)
 
 		if info.IsDir() {
@@ -472,80 +571,18 @@ func (ps *DefaultPackageService) copyPackage(sourcePath, destPath string) error 
 	})
 }
 
-// copyFile copies a single file from src to dst
+// copyFile copies a single file from src to dst, preserving its mode. Shared
+// with the CLI installer so an executable a node ships stays executable on
+// both install paths.
 func (ps *DefaultPackageService) copyFile(src, dst string) error {
-	sourceFile, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer sourceFile.Close()
-
-	destFile, err := os.Create(dst)
-	if err != nil {
-		return err
-	}
-	defer destFile.Close()
-
-	_, err = io.Copy(destFile, sourceFile)
-	return err
+	return packages.CopyFile(src, dst)
 }
 
-// installDependencies installs package dependencies
+// installDependencies installs package dependencies for the node's language
+// (Go build or Python venv), delegating to the shared, language-aware installer
+// so this service path handles Go nodes identically to the CLI installer.
 func (ps *DefaultPackageService) installDependencies(packagePath string, metadata *packages.PackageMetadata) error {
-	// Install Python dependencies in a virtual environment
-	if len(metadata.Dependencies.Python) > 0 || ps.hasRequirementsFile(packagePath) {
-		// Create virtual environment
-		venvPath := filepath.Join(packagePath, "venv")
-
-		cmd := exec.Command("python3", "-m", "venv", venvPath)
-		if _, err := cmd.CombinedOutput(); err != nil {
-			// Try with python if python3 fails
-			cmd = exec.Command("python", "-m", "venv", venvPath)
-			if output, err := cmd.CombinedOutput(); err != nil {
-				return fmt.Errorf("failed to create virtual environment: %w\nOutput: %s", err, output)
-			}
-		}
-
-		// Determine pip path
-		var pipPath string
-		if _, err := os.Stat(filepath.Join(venvPath, "bin", "pip")); err == nil {
-			pipPath = filepath.Join(venvPath, "bin", "pip")
-		} else {
-			pipPath = filepath.Join(venvPath, "Scripts", "pip.exe") // Windows
-		}
-
-		// Upgrade pip first (ignore failures)
-		cmd = exec.Command(pipPath, "install", "--upgrade", "pip")
-		_, _ = cmd.CombinedOutput()
-
-		// Install from requirements.txt if it exists
-		requirementsPath := filepath.Join(packagePath, "requirements.txt")
-		if _, err := os.Stat(requirementsPath); err == nil {
-			cmd = exec.Command(pipPath, "install", "-r", requirementsPath)
-			cmd.Dir = packagePath
-			if output, err := cmd.CombinedOutput(); err != nil {
-				return fmt.Errorf("failed to install requirements.txt dependencies: %w\nOutput: %s", err, output)
-			}
-		}
-
-		// Install dependencies from agentfield-package.yaml
-		if len(metadata.Dependencies.Python) > 0 {
-			for _, dep := range metadata.Dependencies.Python {
-				cmd = exec.Command(pipPath, "install", dep)
-				cmd.Dir = packagePath
-				if output, err := cmd.CombinedOutput(); err != nil {
-					return fmt.Errorf("failed to install dependency %s: %w\nOutput: %s", dep, err, output)
-				}
-			}
-		}
-	}
-
-	// Install system dependencies (if any)
-	for _, dep := range metadata.Dependencies.System {
-		fmt.Printf("System dependency required: %s (please install manually)\n", dep)
-	}
-
-	return nil
+	return packages.InstallDependencies(packagePath, metadata)
 }
 
 // hasRequirementsFile checks if requirements.txt exists
@@ -608,13 +645,14 @@ func (ps *DefaultPackageService) updateRegistry(metadata *packages.PackageMetada
 
 // checkEnvironmentVariables checks for required environment variables and provides setup guidance
 func (ps *DefaultPackageService) checkEnvironmentVariables(metadata *packages.PackageMetadata) {
-	if len(metadata.UserEnvironment.Required) == 0 && len(metadata.UserEnvironment.Optional) == 0 {
+	env := metadata.UserEnvironment
+	if len(env.Required) == 0 && len(env.RequireOneOf) == 0 && len(env.Optional) == 0 {
 		return // No user environment variables configured
 	}
 
 	// Check required environment variables
 	missingRequired := []packages.UserEnvironmentVar{}
-	for _, envVar := range metadata.UserEnvironment.Required {
+	for _, envVar := range env.Required {
 		if os.Getenv(envVar.Name) == "" {
 			missingRequired = append(missingRequired, envVar)
 		}
@@ -623,8 +661,32 @@ func (ps *DefaultPackageService) checkEnvironmentVariables(metadata *packages.Pa
 	if len(missingRequired) > 0 {
 		fmt.Printf("\n%s %s\n", ps.yellow("⚠"), ps.bold("Missing required environment variables:"))
 		for _, envVar := range missingRequired {
-			fmt.Printf("  %s\n", ps.cyan(fmt.Sprintf("af config %s --set %s=your-value-here", metadata.Name, envVar.Name)))
+			fmt.Printf("  %s\n", ps.cyan(fmt.Sprintf("af secrets set %s", envVar.Name)))
 		}
+		fmt.Printf("  %s\n", ps.gray("(or you'll be prompted on first 'af run')"))
+	}
+
+	// Check require_one_of groups (at least one option must be set).
+	for _, g := range env.RequireOneOf {
+		satisfied := false
+		for _, opt := range g.Options {
+			if os.Getenv(opt.Name) != "" {
+				satisfied = true
+				break
+			}
+		}
+		if satisfied {
+			continue
+		}
+		label := g.Description
+		if label == "" {
+			label = "one of these"
+		}
+		fmt.Printf("\n%s %s (%s):\n", ps.yellow("⚠"), ps.bold("Set at least one of"), label)
+		for _, opt := range g.Options {
+			fmt.Printf("  %s\n", ps.cyan(fmt.Sprintf("af secrets set %s", opt.Name)))
+		}
+		fmt.Printf("  %s\n", ps.gray("(or you'll be prompted on first 'af run')"))
 	}
 
 	// Show optional environment variables if any

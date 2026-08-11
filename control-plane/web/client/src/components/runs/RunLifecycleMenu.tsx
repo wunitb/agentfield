@@ -5,9 +5,12 @@ import {
   Play,
   XCircle,
   Activity,
+  GitBranch,
+  Share2,
 } from "lucide-react";
 
 import { cn } from "@/lib/utils";
+import { statusTone } from "@/lib/theme";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -28,6 +31,7 @@ import {
   AlertDialogTitle,
 } from "@/components/ui/alert-dialog";
 import { isTerminalStatus } from "@/utils/status";
+import { downloadWorkflowShareFile } from "@/services/vcApi";
 import type { WorkflowSummary } from "@/types/workflows";
 
 /**
@@ -59,6 +63,7 @@ interface RunLifecycleMenuProps {
   onPause: (run: WorkflowSummary) => void;
   onResume: (run: WorkflowSummary) => void;
   onCancel: (run: WorkflowSummary) => void;
+  onRestart?: (run: WorkflowSummary) => void;
 }
 
 /**
@@ -74,23 +79,32 @@ export function RunLifecycleMenu({
   onPause,
   onResume,
   onCancel,
+  onRestart,
 }: RunLifecycleMenuProps) {
   const [menuOpen, setMenuOpen] = useState(false);
   const [confirmOpen, setConfirmOpen] = useState(false);
 
-  // Prefer the root execution status when available — that's the row the
-  // user actually controls. The aggregate `run.status` can stay 'running'
-  // even after the user paused the root because in-flight children keep
-  // going (see backend execute.go dispatch-time guard). Falling back to
-  // the aggregate keeps things working for older API responses.
-  const effectiveStatus = run.root_execution_status ?? run.status;
-  const isRunning = effectiveStatus === "running";
-  const isPaused = effectiveStatus === "paused";
-  const isTerminal = isTerminalStatus(effectiveStatus);
+  // Pause/Resume target the root execution — they're scoped operations on
+  // the row the user actually controls, and the aggregate `run.status` can
+  // stay 'running' even after the user paused the root because in-flight
+  // children keep going (see backend execute.go dispatch-time guard).
+  // Cancel targets the AGGREGATE status because a run with a terminated
+  // root and zombied children still has work that needs cancelling — the
+  // bulk-cancel path walks the whole DAG.
+  const rootStatus = run.root_execution_status ?? run.status;
+  const isRunning = rootStatus === "running";
+  const isPaused = rootStatus === "paused";
   const canPause = isRunning && Boolean(run.root_execution_id);
   const canResume = isPaused && Boolean(run.root_execution_id);
-  const canCancel = !isTerminal && Boolean(run.root_execution_id);
-  const hasAnyAction = canPause || canResume || canCancel;
+  const canCancel = !isTerminalStatus(run.status);
+  const canRestart = Boolean(
+    onRestart && run.root_execution_id && isTerminalStatus(run.status),
+  );
+  // Share is always available: any run can be exported to a self-contained
+  // offline HTML artifact, so the kebab is never fully empty.
+  const canShare = Boolean(run.run_id);
+  const hasAnyAction =
+    canPause || canResume || canCancel || canRestart || canShare;
 
   // Render an inert placeholder with the same footprint so the column
   // stays aligned across rows even when no action is available.
@@ -159,17 +173,60 @@ export function RunLifecycleMenu({
               Resume run
             </DropdownMenuItem>
           ) : null}
-          {canCancel ? (
+          {canRestart ? (
+            <>
+              <DropdownMenuSeparator />
+              <DropdownMenuLabel className="text-xs font-normal text-muted-foreground">
+                Recovery
+              </DropdownMenuLabel>
+            </>
+          ) : null}
+          {canRestart ? (
             <DropdownMenuItem
-              className="gap-2 text-xs text-destructive focus:text-destructive"
+              className="gap-2 text-xs"
               onClick={() => {
                 setMenuOpen(false);
-                setConfirmOpen(true);
+                onRestart?.(run);
               }}
             >
-              <XCircle className="size-3.5" aria-hidden />
-              Cancel run
+              <GitBranch
+                className={cn("size-3.5", statusTone.info.accent)}
+                aria-hidden
+              />
+              Restart run
             </DropdownMenuItem>
+          ) : null}
+          {canShare ? (
+            <>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                className="gap-2 text-xs"
+                onClick={() => {
+                  setMenuOpen(false);
+                  void downloadWorkflowShareFile(run.run_id).catch((e) =>
+                    console.error(e),
+                  );
+                }}
+              >
+                <Share2 className="size-3.5 text-muted-foreground" aria-hidden />
+                Share run
+              </DropdownMenuItem>
+            </>
+          ) : null}
+          {canCancel ? (
+            <>
+              <DropdownMenuSeparator />
+              <DropdownMenuItem
+                className="gap-2 text-xs text-destructive focus:text-destructive"
+                onClick={() => {
+                  setMenuOpen(false);
+                  setConfirmOpen(true);
+                }}
+              >
+                <XCircle className="size-3.5" aria-hidden />
+                Cancel run
+              </DropdownMenuItem>
+            </>
           ) : null}
         </DropdownMenuContent>
       </DropdownMenu>

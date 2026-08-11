@@ -38,9 +38,11 @@ func (ls *LocalStorage) CreateExecutionRecord(ctx context.Context, exec *types.E
 			input_uri, result_uri,
 			session_id, actor_id,
 			started_at, completed_at, duration_ms,
+			authority_home_id, authority_run_id, authority_lease_owner,
+			authority_attempt, authority_revoked_at,
 			notes,
 			created_at, updated_at
-		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
 
 	// Serialize notes to JSON
 	var notesJSON []byte
@@ -73,6 +75,11 @@ func (ls *LocalStorage) CreateExecutionRecord(ctx context.Context, exec *types.E
 		exec.StartedAt,
 		exec.CompletedAt,
 		exec.DurationMS,
+		exec.AuthorityHomeID,
+		exec.AuthorityRunID,
+		exec.AuthorityLeaseOwner,
+		exec.AuthorityAttempt,
+		exec.AuthorityRevokedAt,
 		notesJSON,
 		exec.CreatedAt,
 		exec.UpdatedAt,
@@ -93,6 +100,8 @@ func (ls *LocalStorage) GetExecutionRecord(ctx context.Context, executionID stri
 		       input_uri, result_uri,
 		       session_id, actor_id,
 		       started_at, completed_at, duration_ms,
+		       authority_home_id, authority_run_id, authority_lease_owner,
+		       authority_attempt, authority_revoked_at,
 		       notes,
 		       created_at, updated_at
 		FROM executions
@@ -109,6 +118,72 @@ func (ls *LocalStorage) GetExecutionRecord(ctx context.Context, executionID stri
 	return exec, nil
 }
 
+// maxBatchExecutionIDs caps the number of execution IDs a single batch
+// fetch may query, guarding against unbounded IN-clause expansion.
+const maxBatchExecutionIDs = 500
+
+// GetExecutionRecordsBatch fetches multiple execution rows by execution_id in
+// a single query. IDs that do not exist are simply absent from the returned
+// map. An empty input returns an empty (non-nil) map without hitting the DB.
+func (ls *LocalStorage) GetExecutionRecordsBatch(ctx context.Context, executionIDs []string) (map[string]*types.Execution, error) {
+	result := make(map[string]*types.Execution, len(executionIDs))
+	if len(executionIDs) == 0 {
+		return result, nil
+	}
+	if len(executionIDs) > maxBatchExecutionIDs {
+		return nil, fmt.Errorf("batch fetch supports at most %d execution IDs, got %d", maxBatchExecutionIDs, len(executionIDs))
+	}
+
+	db := ls.requireSQLDB()
+
+	placeholders := strings.TrimSuffix(strings.Repeat("?,", len(executionIDs)), ",")
+	query := fmt.Sprintf(`
+		SELECT execution_id, run_id, parent_execution_id,
+		       agent_node_id, reasoner_id, node_id,
+		       status, status_reason, input_payload, result_payload, error_message,
+		       input_uri, result_uri,
+		       session_id, actor_id,
+		       started_at, completed_at, duration_ms,
+		       authority_home_id, authority_run_id, authority_lease_owner,
+		       authority_attempt, authority_revoked_at,
+		       notes,
+		       created_at, updated_at
+		FROM executions
+		WHERE execution_id IN (%s)`, placeholders)
+
+	args := make([]interface{}, len(executionIDs))
+	for i, id := range executionIDs {
+		args[i] = id
+	}
+
+	rows, err := db.QueryContext(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("batch query executions: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		exec, err := scanExecution(rows)
+		if err != nil {
+			return nil, err
+		}
+		result[exec.ExecutionID] = exec
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate batch executions: %w", err)
+	}
+
+	// Reuse the batched webhook-registration lookup so we don't issue one
+	// HasExecutionWebhook query per execution (the same N+1 we're fixing).
+	found := make([]*types.Execution, 0, len(result))
+	for _, exec := range result {
+		found = append(found, exec)
+	}
+	ls.populateWebhookRegistration(ctx, found)
+
+	return result, nil
+}
+
 // UpdateExecutionRecord applies an update callback atomically. The callback mutates a
 // types.Execution copy and the result gets persisted.
 func (ls *LocalStorage) UpdateExecutionRecord(ctx context.Context, executionID string, updater func(*types.Execution) (*types.Execution, error)) (*types.Execution, error) {
@@ -123,17 +198,23 @@ func (ls *LocalStorage) UpdateExecutionRecord(ctx context.Context, executionID s
 	}
 	defer rollbackTx(tx, "UpdateExecutionRecord:"+executionID)
 
-	row := tx.QueryRowContext(ctx, `
+	selectQuery := `
 		SELECT execution_id, run_id, parent_execution_id,
 		       agent_node_id, reasoner_id, node_id,
 		       status, status_reason, input_payload, result_payload, error_message,
 		       input_uri, result_uri,
 		       session_id, actor_id,
 		       started_at, completed_at, duration_ms,
+		       authority_home_id, authority_run_id, authority_lease_owner,
+		       authority_attempt, authority_revoked_at,
 		       notes,
 		       created_at, updated_at
 		FROM executions
-		WHERE execution_id = ?`, executionID)
+		WHERE execution_id = ?`
+	if ls.mode != "local" {
+		selectQuery += " FOR UPDATE"
+	}
+	row := tx.QueryRowContext(ctx, selectQuery, executionID)
 
 	current, err := scanExecution(row)
 	if err != nil {
@@ -181,6 +262,11 @@ func (ls *LocalStorage) UpdateExecutionRecord(ctx context.Context, executionID s
 			started_at = ?,
 			completed_at = ?,
 			duration_ms = ?,
+			authority_home_id = ?,
+			authority_run_id = ?,
+			authority_lease_owner = ?,
+			authority_attempt = ?,
+			authority_revoked_at = ?,
 			notes = ?,
 			updated_at = ?
 		WHERE execution_id = ?`
@@ -205,6 +291,11 @@ func (ls *LocalStorage) UpdateExecutionRecord(ctx context.Context, executionID s
 		updated.StartedAt,
 		updated.CompletedAt,
 		updated.DurationMS,
+		updated.AuthorityHomeID,
+		updated.AuthorityRunID,
+		updated.AuthorityLeaseOwner,
+		updated.AuthorityAttempt,
+		updated.AuthorityRevokedAt,
 		notesJSON,
 		updated.UpdatedAt,
 		updated.ExecutionID,
@@ -260,6 +351,13 @@ func (ls *LocalStorage) QueryExecutionRecords(ctx context.Context, filter types.
 		where = append(where, "actor_id = ?")
 		args = append(args, *filter.ActorID)
 	}
+	if filter.AuthorityBoundOnly {
+		where = append(where, "authority_home_id IS NOT NULL")
+	}
+	if filter.NonTerminalOnly {
+		where = append(where, "status NOT IN (?, ?, ?, ?)")
+		args = append(args, types.ExecutionStatusSucceeded, types.ExecutionStatusFailed, types.ExecutionStatusCancelled, types.ExecutionStatusTimeout)
+	}
 	if filter.StartTime != nil {
 		where = append(where, "started_at >= ?")
 		args = append(args, filter.StartTime.UTC())
@@ -283,6 +381,8 @@ func (ls *LocalStorage) QueryExecutionRecords(ctx context.Context, filter types.
 		       input_uri, result_uri,
 		       session_id, actor_id,
 		       started_at, completed_at, duration_ms,
+		       authority_home_id, authority_run_id, authority_lease_owner,
+		       authority_attempt, authority_revoked_at,
 		       notes,
 		       created_at, updated_at
 		FROM executions`)
@@ -347,6 +447,11 @@ func (ls *LocalStorage) QueryExecutionRecords(ctx context.Context, filter types.
 	return executions, nil
 }
 
+// maxRunSummaryLimit caps filter.Limit in QueryRunSummaries. The limit
+// pre-sizes result slices, so an unchecked request-supplied value would let
+// one call allocate gigabytes up front (CodeQL go/uncontrolled-allocation-size).
+const maxRunSummaryLimit = 1000
+
 // QueryRunSummaries returns aggregated statistics for workflow runs without fetching all execution records.
 // The implementation uses a single GROUP BY query plus a lightweight COUNT for total runs to stay fast even
 // when page_size is large.
@@ -361,12 +466,29 @@ func (ls *LocalStorage) QueryRunSummaries(ctx context.Context, filter types.Exec
 		where = append(where, "run_id = ?")
 		args = append(args, *filter.RunID)
 	}
+	if filter.AgentNodeID != nil {
+		// Run-level membership: keep every row of any run that touched this
+		// agent. A plain agent_node_id = ? here would drop other agents' rows
+		// before GROUP BY, corrupting a cross-agent run's status_counts and
+		// losing its root fields when the root ran elsewhere.
+		where = append(where, "run_id IN (SELECT run_id FROM executions WHERE agent_node_id = ?)")
+		args = append(args, *filter.AgentNodeID)
+	}
 	if filter.Status != nil {
 		where = append(where, "status = ?")
 		args = append(args, *filter.Status)
 	}
 	if filter.SessionID != nil {
-		where = append(where, "session_id = ?")
+		// Run-level membership: keep every row of any run whose root is in this
+		// session. Only the root execution carries session_id — child records
+		// created through the workflow-execution-events path (SDK CallLocal /
+		// in-process composition) are persisted without one. A plain
+		// session_id = ? here would drop all those children before GROUP BY,
+		// collapsing a session-scoped active run to its root alone:
+		// total_/active_executions stuck at 1 and latest_activity frozen at the
+		// root's dispatch time for the whole run, false-alarming the wedge
+		// heuristic on every legitimate long run.
+		where = append(where, "run_id IN (SELECT run_id FROM executions WHERE session_id = ?)")
 		args = append(args, *filter.SessionID)
 	}
 	if filter.ActorID != nil {
@@ -392,10 +514,27 @@ func (ls *LocalStorage) QueryRunSummaries(ctx context.Context, filter types.Exec
 		whereClause = " WHERE " + strings.Join(where, " AND ")
 	}
 
+	// ActiveOnly filters at the run level (post-aggregation) so terminal
+	// children still contribute to status_counts — a Status="running" filter
+	// would instead drop those rows before grouping and also miss runs whose
+	// only in-flight executions are queued/pending/waiting. The set matches
+	// types.IsTerminalExecutionStatus: every canonical non-terminal status
+	// counts as in flight, including paused (a pause-wedged run must not
+	// vanish from af ps) and unknown. Deliberately wider than the query's
+	// active_executions column, whose narrower pre-existing set the UI's
+	// status derivation depends on.
+	havingClause := ""
+	if filter.ActiveOnly {
+		havingClause = " HAVING SUM(CASE WHEN LOWER(status) IN ('running','pending','queued','waiting','paused','unknown') THEN 1 ELSE 0 END) > 0"
+	}
+
 	db := ls.requireSQLDB()
 
 	// Query total run count up front so pagination metadata is accurate without extra round trips.
 	countQuery := "SELECT COUNT(DISTINCT run_id) FROM executions" + whereClause
+	if filter.ActiveOnly {
+		countQuery = "SELECT COUNT(*) FROM (SELECT run_id FROM executions" + whereClause + " GROUP BY run_id" + havingClause + ") active_runs"
+	}
 	var totalRuns int
 	if err := db.QueryRowContext(ctx, countQuery, args...).Scan(&totalRuns); err != nil {
 		return nil, 0, fmt.Errorf("count run_ids: %w", err)
@@ -404,9 +543,15 @@ func (ls *LocalStorage) QueryRunSummaries(ctx context.Context, filter types.Exec
 		return []*RunSummaryAggregation{}, 0, nil
 	}
 
+	// Every API caller clamps its page size (UI ≤200, agentic ≤100, af ps
+	// ≤200), but limit sizes the result pre-allocations below, so the
+	// storage layer enforces its own ceiling rather than trusting callers.
 	limit := filter.Limit
 	if limit <= 0 {
 		limit = 20
+	}
+	if limit > maxRunSummaryLimit {
+		limit = maxRunSummaryLimit
 	}
 	offset := filter.Offset
 	if offset < 0 {
@@ -437,6 +582,8 @@ func (ls *LocalStorage) QueryRunSummaries(ctx context.Context, filter types.Exec
 			SUM(CASE WHEN LOWER(status) IN ('running','pending','queued','waiting') THEN 1 ELSE 0 END) AS active_executions,
 			MAX(CASE WHEN parent_execution_id IS NULL OR parent_execution_id = '' THEN execution_id END) AS root_execution_id,
 			MAX(CASE WHEN parent_execution_id IS NULL OR parent_execution_id = '' THEN status END) AS root_status,
+			MAX(CASE WHEN parent_execution_id IS NULL OR parent_execution_id = '' THEN status_reason END) AS root_error_category,
+			MAX(CASE WHEN parent_execution_id IS NULL OR parent_execution_id = '' THEN error_message END) AS root_error_message,
 			MAX(CASE WHEN parent_execution_id IS NULL OR parent_execution_id = '' THEN agent_node_id END) AS root_agent_node_id,
 			MAX(CASE WHEN parent_execution_id IS NULL OR parent_execution_id = '' THEN reasoner_id END) AS root_reasoner_id,
 			MAX(session_id) AS session_id,
@@ -448,10 +595,10 @@ func (ls *LocalStorage) QueryRunSummaries(ctx context.Context, filter types.Exec
 			END AS status_rank
 		FROM executions
 		%s
-		GROUP BY run_id
+		GROUP BY run_id%s
 		ORDER BY %s %s
 		LIMIT %d OFFSET %d`,
-		whereClause, orderColumn, orderDirection, limit, offset)
+		whereClause, havingClause, orderColumn, orderDirection, limit, offset)
 
 	logger.Logger.Debug().
 		Str("query", query).
@@ -465,9 +612,19 @@ func (ls *LocalStorage) QueryRunSummaries(ctx context.Context, filter types.Exec
 	}
 	defer rows.Close()
 
-	summaries := make([]*RunSummaryAggregation, 0, limit)
-	runIDsForDepth := make([]string, 0, limit)
-	summaryByRunID := make(map[string]*RunSummaryAggregation, limit)
+	// Capacity hint bounded by what the query can actually return (the DB's
+	// own run count) and the page ceiling — deliberately not by the
+	// request-supplied limit, so allocation size never depends on caller
+	// input (CodeQL go/uncontrolled-allocation-size; the reassignment-style
+	// clamp above is not recognized as a sanitizer).
+	capHint := totalRuns
+	if capHint > maxRunSummaryLimit {
+		capHint = maxRunSummaryLimit
+	}
+
+	summaries := make([]*RunSummaryAggregation, 0, capHint)
+	runIDsForDepth := make([]string, 0, capHint)
+	summaryByRunID := make(map[string]*RunSummaryAggregation, capHint)
 
 	for rows.Next() {
 		var (
@@ -487,6 +644,8 @@ func (ls *LocalStorage) QueryRunSummaries(ctx context.Context, filter types.Exec
 			activeExecutions   int
 			rootExecutionID    sql.NullString
 			rootStatus         sql.NullString
+			rootErrorCategory  sql.NullString
+			rootErrorMessage   sql.NullString
 			rootAgentNodeID    sql.NullString
 			rootReasonerID     sql.NullString
 			sessionID          sql.NullString
@@ -511,6 +670,8 @@ func (ls *LocalStorage) QueryRunSummaries(ctx context.Context, filter types.Exec
 			&activeExecutions,
 			&rootExecutionID,
 			&rootStatus,
+			&rootErrorCategory,
+			&rootErrorMessage,
 			&rootAgentNodeID,
 			&rootReasonerID,
 			&sessionID,
@@ -564,6 +725,12 @@ func (ls *LocalStorage) QueryRunSummaries(ctx context.Context, filter types.Exec
 		if rootStatus.Valid && rootStatus.String != "" {
 			normalized := types.NormalizeExecutionStatus(rootStatus.String)
 			summary.RootStatus = &normalized
+		}
+		if rootErrorCategory.Valid && rootErrorCategory.String != "" {
+			summary.RootErrorCategory = &rootErrorCategory.String
+		}
+		if rootErrorMessage.Valid && rootErrorMessage.String != "" {
+			summary.RootErrorMessage = &rootErrorMessage.String
 		}
 		if rootAgentNodeID.Valid && rootAgentNodeID.String != "" {
 			summary.RootAgentNodeID = &rootAgentNodeID.String
@@ -744,17 +911,19 @@ func (ls *LocalStorage) getRunAggregation(ctx context.Context, runID string) (*R
 
 	// Query 3: Get root execution info (execution with no parent)
 	rootQuery := `
-		SELECT execution_id, status, agent_node_id, reasoner_id, session_id, actor_id
+		SELECT execution_id, status, status_reason, error_message, agent_node_id, reasoner_id, session_id, actor_id
 		FROM executions
 		WHERE run_id = ? AND (parent_execution_id IS NULL OR parent_execution_id = '')
 		ORDER BY started_at ASC
 		LIMIT 1`
 
-	var rootExecID, rootStatus, rootAgentNodeID, rootReasonerID sql.NullString
+	var rootExecID, rootStatus, rootErrorCategory, rootErrorMessage, rootAgentNodeID, rootReasonerID sql.NullString
 	var sessionID, actorID sql.NullString
 	err = db.QueryRowContext(ctx, rootQuery, runID).Scan(
 		&rootExecID,
 		&rootStatus,
+		&rootErrorCategory,
+		&rootErrorMessage,
 		&rootAgentNodeID,
 		&rootReasonerID,
 		&sessionID,
@@ -770,6 +939,12 @@ func (ls *LocalStorage) getRunAggregation(ctx context.Context, runID string) (*R
 	if rootStatus.Valid && rootStatus.String != "" {
 		normalized := types.NormalizeExecutionStatus(rootStatus.String)
 		summary.RootStatus = &normalized
+	}
+	if rootErrorCategory.Valid && rootErrorCategory.String != "" {
+		summary.RootErrorCategory = &rootErrorCategory.String
+	}
+	if rootErrorMessage.Valid && rootErrorMessage.String != "" {
+		summary.RootErrorMessage = &rootErrorMessage.String
 	}
 	if rootAgentNodeID.Valid {
 		summary.RootAgentNodeID = &rootAgentNodeID.String
@@ -963,6 +1138,16 @@ func parseTimeString(value string) (time.Time, error) {
 // INVARIANT: callers must ensure updated_at is bumped on every meaningful execution activity.
 // If updated_at is not maintained, active executions may be incorrectly reaped.
 // Uses COALESCE(updated_at, created_at, started_at) to handle rows where updated_at may be NULL.
+//
+// An execution that is merely BLOCKED ON A CHILD is not stale, so rows with a
+// non-terminal child are skipped. A parent's own updated_at stops moving while
+// it waits, so without this a long child call — one agent doing many minutes of
+// work in a single request — reaps its whole ancestor chain even though real
+// work is happening. Deliberately no recency test on the child: the chain
+// unwinds bottom-up instead. If work genuinely stops, the leaf goes stale and
+// is reaped first, which makes its parent childless and eligible on the next
+// sweep, and so on up. Nothing is stuck forever; it just takes one sweep per
+// level.
 func (ls *LocalStorage) MarkStaleExecutions(ctx context.Context, staleAfter time.Duration, limit int) (int, error) {
 	if limit <= 0 {
 		return 0, nil
@@ -976,9 +1161,14 @@ func (ls *LocalStorage) MarkStaleExecutions(ctx context.Context, staleAfter time
 	db := ls.requireSQLDB()
 	rows, err := db.QueryContext(ctx, `
 		SELECT execution_id, started_at
-		FROM executions
+		FROM executions e
 		WHERE status IN ('running', 'pending', 'queued')
 		  AND COALESCE(updated_at, created_at, started_at) <= ?
+		  AND NOT EXISTS (
+		      SELECT 1 FROM executions c
+		      WHERE c.parent_execution_id = e.execution_id
+		        AND c.status IN ('running', 'pending', 'queued')
+		  )
 		ORDER BY COALESCE(updated_at, created_at, started_at) ASC
 		LIMIT ?`, cutoff, limit)
 	if err != nil {
@@ -1069,7 +1259,8 @@ func (ls *LocalStorage) MarkStaleExecutions(ctx context.Context, staleAfter time
 // when their updated_at timestamp exceeds the staleAfter threshold. This catches orphaned
 // child executions whose parent failed without cascading cancellation.
 //
-// See MarkStaleExecutions for the updated_at invariant and COALESCE fallback rationale.
+// See MarkStaleExecutions for the updated_at invariant, the COALESCE fallback
+// rationale, and why a row with a non-terminal child is skipped rather than reaped.
 func (ls *LocalStorage) MarkStaleWorkflowExecutions(ctx context.Context, staleAfter time.Duration, limit int) (int, error) {
 	if limit <= 0 {
 		return 0, nil
@@ -1083,10 +1274,15 @@ func (ls *LocalStorage) MarkStaleWorkflowExecutions(ctx context.Context, staleAf
 	db := ls.requireSQLDB()
 	rows, err := db.QueryContext(ctx, `
 		SELECT execution_id, started_at
-		FROM workflow_executions
+		FROM workflow_executions w
 		WHERE status IN ('running', 'pending', 'queued', 'waiting')
 		  AND COALESCE(updated_at, created_at, started_at) <= ?
 		  AND COALESCE(approval_status, '') != 'pending'
+		  AND NOT EXISTS (
+		      SELECT 1 FROM workflow_executions c
+		      WHERE c.parent_execution_id = w.execution_id
+		        AND c.status IN ('running', 'pending', 'queued', 'waiting')
+		  )
 		ORDER BY COALESCE(updated_at, created_at, started_at) ASC
 		LIMIT ?`, cutoff, limit)
 	if err != nil {
@@ -1191,6 +1387,62 @@ func (ls *LocalStorage) MarkStaleWorkflowExecutions(ctx context.Context, staleAf
 	}
 
 	return updated, nil
+}
+
+// MarkAgentExecutionsOrphaned fails every still-running execution and workflow
+// execution owned by the given agent_node_id. This is invoked when an agent
+// re-registers with a new instance_id — the previous OS process is gone, and
+// any cross-agent `Agent.call` that was in its `wait_for_execution_result`
+// loop has lost its in-memory state with that process. Leaving those rows in
+// `running` strands the parent reasoner indefinitely (this is exactly the
+// run_1778004368903_9345a88f case observed in production), so we fail them
+// up-front the moment we detect the restart.
+//
+// reasonMessage is written to error_message AND status_reason. The terminal
+// status used is "failed" (the agent restarted mid-execution; the work was
+// not completed and was not a deadline timeout).
+//
+// Two single bulk UPDATEs — workflow_executions is the source of truth for
+// the DAG UI; the legacy `executions` table is mirrored best-effort so any
+// older code path reading it sees a consistent picture. We deliberately do
+// not write duration_ms here: the row's started_at is preserved, so consumers
+// that need the runtime can compute completed_at - started_at directly.
+func (ls *LocalStorage) MarkAgentExecutionsOrphaned(ctx context.Context, agentNodeID string, reasonMessage string) (int, error) {
+	if strings.TrimSpace(agentNodeID) == "" {
+		return 0, fmt.Errorf("agent_node_id is required")
+	}
+	if strings.TrimSpace(reasonMessage) == "" {
+		reasonMessage = "agent_restart_orphaned"
+	}
+
+	db := ls.requireSQLDB()
+	now := time.Now().UTC()
+
+	res, err := db.ExecContext(ctx, `
+		UPDATE workflow_executions
+		SET status = ?, status_reason = ?, error_message = ?, completed_at = ?, updated_at = ?
+		WHERE agent_node_id = ?
+		  AND status IN ('running', 'pending', 'queued', 'waiting')`,
+		types.ExecutionStatusFailed, reasonMessage, reasonMessage, now, now, agentNodeID,
+	)
+	if err != nil {
+		return 0, fmt.Errorf("update orphaned workflow executions: %w", err)
+	}
+	affected, _ := res.RowsAffected()
+
+	// Best-effort sync to the legacy `executions` table. Errors are
+	// intentionally swallowed: workflow_executions is the source of truth,
+	// and the legacy mirror is allowed to lag without blocking restart
+	// recovery.
+	_, _ = db.ExecContext(ctx, `
+		UPDATE executions
+		SET status = ?, status_reason = ?, error_message = ?, completed_at = ?, updated_at = ?
+		WHERE agent_node_id = ?
+		  AND status IN ('running', 'pending', 'queued', 'waiting')`,
+		types.ExecutionStatusFailed, reasonMessage, reasonMessage, now, now, agentNodeID,
+	)
+
+	return int(affected), nil
 }
 
 // RetryStaleWorkflowExecutions finds stale workflow executions that haven't exceeded
@@ -1313,6 +1565,11 @@ func scanExecution(scanner interface {
 		errorMessage                 sql.NullString
 		completedAt                  sql.NullTime
 		durationMS                   sql.NullInt64
+		authorityHomeID              sql.NullString
+		authorityRunID               sql.NullString
+		authorityLeaseOwner          sql.NullString
+		authorityAttempt             sql.NullInt64
+		authorityRevokedAt           sql.NullTime
 		notesJSON                    []byte
 	)
 
@@ -1335,6 +1592,11 @@ func scanExecution(scanner interface {
 		&exec.StartedAt,
 		&completedAt,
 		&durationMS,
+		&authorityHomeID,
+		&authorityRunID,
+		&authorityLeaseOwner,
+		&authorityAttempt,
+		&authorityRevokedAt,
 		&notesJSON,
 		&exec.CreatedAt,
 		&exec.UpdatedAt,
@@ -1378,6 +1640,26 @@ func scanExecution(scanner interface {
 	if durationMS.Valid {
 		val := durationMS.Int64
 		exec.DurationMS = &val
+	}
+	if authorityHomeID.Valid {
+		value := authorityHomeID.String
+		exec.AuthorityHomeID = &value
+	}
+	if authorityRunID.Valid {
+		value := authorityRunID.String
+		exec.AuthorityRunID = &value
+	}
+	if authorityLeaseOwner.Valid {
+		value := authorityLeaseOwner.String
+		exec.AuthorityLeaseOwner = &value
+	}
+	if authorityAttempt.Valid {
+		attempt := int(authorityAttempt.Int64)
+		exec.AuthorityAttempt = &attempt
+	}
+	if authorityRevokedAt.Valid {
+		revokedAt := authorityRevokedAt.Time
+		exec.AuthorityRevokedAt = &revokedAt
 	}
 	if len(notesJSON) > 0 {
 		if err := json.Unmarshal(notesJSON, &exec.Notes); err != nil {

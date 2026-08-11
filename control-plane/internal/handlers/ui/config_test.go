@@ -461,6 +461,21 @@ func (m *MockStorageProvider) ListExecutionLogEntries(ctx context.Context, execu
 	return args.Get(0).([]*types.ExecutionLogEntry), args.Error(1)
 }
 
+func (m *MockStorageProvider) CreateExecutionUsage(ctx context.Context, rows []*types.ExecutionUsage) error {
+	return nil
+}
+func (m *MockStorageProvider) GetUsageStats(ctx context.Context, since *time.Time) (*types.UsageStatsAggregation, error) {
+	return &types.UsageStatsAggregation{}, nil
+}
+func (m *MockStorageProvider) GetUsageTimeseries(ctx context.Context, since *time.Time, now time.Time, buckets int) (*types.UsageTimeseries, error) {
+	return &types.UsageTimeseries{}, nil
+}
+func (m *MockStorageProvider) GetUsageTimeseriesByModel(ctx context.Context, since *time.Time, now time.Time, buckets int) ([]types.UsageModelSeries, error) {
+	return nil, nil
+}
+func (m *MockStorageProvider) GetExecutionUsageTotals(ctx context.Context, executionID string) (*float64, int64, error) {
+	return nil, 0, nil
+}
 func (m *MockStorageProvider) PruneExecutionLogEntries(ctx context.Context, executionID string, maxEntries int, olderThan time.Time) error {
 	args := m.Called(ctx, executionID, maxEntries, olderThan)
 	return args.Error(0)
@@ -565,6 +580,10 @@ func (m *MockStorageProvider) ListComponentDIDs(ctx context.Context, agentDID st
 // Execution VC operations
 func (m *MockStorageProvider) StoreExecutionVC(ctx context.Context, vcID, executionID, workflowID, sessionID, issuerDID, targetDID, callerDID, inputHash, outputHash, status string, vcDocument []byte, signature string, storageURI string, documentSizeBytes int64) error {
 	args := m.Called(ctx, vcID, executionID, workflowID, sessionID, issuerDID, targetDID, callerDID, inputHash, outputHash, status, vcDocument, signature)
+	return args.Error(0)
+}
+func (m *MockStorageProvider) StoreExecutionVCRecord(ctx context.Context, vc *types.ExecutionVC) error {
+	args := m.Called(ctx, vc)
 	return args.Error(0)
 }
 

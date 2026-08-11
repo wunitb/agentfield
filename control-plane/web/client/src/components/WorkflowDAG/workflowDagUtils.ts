@@ -1,6 +1,7 @@
 import type { Edge, Node } from "@xyflow/react";
 
 import type {
+  WorkflowDAGExternal,
   WorkflowDAGLightweightNode,
   WorkflowDAGLightweightResponse,
 } from "../../types/workflows";
@@ -19,7 +20,13 @@ export interface WorkflowDAGNode {
   workflow_depth: number;
   agent_name?: string;
   task_name?: string;
+  reuse?: {
+    hit: boolean;
+    source_execution_id: string;
+    source_run_id?: string;
+  };
   children?: WorkflowDAGNode[];
+  external?: WorkflowDAGExternal;
 }
 
 export interface WorkflowDAGResponse {
@@ -44,7 +51,7 @@ export const SIMPLE_LAYOUT_X_SPACING = 240;
 export const SIMPLE_LAYOUT_Y_SPACING = 120;
 
 export function isLightweightDAGResponse(
-  data: WorkflowDAGResponse | WorkflowDAGLightweightResponse | null
+  data: WorkflowDAGResponse | WorkflowDAGLightweightResponse | null,
 ): data is WorkflowDAGLightweightResponse {
   if (!data) {
     return false;
@@ -55,7 +62,7 @@ export function isLightweightDAGResponse(
 
 export function mapLightweightNode(
   node: WorkflowDAGLightweightNode,
-  workflowId: string
+  workflowId: string,
 ): WorkflowDAGNode {
   return {
     workflow_id: workflowId,
@@ -68,14 +75,16 @@ export function mapLightweightNode(
     duration_ms: node.duration_ms,
     parent_execution_id: node.parent_execution_id,
     workflow_depth: node.workflow_depth,
+    reuse: node.reuse,
+    external: node.external,
   };
 }
 
 export function adaptLightweightResponse(
-  response: WorkflowDAGLightweightResponse
+  response: WorkflowDAGLightweightResponse,
 ): WorkflowDAGResponse {
   const timeline = response.timeline.map((node) =>
-    mapLightweightNode(node, response.root_workflow_id)
+    mapLightweightNode(node, response.root_workflow_id),
   );
 
   return {
@@ -95,7 +104,7 @@ export function adaptLightweightResponse(
 
 export function applySimpleGridLayout(
   nodes: Node[],
-  executionMap: Map<string, WorkflowDAGNode>
+  executionMap: Map<string, WorkflowDAGNode>,
 ): Node[] {
   const sortedNodes = [...nodes].sort((a, b) => {
     const depthA =
@@ -132,7 +141,10 @@ export function applySimpleGridLayout(
   });
 }
 
-export function decorateNodesWithViewMode(nodes: Node[], viewMode: string): Node[] {
+export function decorateNodesWithViewMode(
+  nodes: Node[],
+  viewMode: string,
+): Node[] {
   return nodes.map((node) => ({
     ...node,
     data: {
@@ -144,7 +156,7 @@ export function decorateNodesWithViewMode(nodes: Node[], viewMode: string): Node
 
 export function decorateEdgesWithStatus(
   edges: Edge[],
-  executionMap: Map<string, WorkflowDAGNode>
+  executionMap: Map<string, WorkflowDAGNode>,
 ): Edge[] {
   return edges.map((edge) => {
     const targetExecution = executionMap.get(edge.target);

@@ -16,18 +16,21 @@ import (
 )
 
 // DoctorReport is the JSON structure returned by `af doctor --json`.
-// Coding agents (and skills like agentfield-multi-reasoner-builder) call this once
-// to learn what's actually available in the environment instead of probing manually.
+// Coding agents (and skills like agentfield) call this once to learn
+// what's actually available in the environment instead of probing manually.
 type DoctorReport struct {
-	OS              string                  `json:"os"`
-	Arch            string                  `json:"arch"`
-	Python          ToolStatus              `json:"python"`
-	Node            ToolStatus              `json:"node"`
-	Docker          ToolStatus              `json:"docker"`
+	OS               string                 `json:"os"`
+	Arch             string                 `json:"arch"`
+	Python           ToolStatus             `json:"python"`
+	Node             ToolStatus             `json:"node"`
+	Docker           ToolStatus             `json:"docker"`
 	HarnessProviders map[string]ToolStatus  `json:"harness_providers"`
-	ProviderKeys    map[string]ProviderKey  `json:"provider_keys"`
-	ControlPlane    ControlPlaneStatus      `json:"control_plane"`
-	Recommendation  Recommendation          `json:"recommendation"`
+	ProviderKeys     map[string]ProviderKey `json:"provider_keys"`
+	ControlPlane     ControlPlaneStatus     `json:"control_plane"`
+	Recommendation   Recommendation         `json:"recommendation"`
+	// HarnessProbes is populated only when `--probe` is passed: a live smoke
+	// test of each detected provider CLI, keyed by provider name.
+	HarnessProbes map[string]HarnessProbeResult `json:"harness_probes,omitempty"`
 }
 
 // ToolStatus describes whether a CLI is available and, if so, where.
@@ -47,21 +50,21 @@ type ProviderKey struct {
 // ControlPlaneStatus reports whether a local control plane is reachable
 // and whether the Docker image is locally available.
 type ControlPlaneStatus struct {
-	URL                string `json:"url"`
-	Reachable          bool   `json:"reachable"`
-	HealthStatus       string `json:"health_status,omitempty"`
-	DockerImageName    string `json:"docker_image_name"`
-	DockerImageLocal   bool   `json:"docker_image_local"`
+	URL              string `json:"url"`
+	Reachable        bool   `json:"reachable"`
+	HealthStatus     string `json:"health_status,omitempty"`
+	DockerImageName  string `json:"docker_image_name"`
+	DockerImageLocal bool   `json:"docker_image_local"`
 }
 
 // Recommendation tells the caller (a skill or a coding agent) what to default to,
 // based on what's actually present in the environment.
 type Recommendation struct {
-	Provider           string   `json:"provider"`             // "openrouter" / "openai" / "anthropic" / "google" / "none"
-	AIModel            string   `json:"ai_model"`             // suggested LiteLLM-style model string
-	HarnessUsable      bool     `json:"harness_usable"`       // true only if at least one provider CLI is on PATH
-	HarnessProviders   []string `json:"harness_providers"`    // available provider CLI names
-	Notes              []string `json:"notes"`                // human-readable suggestions
+	Provider         string   `json:"provider"`          // "openrouter" / "openai" / "anthropic" / "google" / "none"
+	AIModel          string   `json:"ai_model"`          // suggested LiteLLM-style model string
+	HarnessUsable    bool     `json:"harness_usable"`    // true only if at least one provider CLI is on PATH
+	HarnessProviders []string `json:"harness_providers"` // available provider CLI names
+	Notes            []string `json:"notes"`             // human-readable suggestions
 }
 
 // providerEnvVars maps provider name -> env var. Order matters for the recommendation.
@@ -78,19 +81,37 @@ var providerEnvVars = []struct {
 
 // harnessProviders is the canonical list of CLIs `app.harness()` knows how to drive.
 var harnessProviders = []struct {
-	Name   string // value passed to provider= in app.harness()
-	Binary string // executable name to look up on PATH
+	Name      string   // value passed to provider= in app.harness()
+	Binary    string   // executable name to look up on PATH
+	ProbeArgs []string // minimal one-shot invocation used by `--probe`
 }{
-	{Name: "claude-code", Binary: "claude"},
-	{Name: "codex", Binary: "codex"},
-	{Name: "gemini", Binary: "gemini"},
-	{Name: "opencode", Binary: "opencode"},
+	{Name: "claude-code", Binary: "claude", ProbeArgs: []string{"-p", "Say OK"}},
+	{Name: "codex", Binary: "codex", ProbeArgs: []string{"exec", "Say OK"}},
+	{Name: "gemini", Binary: "gemini", ProbeArgs: []string{"-p", "Say OK"}},
+	{Name: "opencode", Binary: "opencode", ProbeArgs: []string{"run", "Say OK"}},
+}
+
+// harnessProbeTimeout bounds a single provider smoke test. Coding-agent CLIs
+// cold-start slowly (model download, auth handshake), so this is generous.
+const harnessProbeTimeout = 60 * time.Second
+
+// HarnessProbeResult is the outcome of smoke-testing one provider CLI with a
+// minimal one-shot prompt.
+type HarnessProbeResult struct {
+	Provider string `json:"provider"`
+	Binary   string `json:"binary,omitempty"`
+	// Status is one of: ok, empty, error, timeout.
+	Status     string `json:"status"`
+	DurationMS int64  `json:"duration_ms"`
+	// Detail carries a short explanation on failure (stderr head / note).
+	Detail string `json:"detail,omitempty"`
 }
 
 // NewDoctorCommand builds the `af doctor` command.
 func NewDoctorCommand() *cobra.Command {
 	var jsonOut bool
 	var controlPlaneURL string
+	var probe bool
 
 	cmd := &cobra.Command{
 		Use:   "doctor",
@@ -104,16 +125,28 @@ building AgentField multi-reasoner systems:
   • Whether a local control plane is reachable
   • A recommended default provider, model, and whether app.harness() is usable
 
-Coding agents and skills (e.g. agentfield-multi-reasoner-builder) should call
-this once at the start of a build to learn ground truth instead of probing
-each tool by hand.
+Coding agents and skills (e.g. agentfield) should call this once at the
+start of a build to learn ground truth instead of probing each tool
+by hand.
+
+With --probe, each DETECTED provider CLI is additionally smoke-tested with a
+minimal one-shot prompt (e.g. codex exec "Say OK") and classified as ok, empty
+(exit 0 but no completion — a silently broken provider), error, or timeout.
+Detecting a binary on PATH does not prove it can actually complete; --probe
+catches providers that look installed but return nothing. Each probe runs a real
+one-shot request and consumes a trivial amount of provider quota.
 
 Examples:
   af doctor                  # Pretty human-readable output
   af doctor --json           # Machine-readable JSON for tooling/skills
+  af doctor --probe          # Also smoke-test each detected provider CLI
   af doctor --json | jq      # Pipe to jq for filtering`,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			report := buildDoctorReport(controlPlaneURL)
+
+			if probe {
+				report.HarnessProbes = runHarnessProbes(report)
+			}
 
 			if jsonOut {
 				enc := json.NewEncoder(os.Stdout)
@@ -128,8 +161,102 @@ Examples:
 
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "Output the report as JSON (recommended for tools and skills)")
 	cmd.Flags().StringVar(&controlPlaneURL, "server", "http://localhost:8080", "Control plane URL to probe for /api/v1/health")
+	cmd.Flags().BoolVar(&probe, "probe", false, "Smoke-test each detected provider CLI with a minimal one-shot prompt (consumes trivial provider quota)")
 
 	return cmd
+}
+
+// runHarnessProbes smoke-tests every provider CLI that doctor detected on PATH.
+// Providers that were not detected are skipped entirely — probing runs only for
+// what doctor already reports as available.
+func runHarnessProbes(report DoctorReport) map[string]HarnessProbeResult {
+	results := map[string]HarnessProbeResult{}
+	for _, h := range harnessProviders {
+		if !report.HarnessProviders[h.Name].Available {
+			continue
+		}
+		results[h.Name] = probeHarnessProvider(h.Name, h.Binary, h.ProbeArgs, harnessProbeTimeout)
+	}
+	return results
+}
+
+// probeHarnessProvider runs one provider CLI's minimal one-shot invocation and
+// classifies the outcome.
+func probeHarnessProvider(name, binary string, args []string, timeout time.Duration) HarnessProbeResult {
+	start := time.Now()
+	stdout, stderr, exitCode, timedOut := runProbeCommand(binary, args, timeout)
+	status := classifyProbe(exitCode, stdout, timedOut)
+
+	result := HarnessProbeResult{
+		Provider:   name,
+		Binary:     binary,
+		Status:     status,
+		DurationMS: time.Since(start).Milliseconds(),
+	}
+	switch status {
+	case "error":
+		result.Detail = firstLine(stderr)
+	case "timeout":
+		result.Detail = fmt.Sprintf("no response within %s", timeout)
+	case "empty":
+		result.Detail = "exited 0 with no completion output"
+	}
+	return result
+}
+
+// runProbeCommand executes bin with args under a timeout, returning stdout,
+// stderr, the process exit code, and whether the timeout fired. A timeout is
+// reported distinctly so it is never misclassified as a plain error.
+func runProbeCommand(bin string, args []string, timeout time.Duration) (stdout, stderr string, exitCode int, timedOut bool) {
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, bin, args...)
+	var outBuf, errBuf strings.Builder
+	cmd.Stdout = &outBuf
+	cmd.Stderr = &errBuf
+	err := cmd.Run()
+
+	if ctx.Err() == context.DeadlineExceeded {
+		return outBuf.String(), errBuf.String(), -1, true
+	}
+	if err != nil {
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			return outBuf.String(), errBuf.String(), exitErr.ExitCode(), false
+		}
+		// Could not start (binary vanished between detection and probe) — treat
+		// as a non-zero exit so it classifies as error.
+		return outBuf.String(), err.Error(), 1, false
+	}
+	return outBuf.String(), errBuf.String(), 0, false
+}
+
+// classifyProbe maps a probe outcome to a status. Order matters: a timeout is
+// checked before the exit code (a killed process also exits non-zero), and an
+// empty completion on a clean exit is the real-world "silently broken provider"
+// case that a mere PATH check misses.
+func classifyProbe(exitCode int, stdout string, timedOut bool) string {
+	switch {
+	case timedOut:
+		return "timeout"
+	case exitCode != 0:
+		return "error"
+	case strings.TrimSpace(stdout) == "":
+		return "empty"
+	default:
+		return "ok"
+	}
+}
+
+// firstLine returns the first non-empty line of s, trimmed, for compact error
+// detail.
+func firstLine(s string) string {
+	for _, line := range strings.Split(s, "\n") {
+		if trimmed := strings.TrimSpace(line); trimmed != "" {
+			return trimmed
+		}
+	}
+	return ""
 }
 
 // buildDoctorReport collects the full environment snapshot.
@@ -241,6 +368,12 @@ func checkControlPlane(url string) ControlPlaneStatus {
 	ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
 	defer cancel()
 	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, strings.TrimRight(url, "/")+"/api/v1/health", nil)
+	// Health is public today, but a control plane can be fronted by something
+	// that is not; send the same credential as every other CLI request so a
+	// reachable control plane never reports as unreachable.
+	if key := strings.TrimSpace(GetAPIKey()); key != "" {
+		req.Header.Set("X-API-Key", key)
+	}
 	resp, err := http.DefaultClient.Do(req)
 	if err == nil {
 		defer resp.Body.Close()
@@ -283,6 +416,19 @@ func printDoctorReport(r DoctorReport) {
 		printToolLine(h.Name, r.HarnessProviders[h.Name], green, red)
 	}
 	fmt.Println()
+
+	if len(r.HarnessProbes) > 0 {
+		bold.Println("Harness provider probes (--probe)")
+		for _, h := range harnessProviders {
+			probe, ok := r.HarnessProbes[h.Name]
+			if !ok {
+				continue
+			}
+			printProbeLine(probe, green, red, yellow)
+		}
+		fmt.Println("  note: probes ran a real one-shot request and consumed a trivial amount of provider quota")
+		fmt.Println()
+	}
 
 	bold.Println("Provider API keys")
 	for _, p := range providerEnvVars {
@@ -327,6 +473,23 @@ func printDoctorReport(r DoctorReport) {
 	}
 	fmt.Println()
 	fmt.Println("Tip: pipe to jq for tooling — `af doctor --json | jq`")
+}
+
+// printProbeLine renders one provider probe result with a status-colored mark.
+func printProbeLine(p HarnessProbeResult, ok, fail, warn *color.Color) {
+	mark, c := "✓", ok
+	switch p.Status {
+	case "empty", "timeout":
+		mark, c = "⚠", warn
+	case "error":
+		mark, c = "✗", fail
+	}
+	c.Printf("  %s %-12s  %s", mark, p.Provider, p.Status)
+	fmt.Printf("  (%dms)", p.DurationMS)
+	if p.Detail != "" {
+		fmt.Printf("  — %s", p.Detail)
+	}
+	fmt.Println()
 }
 
 func printToolLine(name string, status ToolStatus, ok, fail *color.Color) {

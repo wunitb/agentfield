@@ -77,8 +77,8 @@ func TestGitInstallerFindPackageRootAndRegistry(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(missingMain, "agentfield-package.yaml"), []byte("name: bad\nversion: 1.0.0\n"), 0644); err != nil {
 		t.Fatalf("write yaml: %v", err)
 	}
-	if _, err := gi.findPackageRoot(missingMain); err == nil || !strings.Contains(err.Error(), "main.py not found") {
-		t.Fatalf("expected main.py error, got %v", err)
+	if _, err := gi.findPackageRoot(missingMain); err == nil || !strings.Contains(err.Error(), "main.py") {
+		t.Fatalf("expected entrypoint/main.py error, got %v", err)
 	}
 
 	emptyRepo := t.TempDir()
@@ -90,7 +90,12 @@ func TestGitInstallerFindPackageRootAndRegistry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("parsePackageMetadata: %v", err)
 	}
-	info := &GitPackageInfo{URL: "https://gitlab.com/acme/repo", Ref: "main"}
+	// Provenance keeps the user's original source string verbatim — the ref
+	// (and any //subdir) already live inside it.
+	info, err := ParseGitURL("https://gitlab.com/acme/repo@main")
+	if err != nil {
+		t.Fatalf("ParseGitURL: %v", err)
+	}
 	dest := filepath.Join(home, "packages", "git-demo")
 	if err := gi.updateRegistryWithGit(metadata, info, repo, dest); err != nil {
 		t.Fatalf("updateRegistryWithGit: %v", err)
@@ -121,5 +126,30 @@ func TestGitInstallerErrorsWithoutGit(t *testing.T) {
 	_, err := gi.cloneRepository(&GitPackageInfo{CloneURL: "https://github.com/acme/repo"})
 	if err == nil || !strings.Contains(err.Error(), "git clone failed") {
 		t.Fatalf("expected cloneRepository failure, got %v", err)
+	}
+}
+
+func TestValidateCloneArgsRejectsOptionLikeValues(t *testing.T) {
+	cases := []struct {
+		name    string
+		info    GitPackageInfo
+		wantErr bool
+	}{
+		{"clean https url", GitPackageInfo{CloneURL: "https://github.com/o/r"}, false},
+		{"clean url with ref", GitPackageInfo{CloneURL: "https://github.com/o/r", Ref: "v1.2.3"}, false},
+		{"flag-like url", GitPackageInfo{CloneURL: "--upload-pack=touch /tmp/pwned"}, true},
+		{"flag-like ref", GitPackageInfo{CloneURL: "https://github.com/o/r", Ref: "--upload-pack=evil"}, true},
+		{"dash ref", GitPackageInfo{CloneURL: "https://github.com/o/r", Ref: "-b"}, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := validateCloneArgs(&tc.info)
+			if tc.wantErr && err == nil {
+				t.Fatal("expected error, got nil")
+			}
+			if !tc.wantErr && err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
 	}
 }

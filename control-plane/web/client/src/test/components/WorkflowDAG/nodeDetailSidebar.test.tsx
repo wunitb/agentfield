@@ -8,6 +8,17 @@ import { NodeDetailSidebar } from "@/components/WorkflowDAG/NodeDetailSidebar";
 
 const mockUseNodeDetails = vi.fn();
 
+vi.mock("@tanstack/react-query", () => ({
+  useQuery: () => ({
+    data: [],
+    isLoading: false,
+    isError: false,
+  }),
+  useQueryClient: () => ({
+    invalidateQueries: vi.fn(),
+  }),
+}));
+
 vi.mock("@/components/ui/icon-bridge", () => ({
   Close: () => <span>close</span>,
 }));
@@ -47,7 +58,34 @@ vi.mock("@/lib/theme", () => ({
       border: "error-border",
       accent: "error-accent",
     },
+    success: {
+      bg: "success-bg",
+      border: "success-border",
+      accent: "success-accent",
+    },
+    warning: {
+      bg: "warning-bg",
+      border: "warning-border",
+      accent: "warning-accent",
+    },
+    info: {
+      bg: "info-bg",
+      border: "info-border",
+      accent: "info-accent",
+    },
+    neutral: {
+      bg: "neutral-bg",
+      border: "neutral-border",
+      accent: "neutral-accent",
+    },
   },
+  getStatusTone: (tone: string) => ({
+    bg: `${tone}-bg`,
+    border: `${tone}-border`,
+    accent: `${tone}-accent`,
+    fg: `${tone}-fg`,
+  }),
+  getStatusBadgeClasses: (tone: string) => `${tone}-badge-classes`,
 }));
 
 vi.mock("@/lib/utils", () => ({
@@ -101,6 +139,9 @@ describe("NodeDetailSidebar", () => {
   it("renders loaded content, refetches on open, and closes from interactions", async () => {
     const refetch = vi.fn();
     const onClose = vi.fn();
+    const onRestartWorkflowFromNode = vi.fn();
+    const onRerunNodeOnly = vi.fn();
+    const onForkFromNode = vi.fn();
     const user = userEvent.setup();
 
     mockUseNodeDetails.mockReturnValue({
@@ -110,15 +151,41 @@ describe("NodeDetailSidebar", () => {
       refetch,
     });
 
-    render(<NodeDetailSidebar node={node} isOpen onClose={onClose} />);
+    render(
+      <NodeDetailSidebar
+        node={{
+          ...node,
+          reuse: {
+            hit: true,
+            source_execution_id: "exec-source",
+            source_run_id: "run-source",
+          },
+        }}
+        isOpen
+        onClose={onClose}
+        onRestartWorkflowFromNode={onRestartWorkflowFromNode}
+        onRerunNodeOnly={onRerunNodeOnly}
+        onForkFromNode={onForkFromNode}
+      />
+    );
 
     expect(screen.getByRole("dialog")).toBeInTheDocument();
     expect(screen.getByText("Execution Details")).toBeInTheDocument();
     expect(screen.getByText("My Task")).toBeInTheDocument();
+    expect(screen.getByText("Reused output")).toBeInTheDocument();
+    expect(screen.getByText("exec-source")).toBeInTheDocument();
+    expect(screen.getByText("run-source")).toBeInTheDocument();
     expect(screen.getByText("Data section")).toBeInTheDocument();
     expect(screen.getByText("Timing section")).toBeInTheDocument();
     expect(screen.getByText("Technical section")).toBeInTheDocument();
     expect(refetch).toHaveBeenCalledTimes(1);
+
+    await user.click(screen.getByRole("button", { name: /restart from here/i }));
+    await user.click(screen.getByRole("button", { name: /rerun node only/i }));
+    await user.click(screen.getByRole("button", { name: /fork with changes/i }));
+    expect(onRestartWorkflowFromNode).toHaveBeenCalledWith(expect.objectContaining({ execution_id: "exec-1" }));
+    expect(onRerunNodeOnly).toHaveBeenCalledWith(expect.objectContaining({ execution_id: "exec-1" }));
+    expect(onForkFromNode).toHaveBeenCalledWith(expect.objectContaining({ execution_id: "exec-1" }));
 
     fireEvent.keyDown(document, { key: "Escape" });
     expect(onClose).toHaveBeenCalledTimes(1);

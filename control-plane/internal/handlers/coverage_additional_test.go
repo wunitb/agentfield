@@ -96,6 +96,37 @@ func (s *workflowDAGStorageStub) ListExecutionWebhookEventsBatch(ctx context.Con
 	return out, nil
 }
 
+// GetInboundEventByWorkflowID is part of the StorageProvider surface that the
+// workflow_dag handler now consults via handlers.TriggerForRun. The stub
+// returns (nil, nil) so triggered enrichment cleanly degrades to "no
+// trigger" in tests that don't care about webhook origin.
+func (s *workflowDAGStorageStub) GetInboundEventByWorkflowID(context.Context, string) (*types.InboundEvent, error) {
+	return nil, nil
+}
+
+// SetInboundEventDispatchedWorkflow exists for parity — the dag handler
+// doesn't call it, but having the stub satisfy the interface keeps
+// compile-time invariants honest.
+func (s *workflowDAGStorageStub) SetInboundEventDispatchedWorkflow(context.Context, string, string) error {
+	return nil
+}
+
+// GetExecutionVC + GetInboundEvent are also reached by TriggerForExecution
+// when it falls back from the workflow-id path; both stubs return nil so
+// the trigger lookup returns nil cleanly without dereferencing the
+// embedded nil StorageProvider interface.
+func (s *workflowDAGStorageStub) GetExecutionVC(context.Context, string) (*types.ExecutionVCInfo, error) {
+	return nil, nil
+}
+
+func (s *workflowDAGStorageStub) GetInboundEvent(context.Context, string) (*types.InboundEvent, error) {
+	return nil, nil
+}
+
+func (s *workflowDAGStorageStub) GetTrigger(context.Context, string) (*types.Trigger, error) {
+	return nil, nil
+}
+
 func (s *workflowDAGStorageStub) ListExecutionVCs(ctx context.Context, filter types.VCFilters) ([]*types.ExecutionVCInfo, error) {
 	if s.vcErr != nil {
 		return nil, s.vcErr
@@ -128,17 +159,19 @@ func (s *cleanupStorageStub) CleanupWorkflow(ctx context.Context, workflowID str
 
 type nodeRESTStorageStub struct {
 	storage.StorageProvider
-	agent           *types.AgentNode
-	versionedAgent  *types.AgentNode
-	listAgents      []*types.AgentNode
-	getAgentErr     error
-	getVersionErr   error
-	listAgentsErr   error
-	heartbeats      []time.Time
-	lastHeartbeatID string
-	lastVersion     string
+	mu               sync.Mutex
+	agent            *types.AgentNode
+	versionedAgent   *types.AgentNode
+	listAgents       []*types.AgentNode
+	getAgentErr      error
+	getVersionErr    error
+	listAgentsErr    error
+	heartbeats       []time.Time
+	lastHeartbeatID  string
+	lastVersion      string
 	updatedLifecycle *types.AgentLifecycleStatus
 	registeredAgent  *types.AgentNode
+	healthUpdates    []types.HealthStatus
 }
 
 func (s *nodeRESTStorageStub) GetAgent(ctx context.Context, id string) (*types.AgentNode, error) {
@@ -162,9 +195,18 @@ func (s *nodeRESTStorageStub) GetAgentVersion(ctx context.Context, id, version s
 }
 
 func (s *nodeRESTStorageStub) UpdateAgentHeartbeat(ctx context.Context, id, version string, ts time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.lastHeartbeatID = id
 	s.lastVersion = version
 	s.heartbeats = append(s.heartbeats, ts)
+	return nil
+}
+
+func (s *nodeRESTStorageStub) UpdateAgentHealth(ctx context.Context, id string, status types.HealthStatus) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.healthUpdates = append(s.healthUpdates, status)
 	return nil
 }
 
@@ -186,6 +228,23 @@ func (s *nodeRESTStorageStub) RegisterAgent(ctx context.Context, agent *types.Ag
 	return nil
 }
 
+// Trigger stubs override the embedded nil StorageProvider interface so the
+// registration path's call to upsertCodeManagedTriggers + MarkOrphanedTriggers
+// doesn't deref nil. Tests in this file don't exercise trigger persistence
+// so empty no-ops are sufficient.
+func (s *nodeRESTStorageStub) UpsertCodeManagedTrigger(context.Context, *types.Trigger) (string, error) {
+	return "", nil
+}
+func (s *nodeRESTStorageStub) MarkOrphanedTriggers(context.Context, string, []string) error {
+	return nil
+}
+func (s *nodeRESTStorageStub) SetTriggerOverride(context.Context, string, bool, bool) error {
+	return nil
+}
+func (s *nodeRESTStorageStub) ConvertTriggerToUIManaged(context.Context, string) error {
+	return nil
+}
+
 type didServiceStub struct{}
 
 func (didServiceStub) RegisterAgent(req *types.DIDRegistrationRequest) (*types.DIDRegistrationResponse, error) {
@@ -193,7 +252,10 @@ func (didServiceStub) RegisterAgent(req *types.DIDRegistrationRequest) (*types.D
 }
 
 func (didServiceStub) ResolveDID(did string) (*types.DIDIdentity, error) { return nil, nil }
-func (didServiceStub) ListAllAgentDIDs() ([]string, error)                { return nil, nil }
+func (didServiceStub) ListAllAgentDIDs() ([]string, error)               { return nil, nil }
+func (didServiceStub) RotateAgentX25519Key(did string) (string, int, error) {
+	return "", 0, nil
+}
 
 type vcServiceStub struct{}
 
@@ -566,7 +628,7 @@ func TestNodeRESTHandlers_SuccessPaths(t *testing.T) {
 	t.Run("status lease updates heartbeat and returns lease", func(t *testing.T) {
 		store := &nodeRESTStorageStub{agent: agent}
 		router := gin.New()
-		router.PUT("/nodes/:node_id/status", NodeStatusLeaseHandler(store, nil, presence, 2*time.Minute))
+		router.PUT("/nodes/:node_id/status", NodeStatusLeaseHandler(store, nil, nil, presence, 2*time.Minute))
 
 		req := httptest.NewRequest(http.MethodPut, "/nodes/node-1/status", strings.NewReader(`{"phase":"ready","health_score":99}`))
 		req.Header.Set("Content-Type", "application/json")
@@ -582,7 +644,7 @@ func TestNodeRESTHandlers_SuccessPaths(t *testing.T) {
 	t.Run("pending approval only renews lease", func(t *testing.T) {
 		store := &nodeRESTStorageStub{agent: pendingAgent}
 		router := gin.New()
-		router.PUT("/nodes/:node_id/status", NodeStatusLeaseHandler(store, nil, presence, 0))
+		router.PUT("/nodes/:node_id/status", NodeStatusLeaseHandler(store, nil, nil, presence, 0))
 
 		req := httptest.NewRequest(http.MethodPut, "/nodes/node-pending/status", strings.NewReader(`{"phase":"offline"}`))
 		req.Header.Set("Content-Type", "application/json")

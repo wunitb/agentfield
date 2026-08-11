@@ -222,6 +222,7 @@ describe('Agent runtime paths', () => {
         version: '1.0.0',
         deployment_type: 'serverless',
         reasoners: [],
+        sessions: [],
         skills: []
       }
     });
@@ -438,7 +439,10 @@ describe('Agent runtime paths', () => {
   });
 
   it('call() delegates remote targets and note() emits only when execution metadata exists', async () => {
-    const agent = createAgent({ nodeId: 'agent-1', agentFieldUrl: 'http://control-plane.local/api/v1' });
+    // asyncExecution:false pins the classic synchronous execute() delegation
+    // path. The async default (executeAsync + poll) is covered separately in
+    // agent_async_execution.test.ts.
+    const agent = createAgent({ nodeId: 'agent-1', agentFieldUrl: 'http://control-plane.local/api/v1', asyncExecution: false });
     const execute = vi.spyOn(AgentFieldClient.prototype, 'execute').mockResolvedValue({ remote: true });
     const sendNote = vi.spyOn(AgentFieldClient.prototype, 'sendNote').mockImplementation(() => {});
 
@@ -451,7 +455,8 @@ describe('Agent runtime paths', () => {
         rootWorkflowId: 'root-remote',
         callerDid: 'did:caller:remote',
         targetDid: 'did:target:remote',
-        agentNodeDid: 'did:agent:remote'
+        agentNodeDid: 'did:agent:remote',
+        runAuthority: { homeId: 'home-a', runId: 'run-remote', leaseOwner: 'worker-a' }
       },
       req: {} as express.Request,
       res: {} as express.Response,
@@ -472,7 +477,8 @@ describe('Agent runtime paths', () => {
       callerDid: 'did:caller:remote',
       targetDid: 'did:target:remote',
       agentNodeDid: 'did:agent:remote',
-      agentNodeId: 'agent-1'
+      agentNodeId: 'agent-1',
+      runAuthority: { homeId: 'home-a', runId: 'run-remote', leaseOwner: 'worker-a' }
     }));
     expect(sendNote).toHaveBeenCalledTimes(1);
     expect(sendNote).toHaveBeenCalledWith(

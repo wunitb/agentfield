@@ -3,6 +3,11 @@ from typing import Any, Dict, List, Literal, Optional
 from pydantic import BaseModel, Field, computed_field
 from enum import Enum
 
+from agentfield.openrouter_attribution import (
+    apply_litellm_attribution,
+    apply_openrouter_usage_accounting,
+)
+
 
 class AgentStatus(str, Enum):
     """Agent lifecycle status enum matching the Go backend"""
@@ -20,12 +25,17 @@ class HeartbeatData:
     status: AgentStatus
     timestamp: str
     version: str = ""
+    # Per-process identifier. Sent on every heartbeat so the control plane
+    # can detect a redeploy even if the post-restart re-registration step
+    # was missed (e.g. dropped while the new process was still booting).
+    instance_id: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return {
             "status": self.status.value,
             "timestamp": self.timestamp,
             "version": self.version,
+            "instance_id": self.instance_id,
         }
 
 
@@ -76,6 +86,7 @@ class ExecutionHeaders:
     session_id: Optional[str] = None
     actor_id: Optional[str] = None
     parent_execution_id: Optional[str] = None
+    parent_vc_id: Optional[str] = None
 
     def to_headers(self) -> Dict[str, str]:
         headers = {"X-Run-ID": self.run_id}
@@ -83,6 +94,8 @@ class ExecutionHeaders:
             headers["X-Parent-Execution-ID"] = self.parent_execution_id
         if self.session_id:
             headers["X-Session-ID"] = self.session_id
+        if self.parent_vc_id:
+            headers["X-Parent-VC-ID"] = self.parent_vc_id
         if self.actor_id:
             headers["X-Actor-ID"] = self.actor_id
         return headers
@@ -308,6 +321,15 @@ class HarnessConfig(BaseModel):
     opencode_bin: str = Field(
         default="opencode", description="Path to opencode binary."
     )
+    schema_mode: str = Field(
+        default="single",
+        description=(
+            'How schema output is produced: "single" (one Write of the whole '
+            'object, default), "incremental" (build it one top-level field at a '
+            "time with field-level recovery — robust for large/deep schemas), or "
+            '"auto" (incremental only when the schema is large).'
+        ),
+    )
 
 
 class AIConfig(BaseModel):
@@ -376,10 +398,23 @@ class AIConfig(BaseModel):
         default="wav", description="Default format for audio output (wav, mp3)."
     )
 
-    # Fal.ai settings
+    # Media provider settings
     fal_api_key: Optional[str] = Field(
         default=None,
         description="Fal.ai API key. If not set, uses FAL_KEY environment variable.",
+    )
+    minimax_api_key: Optional[str] = Field(
+        default=None,
+        description=(
+            "MiniMax API key. If not set, uses MINIMAX_API_KEY environment variable."
+        ),
+    )
+    minimax_base_url: Optional[str] = Field(
+        default=None,
+        description=(
+            "MiniMax API base URL. Uses https://api.minimax.io/v1 by default; "
+            "set https://api.minimaxi.com/v1 for the China endpoint."
+        ),
     )
     video_model: str = Field(
         default="fal-ai/minimax-video/image-to-video",
@@ -465,6 +500,14 @@ class AIConfig(BaseModel):
     organization: Optional[str] = Field(
         default=None, description="Organization ID (for OpenAI)"
     )
+    openrouter_site_url: Optional[str] = Field(
+        default=None,
+        description="OpenRouter attribution site URL. Defaults to https://agentfield.ai.",
+    )
+    openrouter_app_name: Optional[str] = Field(
+        default=None,
+        description="OpenRouter attribution app title. Defaults to AgentField AI.",
+    )
 
     # Additional LiteLLM parameters that can be overridden
     litellm_params: Dict[str, Any] = Field(
@@ -512,6 +555,9 @@ class AIConfig(BaseModel):
         "gpt-4o-mini": 128000,
         "gpt-4": 8192,
         "gpt-3.5-turbo": 16385,
+        # GLM models
+        "openrouter/z-ai/glm-5.2": 131072,
+        "z-ai/glm-5.2": 131072,
         # Claude models
         "openrouter/anthropic/claude-3.5-sonnet": 200000,
         "openrouter/anthropic/claude-3-opus": 200000,
@@ -670,6 +716,15 @@ class AIConfig(BaseModel):
         )
         if provider == "openai" and "max_tokens" in params:
             params["max_completion_tokens"] = params.pop("max_tokens")
+
+        apply_litellm_attribution(
+            params,
+            site_url=self.openrouter_site_url,
+            app_name=self.openrouter_app_name,
+        )
+        # Opt into OpenRouter native cost accounting so responses carry
+        # usage.cost (read back in multimodal_response._resolve_cost).
+        apply_openrouter_usage_accounting(params)
 
         return params
 

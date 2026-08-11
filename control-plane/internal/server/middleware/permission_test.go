@@ -6,6 +6,7 @@ package middleware
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"io"
 	"net/http"
@@ -81,6 +82,26 @@ func setupPermissionRouter(
 	didResolver DIDResolverInterface,
 	handler gin.HandlerFunc,
 ) *gin.Engine {
+	return setupPermissionRouterWithConfig(
+		verifiedCallerDID,
+		policy,
+		tagVCVerifier,
+		agentResolver,
+		didResolver,
+		PermissionConfig{Enabled: true},
+		handler,
+	)
+}
+
+func setupPermissionRouterWithConfig(
+	verifiedCallerDID string,
+	policy AccessPolicyServiceInterface,
+	tagVCVerifier TagVCVerifierInterface,
+	agentResolver AgentResolverInterface,
+	didResolver DIDResolverInterface,
+	config PermissionConfig,
+	handler gin.HandlerFunc,
+) *gin.Engine {
 	gin.SetMode(gin.TestMode)
 
 	router := gin.New()
@@ -96,7 +117,7 @@ func setupPermissionRouter(
 		tagVCVerifier,
 		agentResolver,
 		didResolver,
-		PermissionConfig{Enabled: true},
+		config,
 	))
 
 	router.POST("/execute/:target", handler)
@@ -113,7 +134,7 @@ func TestPermissionCallerDIDResolutionPrecedence(t *testing.T) {
 		expectedTags      []string
 	}{
 		{
-			name:              "vc tags win over registration tags and header fallback",
+			name:              "vc tags win over registration tags and caller identity header",
 			verifiedCallerDID: "did:caller:vc",
 			didMappings:       map[string]string{"did:caller:vc": "caller-vc"},
 			headerCallerID:    "caller-header",
@@ -139,11 +160,17 @@ func TestPermissionCallerDIDResolutionPrecedence(t *testing.T) {
 			expectedTags:      []string{"registration-tag"},
 		},
 		{
-			name:           "header caller id is final fallback",
+			name:           "caller identity header ignored without verified did",
 			didMappings:    map[string]string{},
 			headerCallerID: "caller-header",
 			tagVerifier:    &permissionTagVCVerifierStub{},
-			expectedTags:   []string{"header-tag"},
+		},
+		{
+			name:              "caller identity header ignored when verified did is unresolved",
+			verifiedCallerDID: "did:caller:missing",
+			didMappings:       map[string]string{},
+			headerCallerID:    "caller-header",
+			tagVerifier:       &permissionTagVCVerifierStub{},
 		},
 	}
 
@@ -196,6 +223,97 @@ func TestPermissionCallerDIDResolutionPrecedence(t *testing.T) {
 			require.Equal(t, "run", policy.lastFunction)
 		})
 	}
+}
+
+func TestPermissionCallerNodeHeaderWithoutVerifiedDIDIsAnonymous(t *testing.T) {
+	policy := &permissionPolicyCapture{}
+	router := setupPermissionRouter(
+		"",
+		policy,
+		&permissionTagVCVerifierStub{},
+		&permissionAgentResolverStub{
+			agents: map[string]*types.AgentNode{
+				"target-agent": {
+					ID:           "target-agent",
+					ApprovedTags: []string{"target-tag"},
+				},
+				"caller-node": {
+					ID:           "caller-node",
+					ApprovedTags: []string{"node-header-tag"},
+				},
+			},
+		},
+		&permissionDIDResolverStub{dids: map[string]string{}},
+		func(c *gin.Context) {
+			c.Status(http.StatusOK)
+		},
+	)
+
+	req := httptest.NewRequest(http.MethodPost, "/execute/target-agent.run", bytes.NewBufferString(`{"input":{"limit":5}}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Agent-Node-ID", "caller-node")
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.Empty(t, policy.lastCallerTags)
+	require.Equal(t, []string{"target-tag"}, policy.lastTargetTags)
+	require.Equal(t, "run", policy.lastFunction)
+}
+
+func TestPermissionSpoofedCallerHeaderWithoutVerifiedDIDIsAnonymous(t *testing.T) {
+	policy := &permissionPolicyCapture{
+		evaluate: func(callerTags, _ []string, _ string, _ map[string]any) *types.PolicyEvaluationResult {
+			for _, tag := range callerTags {
+				if tag == "privileged" {
+					return &types.PolicyEvaluationResult{
+						Matched: true,
+						Allowed: true,
+					}
+				}
+			}
+			return &types.PolicyEvaluationResult{
+				Matched: true,
+				Allowed: false,
+			}
+		},
+	}
+	router := setupPermissionRouter(
+		"",
+		policy,
+		&permissionTagVCVerifierStub{},
+		&permissionAgentResolverStub{
+			agents: map[string]*types.AgentNode{
+				"target-agent": {
+					ID:           "target-agent",
+					ApprovedTags: []string{"target-tag"},
+				},
+				"privileged-agent": {
+					ID:           "privileged-agent",
+					ApprovedTags: []string{"privileged"},
+				},
+			},
+		},
+		&permissionDIDResolverStub{dids: map[string]string{}},
+		func(c *gin.Context) {
+			t.Fatal("handler should not be reached when only caller identity headers are present")
+		},
+	)
+
+	req := httptest.NewRequest(http.MethodPost, "/execute/target-agent.run", bytes.NewBufferString(`{"input":{"limit":5}}`))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Caller-Agent-ID", "privileged-agent")
+	req.Header.Set("X-Agent-Node-ID", "privileged-agent")
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+
+	require.Equal(t, http.StatusForbidden, recorder.Code)
+	require.Contains(t, recorder.Body.String(), "access_denied")
+	require.Empty(t, policy.lastCallerTags)
+	require.Equal(t, []string{"target-tag"}, policy.lastTargetTags)
+	require.Equal(t, "run", policy.lastFunction)
 }
 
 func TestPermissionRequestBodyReadAndRestored(t *testing.T) {
@@ -310,4 +428,175 @@ func TestParseTargetParam(t *testing.T) {
 	t.Run("missing function name should error", func(t *testing.T) {
 		t.Skip("source bug: parseTargetParam returns nil error when no function segment is present")
 	})
+}
+
+func defaultDenyTestResolver() *permissionAgentResolverStub {
+	return &permissionAgentResolverStub{
+		agents: map[string]*types.AgentNode{
+			"target-agent": {ID: "target-agent", ApprovedTags: []string{"target"}},
+			"caller-agent": {ID: "caller-agent", ApprovedTags: []string{"caller"}},
+		},
+	}
+}
+
+func defaultDenyTestDIDResolver() *permissionDIDResolverStub {
+	return &permissionDIDResolverStub{
+		dids: map[string]string{"did:caller": "caller-agent"},
+	}
+}
+
+func newDefaultDenyTestRequest() *http.Request {
+	req := httptest.NewRequest(http.MethodPost, "/execute/target-agent.run", bytes.NewBufferString(`{"input":{"limit":5}}`))
+	req.Header.Set("Content-Type", "application/json")
+	return req
+}
+
+func TestPermissionDefaultDenyOffAllowsUnmatched(t *testing.T) {
+	handlerCalled := false
+	router := setupPermissionRouterWithConfig(
+		"did:caller",
+		&permissionPolicyCapture{},
+		&permissionTagVCVerifierStub{},
+		defaultDenyTestResolver(),
+		defaultDenyTestDIDResolver(),
+		PermissionConfig{Enabled: true, DefaultDeny: false},
+		func(c *gin.Context) {
+			handlerCalled = true
+			c.Status(http.StatusOK)
+		},
+	)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, newDefaultDenyTestRequest())
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.True(t, handlerCalled, "handler should be reached when default_deny is off and no policy matches")
+}
+
+func TestPermissionDefaultDenyOnBlocksUnmatched(t *testing.T) {
+	router := setupPermissionRouterWithConfig(
+		"did:caller",
+		&permissionPolicyCapture{},
+		&permissionTagVCVerifierStub{},
+		defaultDenyTestResolver(),
+		defaultDenyTestDIDResolver(),
+		PermissionConfig{Enabled: true, DefaultDeny: true},
+		func(c *gin.Context) {
+			t.Fatal("handler should not be reached when default_deny blocks an unmatched request")
+		},
+	)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, newDefaultDenyTestRequest())
+
+	require.Equal(t, http.StatusForbidden, recorder.Code)
+
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &body))
+	require.Equal(t, "no_policy_matched", body["error"])
+	require.NotContains(t, body, "caller_tags", "tag list must not be exposed in the response body")
+	require.NotContains(t, body, "target_tags", "tag list must not be exposed in the response body")
+	require.NotContains(t, body, "function", "function name must not be exposed in the response body")
+}
+
+func TestPermissionDefaultDenyOnEmptyFunctionNameBlocks(t *testing.T) {
+	router := setupPermissionRouterWithConfig(
+		"did:caller",
+		&permissionPolicyCapture{},
+		&permissionTagVCVerifierStub{},
+		defaultDenyTestResolver(),
+		defaultDenyTestDIDResolver(),
+		PermissionConfig{Enabled: true, DefaultDeny: true},
+		func(c *gin.Context) {
+			t.Fatal("handler should not be reached when default_deny blocks a request with no function segment")
+		},
+	)
+
+	// Target without a "." segment — function name parses as empty string.
+	req := httptest.NewRequest(http.MethodPost, "/execute/target-agent", bytes.NewBufferString(`{}`))
+	req.Header.Set("Content-Type", "application/json")
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, req)
+
+	require.Equal(t, http.StatusForbidden, recorder.Code)
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &body))
+	require.Equal(t, "no_policy_matched", body["error"])
+}
+
+func TestPermissionDefaultDenyOnPolicyMatchedAllowsRequest(t *testing.T) {
+	policy := &permissionPolicyCapture{
+		evaluate: func(_, _ []string, _ string, _ map[string]any) *types.PolicyEvaluationResult {
+			return &types.PolicyEvaluationResult{Matched: true, Allowed: true}
+		},
+	}
+	handlerCalled := false
+	router := setupPermissionRouterWithConfig(
+		"did:caller",
+		policy,
+		&permissionTagVCVerifierStub{},
+		defaultDenyTestResolver(),
+		defaultDenyTestDIDResolver(),
+		PermissionConfig{Enabled: true, DefaultDeny: true},
+		func(c *gin.Context) {
+			handlerCalled = true
+			c.Status(http.StatusOK)
+		},
+	)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, newDefaultDenyTestRequest())
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.True(t, handlerCalled, "an explicit policy-allow result must not be overridden by default_deny")
+}
+
+func TestPermissionDefaultDenyOnPolicyMatchedDenyKeepsExistingDenyResponse(t *testing.T) {
+	policy := &permissionPolicyCapture{
+		evaluate: func(_, _ []string, _ string, _ map[string]any) *types.PolicyEvaluationResult {
+			return &types.PolicyEvaluationResult{Matched: true, Allowed: false}
+		},
+	}
+	router := setupPermissionRouterWithConfig(
+		"did:caller",
+		policy,
+		&permissionTagVCVerifierStub{},
+		defaultDenyTestResolver(),
+		defaultDenyTestDIDResolver(),
+		PermissionConfig{Enabled: true, DefaultDeny: true},
+		func(c *gin.Context) {
+			t.Fatal("handler should not be reached when an explicit policy denies access")
+		},
+	)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, newDefaultDenyTestRequest())
+
+	require.Equal(t, http.StatusForbidden, recorder.Code)
+	var body map[string]any
+	require.NoError(t, json.Unmarshal(recorder.Body.Bytes(), &body))
+	require.Equal(t, "access_denied", body["error"], "explicit deny must take precedence over the no_policy_matched response")
+}
+
+func TestPermissionDefaultDenyOnNoPolicyServiceIsNoop(t *testing.T) {
+	handlerCalled := false
+	router := setupPermissionRouterWithConfig(
+		"did:caller",
+		nil,
+		&permissionTagVCVerifierStub{},
+		defaultDenyTestResolver(),
+		defaultDenyTestDIDResolver(),
+		PermissionConfig{Enabled: true, DefaultDeny: true},
+		func(c *gin.Context) {
+			handlerCalled = true
+			c.Status(http.StatusOK)
+		},
+	)
+
+	recorder := httptest.NewRecorder()
+	router.ServeHTTP(recorder, newDefaultDenyTestRequest())
+
+	require.Equal(t, http.StatusOK, recorder.Code)
+	require.True(t, handlerCalled, "default_deny must not engage when no policy service is configured")
 }

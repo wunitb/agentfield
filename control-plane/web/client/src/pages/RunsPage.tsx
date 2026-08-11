@@ -1,21 +1,27 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useNavigate, useSearchParams } from "react-router-dom";
+import { Link, useNavigate, useSearchParams } from 'react-router';
 import {
   ArrowDown,
   ArrowLeftRight,
   ArrowUp,
   Check,
   Copy,
+  GitBranch,
   Play,
+  Star,
 } from "lucide-react";
 import { useQuery } from "@tanstack/react-query";
 import {
   useRuns,
-  useCancelExecution,
+  useCancelWorkflowTree,
   usePauseExecution,
+  useRestartExecution,
   useResumeExecution,
 } from "@/hooks/queries";
-import type { WorkflowSummary } from "@/types/workflows";
+import type {
+  WorkflowDAGLightweightNode,
+  WorkflowSummary,
+} from "@/types/workflows";
 import {
   getStatusLabel,
   isTerminalStatus,
@@ -44,6 +50,7 @@ import {
 } from "@/components/runs/RunLifecycleMenu";
 import { StatusDot } from "@/components/ui/status-pill";
 import { cn } from "@/lib/utils";
+import { statusTone } from "@/lib/theme";
 import {
   Table,
   TableBody,
@@ -90,10 +97,10 @@ import {
 } from "@/components/ui/select";
 import { useSidebar } from "@/components/ui/sidebar";
 import { SortableHeaderCell } from "@/components/ui/CompactTable";
+import { SourceIcon } from "@/components/triggers/SourceIcon";
 import { getExecutionDetails } from "@/services/executionsApi";
-import {
-  JsonHighlightedPre,
-} from "@/components/ui/json-syntax-highlight";
+import { getWorkflowDAGLightweight } from "@/services/workflowsApi";
+import { JsonHighlightedPre } from "@/components/ui/json-syntax-highlight";
 import {
   formatAbsoluteStarted,
   formatDuration,
@@ -103,6 +110,7 @@ import {
   hasMeaningfulPayload,
   shortRunIdDisplay,
 } from "@/pages/runsPageUtils";
+import { getExecutionErrorCategoryMeta } from "@/utils/executionErrorCategory";
 
 // ─── module-level singletons ──────────────────────────────────────────────────
 
@@ -179,7 +187,9 @@ function StartedAtCell({ run }: { run: WorkflowSummary }) {
       </TooltipTrigger>
       <TooltipContent side="left" className="max-w-xs text-xs">
         <p className="font-medium">Started</p>
-        <p className="mt-1 font-mono text-micro-plus text-muted-foreground">{absolute}</p>
+        <p className="mt-1 font-mono text-micro-plus text-muted-foreground">
+          {absolute}
+        </p>
         <p className="mt-1 text-muted-foreground">
           {liveGranular
             ? "Live elapsed time (updates every second)."
@@ -246,7 +256,9 @@ function DurationCell({ run }: { run: WorkflowSummary }) {
   // yet (e.g. queued and never dispatched), fall back to the dash.
   const startedMs = run.started_at ? new Date(run.started_at).getTime() : NaN;
   if (Number.isNaN(startedMs)) {
-    return <span className="text-xs tabular-nums text-muted-foreground">—</span>;
+    return (
+      <span className="text-xs tabular-nums text-muted-foreground">—</span>
+    );
   }
   const elapsed = Math.max(0, now - startedMs);
   return (
@@ -426,6 +438,19 @@ function StatusMenuDot({ canonical }: { canonical: CanonicalStatus }) {
 const PAGE_SIZE_OPTIONS = [10, 25, 50, 100] as const;
 const DEFAULT_PAGE_SIZE = 25;
 
+function pickRestartExecutionIdFromTimeline(
+  timeline: WorkflowDAGLightweightNode[] | undefined,
+  fallbackExecutionId: string,
+): string {
+  const failed = timeline?.find((node) => {
+    const status = normalizeExecutionStatus(node.status);
+    return (
+      status === "failed" || status === "timeout" || status === "cancelled"
+    );
+  });
+  return failed?.execution_id || fallbackExecutionId;
+}
+
 interface RunsPaginationBarProps {
   placement: "top" | "bottom";
   totalCount: number;
@@ -477,8 +502,8 @@ function RunsPaginationBar({
         <span className="font-medium text-foreground">
           {totalCount === 0 ? 0 : (page - 1) * pageSize + pageRowCount}
         </span>{" "}
-        of <span className="font-medium text-foreground">{totalCount}</span>{" "}
-        run{totalCount === 1 ? "" : "s"}
+        of <span className="font-medium text-foreground">{totalCount}</span> run
+        {totalCount === 1 ? "" : "s"}
       </p>
 
       <div className="flex flex-col items-center gap-3 sm:flex-row sm:gap-4">
@@ -552,8 +577,9 @@ function RunsPaginationBar({
 export function RunsPage() {
   const navigate = useNavigate();
   const [searchParams] = useSearchParams();
-  const cancelMutation = useCancelExecution();
+  const cancelTreeMutation = useCancelWorkflowTree();
   const pauseMutation = usePauseExecution();
+  const restartMutation = useRestartExecution();
   const resumeMutation = useResumeExecution();
   const showSuccess = useSuccessNotification();
   const showError = useErrorNotification();
@@ -618,7 +644,13 @@ export function RunsPage() {
         clearPending(execId);
       }
     },
-    [pauseMutation, showRunNotification, markPending, clearPending, runDisplayLabel],
+    [
+      pauseMutation,
+      showRunNotification,
+      markPending,
+      clearPending,
+      runDisplayLabel,
+    ],
   );
 
   const handleResumeRun = useCallback(
@@ -649,21 +681,38 @@ export function RunsPage() {
         clearPending(execId);
       }
     },
-    [resumeMutation, showRunNotification, markPending, clearPending, runDisplayLabel],
+    [
+      resumeMutation,
+      showRunNotification,
+      markPending,
+      clearPending,
+      runDisplayLabel,
+    ],
   );
 
   const handleCancelRun = useCallback(
     async (run: WorkflowSummary) => {
-      const execId = run.root_execution_id;
-      if (!execId) return;
-      markPending(execId);
+      // Use cancel-tree (bottom-up bulk cancel) rather than per-execution
+      // cancel — a run can have a terminated root with non-terminal
+      // children (zombied fan-out) and only the tree walk reaches them.
+      // Pending key is the root_execution_id when present (matches the
+      // existing optimistic-busy contract for the kebab spinner); falls
+      // back to run_id so we still spin when no root exec is recorded.
+      const pendingKey = run.root_execution_id ?? run.run_id;
+      markPending(pendingKey);
       try {
-        await cancelMutation.mutateAsync(execId);
+        const result = await cancelTreeMutation.mutateAsync({
+          workflowId: run.run_id,
+          reason: "user clicked cancel",
+        });
         showRunNotification({
           type: "success",
           eventKind: "cancel",
           title: "Cancelled",
-          message: `${runDisplayLabel(run)} will stop after its current step finishes. In-flight work will be discarded.`,
+          message:
+            result.cancelled_count > 0
+              ? `${runDisplayLabel(run)}: ${result.cancelled_count} ${result.cancelled_count === 1 ? "step" : "steps"} cancelled. In-flight work will finish and be discarded.`
+              : `${runDisplayLabel(run)}: nothing left to cancel.`,
           runId: run.run_id,
           runLabel: runDisplayLabel(run),
         });
@@ -677,10 +726,59 @@ export function RunsPage() {
           runLabel: runDisplayLabel(run),
         });
       } finally {
-        clearPending(execId);
+        clearPending(pendingKey);
       }
     },
-    [cancelMutation, showRunNotification, markPending, clearPending, runDisplayLabel],
+    [
+      cancelTreeMutation,
+      showRunNotification,
+      markPending,
+      clearPending,
+      runDisplayLabel,
+    ],
+  );
+
+  const handleRestartRun = useCallback(
+    async (run: WorkflowSummary) => {
+      const rootExecId = run.root_execution_id;
+      if (!rootExecId) return;
+      markPending(rootExecId);
+      try {
+        const dag = await getWorkflowDAGLightweight(run.run_id);
+        const restartExecutionId = pickRestartExecutionIdFromTimeline(
+          dag.timeline,
+          rootExecId,
+        );
+        const restarted = await restartMutation.mutateAsync(restartExecutionId);
+        showRunNotification({
+          type: "success",
+          eventKind: "resume",
+          title: "Restarted",
+          message: `${runDisplayLabel(run)} started as ${restarted.run_id.slice(0, 8)} with prior successful calls available for replay.`,
+          runId: restarted.run_id,
+          runLabel: runDisplayLabel(run),
+        });
+      } catch (err) {
+        showRunNotification({
+          type: "error",
+          eventKind: "error",
+          title: "Restart failed",
+          message:
+            err instanceof Error ? err.message : "Unable to restart run.",
+          runId: run.run_id,
+          runLabel: runDisplayLabel(run),
+        });
+      } finally {
+        clearPending(rootExecId);
+      }
+    },
+    [
+      restartMutation,
+      showRunNotification,
+      markPending,
+      clearPending,
+      runDisplayLabel,
+    ],
   );
 
   // Bulk confirmation dialog state — a single shared AlertDialog for the
@@ -695,16 +793,24 @@ export function RunsPage() {
       return { left: pad, right: pad } as const;
     }
     const w =
-      sidebarState === "collapsed" ? "var(--sidebar-width-icon)" : "var(--sidebar-width)";
+      sidebarState === "collapsed"
+        ? "var(--sidebar-width-icon)"
+        : "var(--sidebar-width)";
     return { left: `calc(${w} + ${pad})`, right: pad } as const;
   }, [isMobile, sidebarState]);
 
   // filter state
   const [timeRange, setTimeRange] = useState("all");
   /** Empty set = all statuses (no restriction). */
-  const [selectedStatuses, setSelectedStatuses] = useState<Set<string>>(() => new Set());
-  const [search, setSearch] = useState("");
-  const [debouncedSearch, setDebouncedSearch] = useState("");
+  const [selectedStatuses, setSelectedStatuses] = useState<Set<string>>(
+    () => new Set(),
+  );
+  const [showGoldenOnly, setShowGoldenOnly] = useState(false);
+  // Seed search from ?search= URL param so deep links from the trigger sheet's
+  // Dispatch target chip (e.g. /runs?search=summarize_issue) land pre-filtered.
+  const initialSearch = searchParams.get("search") ?? "";
+  const [search, setSearch] = useState(initialSearch);
+  const [debouncedSearch, setDebouncedSearch] = useState(initialSearch);
   const statusParam = searchParams.get("status");
 
   const statusFilterKey = useMemo(
@@ -775,13 +881,7 @@ export function RunsPage() {
         sortOrder,
       };
     }
-  }, [
-    timeRange,
-    statusFilterKey,
-    debouncedSearch,
-    sortBy,
-    sortOrder,
-  ]);
+  }, [timeRange, statusFilterKey, debouncedSearch, sortBy, sortOrder]);
 
   const filters = useMemo(
     () => ({
@@ -825,6 +925,7 @@ export function RunsPage() {
   const hasActiveFilters =
     timeRange !== "all" ||
     selectedStatuses.size > 0 ||
+    showGoldenOnly ||
     search.trim() !== "" ||
     debouncedSearch.trim() !== "";
 
@@ -835,6 +936,7 @@ export function RunsPage() {
     }
     setTimeRange("all");
     setSelectedStatuses(new Set());
+    setShowGoldenOnly(false);
     setSearch("");
     setDebouncedSearch("");
     setSelected(new Set());
@@ -851,13 +953,18 @@ export function RunsPage() {
   /** Server applies status when exactly one is selected; otherwise narrow here (multi-status OR). */
   const filteredRuns = useMemo(() => {
     let rows = pageRows;
+    if (showGoldenOnly) {
+      rows = rows.filter((r) => Boolean(r.golden));
+    }
     if (selectedStatuses.size > 1) {
       rows = rows.filter((r) =>
-        selectedStatuses.has(normalizeExecutionStatus(r.root_execution_status ?? r.status)),
+        selectedStatuses.has(
+          normalizeExecutionStatus(r.root_execution_status ?? r.status),
+        ),
       );
     }
     return rows;
-  }, [pageRows, selectedStatuses]);
+  }, [pageRows, selectedStatuses, showGoldenOnly]);
 
   // row click
   const handleRowClick = useCallback(
@@ -868,21 +975,18 @@ export function RunsPage() {
   );
 
   // checkbox selection
-  const toggleSelect = useCallback(
-    (runId: string, e: React.MouseEvent) => {
-      e.stopPropagation();
-      setSelected((prev) => {
-        const next = new Set(prev);
-        if (next.has(runId)) {
-          next.delete(runId);
-        } else {
-          next.add(runId);
-        }
-        return next;
-      });
-    },
-    [],
-  );
+  const toggleSelect = useCallback((runId: string, e: React.MouseEvent) => {
+    e.stopPropagation();
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(runId)) {
+        next.delete(runId);
+      } else {
+        next.add(runId);
+      }
+      return next;
+    });
+  }, []);
 
   const toggleSelectAll = useCallback(() => {
     if (selected.size === filteredRuns.length && filteredRuns.length > 0) {
@@ -895,6 +999,14 @@ export function RunsPage() {
   const allSelected =
     filteredRuns.length > 0 && selected.size === filteredRuns.length;
   const someSelected = selected.size > 0 && !allSelected;
+  const hasClientSideRowFilter = showGoldenOnly || selectedStatuses.size > 1;
+  const visibleTotalCount = hasClientSideRowFilter
+    ? filteredRuns.length
+    : totalCount;
+  const visibleTotalPages = hasClientSideRowFilter ? 1 : totalPages;
+  const visiblePageRowCount = hasClientSideRowFilter
+    ? filteredRuns.length
+    : pageRows.length;
 
   const handleFilterChange = useCallback(
     (setter: (v: string) => void) => (value: string) => {
@@ -951,6 +1063,22 @@ export function RunsPage() {
               onSelectedChange={handleStatusesFilterChange}
               pluralLabel={(n) => `${n} statuses`}
             />
+            <Button
+              type="button"
+              variant={showGoldenOnly ? "secondary" : "outline"}
+              size="sm"
+              className="h-8 gap-1.5"
+              onClick={() => {
+                setShowGoldenOnly((value) => !value);
+                setPage(1);
+              }}
+            >
+              <Star
+                className={cn("size-3.5", statusTone.warning.accent)}
+                aria-hidden
+              />
+              Golden
+            </Button>
           </div>
 
           <Separator
@@ -985,11 +1113,11 @@ export function RunsPage() {
 
       <RunsPaginationBar
         placement="top"
-        totalCount={totalCount}
-        totalPages={totalPages}
+        totalCount={visibleTotalCount}
+        totalPages={visibleTotalPages}
         page={page}
         pageSize={pageSize}
-        pageRowCount={pageRows.length}
+        pageRowCount={visiblePageRowCount}
         isFetching={isFetching}
         setPage={setPage}
         setPageSize={setPageSize}
@@ -997,112 +1125,155 @@ export function RunsPage() {
 
       {/* Table */}
       <TooltipProvider delayDuration={400}>
-      <div
-        className={cn(
-          "rounded-lg border border-border bg-card transition-opacity",
-          isFetching && "opacity-[0.72]",
-        )}
-      >
-        <Table className="text-xs">
-          <TableHeader>
-            <TableRow>
-              {/* Checkbox */}
-              <TableHead className="h-8 w-10 px-3 text-micro-plus font-medium text-muted-foreground">
-                <Checkbox
-                  checked={allSelected}
-                  data-state={someSelected ? "indeterminate" : undefined}
-                  onCheckedChange={toggleSelectAll}
-                  aria-label="Select all"
-                />
-              </TableHead>
-              {/* Status first — most scannable */}
-              <TableHead className="h-8 px-3 w-24"><SortableHeaderCell field="status" label="Status" sortBy={sortBy} sortOrder={sortOrder as "asc" | "desc"} onSortChange={handleSortClick} /></TableHead>
-              {/* Target + short run id (full id via copy) */}
-              <TableHead
-                className="h-8 px-3 text-micro-plus font-medium text-muted-foreground min-w-0"
-                title="Hover the input/output icon next to a reasoner to preview input / output without leaving the list."
-              >
-                <span className="inline-flex items-center gap-1.5">
-                  Target
-                  <ArrowLeftRight
-                    className="size-3 shrink-0 opacity-45"
-                    aria-hidden
+        <div
+          className={cn(
+            "rounded-lg border border-border bg-card transition-opacity",
+            isFetching && "opacity-[0.72]",
+          )}
+        >
+          <Table className="text-xs">
+            <TableHeader>
+              <TableRow>
+                {/* Checkbox */}
+                <TableHead className="h-8 w-10 px-3 text-micro-plus font-medium text-muted-foreground">
+                  <Checkbox
+                    checked={allSelected}
+                    data-state={someSelected ? "indeterminate" : undefined}
+                    onCheckedChange={toggleSelectAll}
+                    aria-label="Select all"
                   />
-                </span>
-              </TableHead>
-              {/* Steps — complexity */}
-              <TableHead className="h-8 px-3 w-20"><SortableHeaderCell field="total_executions" label="Steps" sortBy={sortBy} sortOrder={sortOrder as "asc" | "desc"} onSortChange={handleSortClick} /></TableHead>
-              {/* Duration — performance */}
-              <TableHead className="h-8 px-3 w-24"><SortableHeaderCell field="duration_ms" label="Duration" sortBy={sortBy} sortOrder={sortOrder as "asc" | "desc"} onSortChange={handleSortClick} /></TableHead>
-              {/* Started — when (relative) */}
-              <TableHead className="h-8 px-3 min-w-[9.5rem] w-44"><SortableHeaderCell field="latest_activity" label="Started" sortBy={sortBy} sortOrder={sortOrder as "asc" | "desc"} onSortChange={handleSortClick} /></TableHead>
-              {/* Lifecycle actions (kebab) — right-anchored, no header label */}
-              <TableHead
-                className="h-8 w-10 px-2 text-right"
-                aria-label="Row actions"
-              />
-            </TableRow>
-          </TableHeader>
-          <TableBody>
-            {loadingInitial ? (
-              <TableRow>
-                <TableCell colSpan={7} className="p-8 text-center text-muted-foreground text-xs">
-                  Loading runs…
-                </TableCell>
-              </TableRow>
-            ) : isError ? (
-              <TableRow>
-                <TableCell colSpan={7} className="p-8 text-center text-destructive text-xs">
-                  {error instanceof Error ? error.message : "Failed to load runs"}
-                </TableCell>
-              </TableRow>
-            ) : filteredRuns.length === 0 ? (
-              <TableRow>
-                <TableCell colSpan={7} className="p-8">
-                  <div className="flex flex-col items-center justify-center py-8 text-center">
-                    <Play className="size-8 text-muted-foreground/30 mb-3" />
-                    <p className="text-sm font-medium text-muted-foreground">No runs found</p>
-                    <p className="text-xs text-muted-foreground mt-1">
-                      {pageRows.length > 0 && selectedStatuses.size > 0
-                        ? "No rows match the current status filters on this page. Try clearing filters or another page."
-                        : timeRange !== "all"
-                          ? "Try expanding the time range"
-                          : "Execute a reasoner to create your first run"}
-                    </p>
-                  </div>
-                </TableCell>
-              </TableRow>
-            ) : (
-              filteredRuns.map((run) => (
-                <RunRow
-                  key={run.run_id}
-                  run={run}
-                  isSelected={selected.has(run.run_id)}
-                  isPending={
-                    run.root_execution_id
-                      ? pendingIds.has(run.root_execution_id)
-                      : false
-                  }
-                  onRowClick={handleRowClick}
-                  onToggleSelect={toggleSelect}
-                  onPauseRun={handlePauseRun}
-                  onResumeRun={handleResumeRun}
-                  onCancelRun={handleCancelRun}
+                </TableHead>
+                {/* Status first — most scannable */}
+                <TableHead className="h-8 px-3 w-44 min-w-[11rem]">
+                  <SortableHeaderCell
+                    field="status"
+                    label="Status"
+                    sortBy={sortBy}
+                    sortOrder={sortOrder as "asc" | "desc"}
+                    onSortChange={handleSortClick}
+                  />
+                </TableHead>
+                {/* Target + short run id (full id via copy) */}
+                <TableHead
+                  className="h-8 px-3 text-micro-plus font-medium text-muted-foreground min-w-0"
+                  title="Hover the input/output icon next to a reasoner to preview input / output without leaving the list."
+                >
+                  <span className="inline-flex items-center gap-1.5">
+                    Target
+                    <ArrowLeftRight
+                      className="size-3 shrink-0 opacity-45"
+                      aria-hidden
+                    />
+                  </span>
+                </TableHead>
+                {/* Steps — complexity */}
+                <TableHead className="h-8 px-3 w-20">
+                  <SortableHeaderCell
+                    field="total_executions"
+                    label="Steps"
+                    sortBy={sortBy}
+                    sortOrder={sortOrder as "asc" | "desc"}
+                    onSortChange={handleSortClick}
+                  />
+                </TableHead>
+                {/* Duration — performance */}
+                <TableHead className="h-8 px-3 w-24">
+                  <SortableHeaderCell
+                    field="duration_ms"
+                    label="Duration"
+                    sortBy={sortBy}
+                    sortOrder={sortOrder as "asc" | "desc"}
+                    onSortChange={handleSortClick}
+                  />
+                </TableHead>
+                {/* Started — when (relative) */}
+                <TableHead className="h-8 px-3 min-w-[9.5rem] w-44">
+                  <SortableHeaderCell
+                    field="latest_activity"
+                    label="Started"
+                    sortBy={sortBy}
+                    sortOrder={sortOrder as "asc" | "desc"}
+                    onSortChange={handleSortClick}
+                  />
+                </TableHead>
+                {/* Lifecycle actions (kebab) — right-anchored, no header label */}
+                <TableHead
+                  className="h-8 w-10 px-2 text-right"
+                  aria-label="Row actions"
                 />
-              ))
-            )}
-          </TableBody>
-        </Table>
-      </div>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {loadingInitial ? (
+                <TableRow>
+                  <TableCell
+                    colSpan={7}
+                    className="p-8 text-center text-muted-foreground text-xs"
+                  >
+                    Loading runs…
+                  </TableCell>
+                </TableRow>
+              ) : isError ? (
+                <TableRow>
+                  <TableCell
+                    colSpan={7}
+                    className="p-8 text-center text-destructive text-xs"
+                  >
+                    {error instanceof Error
+                      ? error.message
+                      : "Failed to load runs"}
+                  </TableCell>
+                </TableRow>
+              ) : filteredRuns.length === 0 ? (
+                <TableRow>
+                  <TableCell colSpan={7} className="p-8">
+                    <div className="flex flex-col items-center justify-center py-8 text-center">
+                      <Play className="size-8 text-muted-foreground/30 mb-3" />
+                      <p className="text-sm font-medium text-muted-foreground">
+                        No runs found
+                      </p>
+                      <p className="text-xs text-muted-foreground mt-1">
+                        {pageRows.length > 0 && selectedStatuses.size > 0
+                          ? "No rows match the current status filters on this page. Try clearing filters or another page."
+                          : timeRange !== "all"
+                            ? "Try expanding the time range"
+                            : "Execute a reasoner to create your first run"}
+                      </p>
+                    </div>
+                  </TableCell>
+                </TableRow>
+              ) : (
+                filteredRuns.map((run) => (
+                  <RunRow
+                    key={run.run_id}
+                    run={run}
+                    isSelected={selected.has(run.run_id)}
+                    isPending={
+                      run.root_execution_id
+                        ? pendingIds.has(run.root_execution_id)
+                        : false
+                    }
+                    onRowClick={handleRowClick}
+                    onToggleSelect={toggleSelect}
+                    onPauseRun={handlePauseRun}
+                    onResumeRun={handleResumeRun}
+                    onCancelRun={handleCancelRun}
+                    onRestartRun={handleRestartRun}
+                  />
+                ))
+              )}
+            </TableBody>
+          </Table>
+        </div>
       </TooltipProvider>
 
       <RunsPaginationBar
         placement="bottom"
-        totalCount={totalCount}
-        totalPages={totalPages}
+        totalCount={visibleTotalCount}
+        totalPages={visibleTotalPages}
         page={page}
         pageSize={pageSize}
-        pageRowCount={pageRows.length}
+        pageRowCount={visiblePageRowCount}
         isFetching={isFetching}
         setPage={setPage}
         setPageSize={setPageSize}
@@ -1211,23 +1382,31 @@ export function RunsPage() {
               disabled={bulkBusy}
               className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
               onClick={async () => {
+                // Bulk cancel uses cancel-tree per run — same reason as the
+                // per-row path: a run with a terminated root and zombied
+                // children needs the bottom-up walk to actually flip every
+                // execution. We gate inclusion on aggregate `r.status` being
+                // non-terminal (not the root's status) so users can sweep
+                // up zombies even when the root has succeeded.
                 const targets = [...selected]
                   .map((id) => filteredRuns.find((r) => r.run_id === id))
                   .filter(
                     (r): r is WorkflowSummary =>
-                      !!r &&
-                      !isTerminalStatus(r.root_execution_status ?? r.status) &&
-                      !!r.root_execution_id,
+                      !!r && !isTerminalStatus(r.status),
                   );
                 setBulkCancelOpen(false);
                 await runBulkMutation({
                   targets,
                   run: async (r) => {
-                    markPending(r.root_execution_id!);
+                    const pendingKey = r.root_execution_id ?? r.run_id;
+                    markPending(pendingKey);
                     try {
-                      await cancelMutation.mutateAsync(r.root_execution_id!);
+                      await cancelTreeMutation.mutateAsync({
+                        workflowId: r.run_id,
+                        reason: "user clicked bulk cancel",
+                      });
                     } finally {
-                      clearPending(r.root_execution_id!);
+                      clearPending(pendingKey);
                     }
                   },
                   verb: "cancelled",
@@ -1245,9 +1424,7 @@ export function RunsPage() {
                   .map((id) => filteredRuns.find((r) => r.run_id === id))
                   .filter(
                     (r): r is WorkflowSummary =>
-                      !!r &&
-                      !isTerminalStatus(r.root_execution_status ?? r.status) &&
-                      !!r.root_execution_id,
+                      !!r && !isTerminalStatus(r.status),
                   );
                 return CANCEL_RUN_COPY.confirmLabel(cancellable.length);
               })()}
@@ -1458,6 +1635,89 @@ function BulkActionBar({
 
 // ─── row sub-component ────────────────────────────────────────────────────────
 
+/**
+ * TriggerBadge renders an icon-tile for the inbound webhook source if the
+ * run was triggered by one. Hover shows event_type + idempotency key + a
+ * "view trigger" action; click jumps straight to the trigger sheet so the
+ * operator can inspect the upstream webhook.
+ */
+function TriggerBadge({ run }: { run: WorkflowSummary }) {
+  const navigate = useNavigate();
+  if (!run.trigger) {
+    return null;
+  }
+  const trigger = run.trigger;
+  const sourceLabel =
+    trigger.source_name.charAt(0).toUpperCase() + trigger.source_name.slice(1);
+  return (
+    <HoverCard openDelay={180} closeDelay={80}>
+      <HoverCardTrigger asChild>
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            navigate(
+              `/triggers?trigger=${encodeURIComponent(trigger.trigger_id)}` +
+                (trigger.event_id
+                  ? `&event=${encodeURIComponent(trigger.event_id)}`
+                  : ""),
+            );
+          }}
+          className={cn(
+            "inline-flex h-6 shrink-0 items-center gap-1.5 rounded-md border border-border/60 bg-muted/30 px-1.5",
+            "text-muted-foreground transition-colors hover:border-border hover:bg-muted/60 hover:text-foreground",
+            "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background",
+          )}
+          aria-label={`Triggered by ${sourceLabel} — view trigger`}
+        >
+          <SourceIcon
+            source={trigger.source_name}
+            size="compact"
+            className="size-4 border-none bg-transparent p-0"
+            iconClassName="size-3.5"
+          />
+          <span className="text-micro-plus font-medium">
+            {trigger.source_name}
+          </span>
+        </button>
+      </HoverCardTrigger>
+      <HoverCardContent
+        className="w-72 overflow-hidden border-border/80 p-0 shadow-md"
+        side="bottom"
+        align="start"
+        sideOffset={6}
+      >
+        <div className="flex flex-col gap-2 p-3">
+          <div className="flex items-center gap-2">
+            <SourceIcon source={trigger.source_name} size="default" />
+            <div className="min-w-0">
+              <p className="truncate text-sm font-medium lowercase">
+                {trigger.source_name}
+              </p>
+              <p className="truncate text-xs text-muted-foreground">
+                {trigger.event_type || "All events"}
+              </p>
+            </div>
+          </div>
+          {trigger.idempotency_key ? (
+            <div className="flex flex-col gap-0.5 border-t border-border/60 pt-2">
+              <span className="text-micro uppercase tracking-wider text-muted-foreground/80">
+                Idempotency key
+              </span>
+              <code className="truncate font-mono text-xs text-foreground/90">
+                {trigger.idempotency_key}
+              </code>
+            </div>
+          ) : null}
+          <p className="text-xs text-muted-foreground">
+            Click to open this trigger in the operator sheet.
+          </p>
+        </div>
+      </HoverCardContent>
+    </HoverCard>
+  );
+}
+
 interface RunRowProps {
   run: WorkflowSummary;
   isSelected: boolean;
@@ -1467,6 +1727,7 @@ interface RunRowProps {
   onPauseRun: (run: WorkflowSummary) => void;
   onResumeRun: (run: WorkflowSummary) => void;
   onCancelRun: (run: WorkflowSummary) => void;
+  onRestartRun: (run: WorkflowSummary) => void;
 }
 
 function RunRow({
@@ -1478,10 +1739,15 @@ function RunRow({
   onPauseRun,
   onResumeRun,
   onCancelRun,
+  onRestartRun,
 }: RunRowProps) {
   const agentLabel = run.agent_id || run.agent_name || "";
   const reasonerLabel = run.root_reasoner || run.display_name || "—";
   const [copied, setCopied] = useState(false);
+  const errorMeta =
+    (run.root_execution_status ?? run.status) === "failed"
+      ? getExecutionErrorCategoryMeta(run.root_error_category)
+      : null;
 
   return (
     <TableRow
@@ -1490,14 +1756,17 @@ function RunRow({
       tabIndex={0}
       onClick={() => onRowClick(run)}
       onKeyDown={(e) => {
-        if (e.key === 'Enter' || e.key === ' ') {
+        if (e.key === "Enter" || e.key === " ") {
           e.preventDefault();
           onRowClick(run);
         }
       }}
     >
       {/* Checkbox */}
-      <TableCell className="w-10" onClick={(e) => onToggleSelect(run.run_id, e)}>
+      <TableCell
+        className="w-10"
+        onClick={(e) => onToggleSelect(run.run_id, e)}
+      >
         <Checkbox
           checked={isSelected}
           aria-label={`Select run ${run.run_id}`}
@@ -1506,17 +1775,38 @@ function RunRow({
       </TableCell>
       {/* Status dot — prefer the root execution status so pause/cancel are
           reflected immediately, even when stragglers are still in-flight */}
-      <TableCell className="w-24">
-        <StatusDot status={run.root_execution_status ?? run.status} />
+      <TableCell className="w-44 min-w-[11rem]">
+        <div className="flex min-w-0 max-w-full flex-col items-start gap-1">
+          <StatusDot status={run.root_execution_status ?? run.status} />
+          {errorMeta ? (
+            <div className="flex min-w-0 max-w-full items-center gap-1">
+              <span
+                title={errorMeta.tooltip}
+                className={cn(
+                  badgeVariants({ variant: "outline", size: "sm" }),
+                  "h-5 min-w-0 max-w-full truncate whitespace-nowrap px-1.5 text-micro-plus capitalize",
+                  errorMeta.badgeClassName,
+                )}
+              >
+                {errorMeta.label}
+              </span>
+              {errorMeta.diagnosticsLabel && errorMeta.diagnosticsPath ? (
+                <Link
+                  to={errorMeta.diagnosticsPath}
+                  className="shrink-0 text-micro-plus text-sky-600 underline-offset-2 hover:underline dark:text-sky-400"
+                  onClick={(e) => e.stopPropagation()}
+                >
+                  {errorMeta.diagnosticsLabel}
+                </Link>
+              ) : null}
+            </div>
+          ) : null}
+        </div>
       </TableCell>
       {/* Target name, then inline copy-chip for run id (no sub-column) */}
-      <TableCell
-        className="min-w-0 max-w-[min(36rem,72vw)]"
-      >
+      <TableCell className="min-w-0 max-w-[min(36rem,72vw)]">
         <div className="flex min-w-0 flex-wrap items-center gap-x-1.5 gap-y-1">
-          <span
-            className="inline-block min-w-0 max-w-[min(100%,20rem)] truncate text-xs font-medium font-mono hover:underline hover:underline-offset-2"
-          >
+          <span className="inline-block min-w-0 max-w-[min(100%,20rem)] truncate text-xs font-medium font-mono hover:underline hover:underline-offset-2">
             {agentLabel ? (
               <>
                 <span className="text-muted-foreground">{agentLabel}.</span>
@@ -1541,7 +1831,11 @@ function RunRow({
                   aria-label="Preview run input and output"
                   onClick={(e) => e.stopPropagation()}
                 >
-                  <ArrowLeftRight className="size-3.5" strokeWidth={2} aria-hidden />
+                  <ArrowLeftRight
+                    className="size-3.5"
+                    strokeWidth={2}
+                    aria-hidden
+                  />
                 </button>
               </HoverCardTrigger>
               <HoverCardContent
@@ -1554,6 +1848,39 @@ function RunRow({
               </HoverCardContent>
             </HoverCard>
           ) : null}
+          {run.golden ? (
+            <span
+              className={cn(
+                badgeVariants({ variant: "outline", size: "sm" }),
+                "h-5 gap-1",
+                statusTone.warning.fg,
+                statusTone.warning.border,
+              )}
+              title={run.golden.name || "Golden run"}
+            >
+              <Star className="size-3" aria-hidden />
+              Golden
+            </span>
+          ) : null}
+          {run.lineage?.source_run_id ? (
+            <Link
+              to={`/runs/${encodeURIComponent(run.lineage.source_run_id)}`}
+              className={cn(
+                badgeVariants({ variant: "metadata", size: "sm" }),
+                "h-5 gap-1 transition-colors",
+                "hover:bg-muted/70 hover:text-foreground",
+                statusTone.info.border,
+              )}
+              title={`Source run ${run.lineage.source_run_id}`}
+              onClick={(e) => e.stopPropagation()}
+            >
+              <GitBranch
+                className={cn("size-3", statusTone.info.accent)}
+                aria-hidden
+              />
+              {run.lineage.kind === "fork" ? "Forked" : "Restarted"}
+            </Link>
+          ) : null}
           <button
             type="button"
             className={cn(
@@ -1561,7 +1888,8 @@ function RunRow({
               "h-6 shrink-0 cursor-pointer gap-1 rounded-full border-border/70 px-2 py-0 font-mono tabular-nums",
               "text-muted-foreground transition-colors hover:border-border hover:bg-muted/70 hover:text-foreground",
               "focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring focus-visible:ring-offset-2 focus-visible:ring-offset-background",
-              copied && "border-green-500/50 text-green-600 dark:text-green-400",
+              copied &&
+                `${statusTone.success.border} ${statusTone.success.fg}`,
             )}
             title={copied ? "Copied!" : run.run_id}
             aria-label={copied ? "Copied!" : `Copy run ID ${run.run_id}`}
@@ -1579,6 +1907,7 @@ function RunRow({
               <Copy className="size-3 shrink-0 opacity-60" aria-hidden />
             )}
           </button>
+          <TriggerBadge run={run} />
         </div>
       </TableCell>
       {/* Steps */}
@@ -1607,6 +1936,7 @@ function RunRow({
           onPause={onPauseRun}
           onResume={onResumeRun}
           onCancel={onCancelRun}
+          onRestart={onRestartRun}
         />
       </TableCell>
     </TableRow>

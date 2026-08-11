@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from types import SimpleNamespace
 
 import pytest
@@ -23,11 +24,11 @@ class DemoSchema(BaseModel):
 
 
 class MockProvider:
-    def __init__(self, results=None):
-        self.results = results or []
-        self.call_count = 0
-        self.last_prompt = None
-        self.last_options = None
+    def __init__(self, results: list[RawResult] | None = None) -> None:
+        self.results: list[RawResult] = results or []
+        self.call_count: int = 0
+        self.last_prompt: str | None = None
+        self.last_options: dict[str, object] | None = None
 
     async def execute(self, prompt: str, options: dict) -> RawResult:
         self.call_count += 1
@@ -48,6 +49,70 @@ class FileWritingProvider(MockProvider):
         with open(output_path, "w", encoding="utf-8") as file_obj:
             file_obj.write(self.payload)
         return await super().execute(prompt, options)
+
+
+class PromptPathWritingProvider(MockProvider):
+    """Mock that writes valid JSON to the absolute output path named in the
+    prompt suffix — faithfully mimicking how a real coding agent learns where
+    to write (it never sees the runner's internal output_dir, only the prompt).
+    """
+
+    def __init__(self, payload: str):
+        super().__init__([RawResult(result="ok")])
+        self.payload = payload
+        self.output_path_in_prompt: str | None = None
+
+    async def execute(self, prompt: str, options: dict) -> RawResult:
+        match = re.search(r"(\S*\.agentfield_output\.json)", prompt)
+        assert match, "schema prompt suffix must name the output file path"
+        self.output_path_in_prompt = match.group(1)
+        with open(self.output_path_in_prompt, "w", encoding="utf-8") as file_obj:
+            file_obj.write(self.payload)
+        return await super().execute(prompt, options)
+
+
+@pytest.mark.asyncio
+async def test_run_with_project_dir_places_output_under_project_dir(tmp_path):
+    """Regression for agentfield#684.
+
+    When project_dir is the agent's root and cwd is a nested task dir, the
+    schema output file must be created under project_dir — not in the nested
+    cwd — so providers like OpenCode never reject it as an external-directory
+    write. Mirrors the Go SDK runner, which already does this.
+    """
+    root = tmp_path / "root"
+    nested = root / "tasks" / "a"
+    nested.mkdir(parents=True)
+    (root / "source.md").write_text("hello", encoding="utf-8")
+
+    provider = PromptPathWritingProvider(json.dumps({"name": "x", "count": 1}))
+
+    runner = HarnessRunner()
+    with patch("agentfield.harness._runner.build_provider", return_value=provider):
+        result = await runner.run(
+            "Read source.md and summarize.",
+            schema=DemoSchema,
+            provider="opencode",
+            cwd=str(nested),
+            project_dir=str(root),
+        )
+
+    assert result.is_error is False
+    assert result.parsed == DemoSchema(name="x", count=1)
+
+    # The output path the agent was told to write must live under project_dir,
+    # NOT under the nested cwd.
+    assert provider.output_path_in_prompt is not None
+    assert provider.output_path_in_prompt.startswith(str(root))
+    assert str(nested) not in provider.output_path_in_prompt
+
+    # Provider still sees the real cwd + project_dir for its own --dir handling.
+    assert provider.last_options is not None
+    assert provider.last_options["cwd"] == str(nested)
+    assert provider.last_options["project_dir"] == str(root)
+
+    # The temp output dir is cleaned up after the run.
+    assert list(root.glob(".agentfield-out-*")) == []
 
 
 def test_resolve_options_merges_config_and_overrides_per_call_wins():
@@ -306,7 +371,7 @@ def test_accumulate_metrics_sums_costs_across_retries():
         RawResult(result="b", metrics=Metrics(num_turns=2, total_cost_usd=0.02)),
         RawResult(result="c", metrics=Metrics(num_turns=1, total_cost_usd=0.005)),
     ]
-    cost, turns, sid, msgs = _accumulate_metrics(raws)
+    cost, turns, sid, msgs, tokens = _accumulate_metrics(raws)
     assert cost == pytest.approx(0.035)
     assert turns == 4
 
@@ -317,7 +382,7 @@ def test_accumulate_metrics_none_cost_skipped():
         RawResult(result="a", metrics=Metrics(num_turns=1, total_cost_usd=None)),
         RawResult(result="b", metrics=Metrics(num_turns=2, total_cost_usd=0.05)),
     ]
-    cost, turns, sid, msgs = _accumulate_metrics(raws)
+    cost, turns, sid, msgs, tokens = _accumulate_metrics(raws)
     assert cost == pytest.approx(0.05)
     assert turns == 3
 
@@ -328,7 +393,7 @@ def test_accumulate_metrics_all_none_returns_none():
         RawResult(result="a", metrics=Metrics(num_turns=1, total_cost_usd=None)),
         RawResult(result="b", metrics=Metrics(num_turns=2, total_cost_usd=None)),
     ]
-    cost, turns, sid, msgs = _accumulate_metrics(raws)
+    cost, turns, sid, msgs, tokens = _accumulate_metrics(raws)
     assert cost is None
     assert turns == 3
 
@@ -384,3 +449,126 @@ async def test_schema_retry_accumulates_cost(tmp_path, monkeypatch):
     assert result.parsed.name == "ok"
     assert result.cost_usd == pytest.approx(0.03)  # 0.01 + 0.02
     assert result.num_turns == 2
+
+
+@pytest.mark.asyncio
+async def test_schema_retry_preserves_original_goal_in_prompt(tmp_path, monkeypatch):
+    """Regression for the data-flow bug: on a non-crash schema retry the retry
+    prompt MUST still carry the original goal, not only the schema-correction
+    followup. Previously the PM lost its goal on retry and emitted a placeholder
+    PRD that poisoned every downstream reasoner (architect/sprint/merger)."""
+    GOAL = "IMPLEMENT_24_ENDPOINTS_SENTINEL_GOAL"
+    prompts: list[str] = []
+
+    class BadJsonCapturingProvider(MockProvider):
+        async def execute(self, prompt, options):
+            prompts.append(prompt)
+            output_path = get_output_path(str(options.get("cwd", ".")))
+            with open(output_path, "w", encoding="utf-8") as file_obj:
+                file_obj.write(
+                    '{"name": "ok"}'
+                )  # missing 'count' -> invalid, non-crash
+            return await super().execute(prompt, options)
+
+    async def _no_repair(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr("agentfield.harness._runner._ai_schema_repair", _no_repair)
+
+    provider = BadJsonCapturingProvider()
+    runner = HarnessRunner()
+    with patch("agentfield.harness._runner.build_provider", return_value=provider):
+        await runner.run(
+            GOAL,
+            provider="codex",
+            schema=DemoSchema,
+            cwd=str(tmp_path),
+            schema_max_retries=2,
+        )
+
+    assert len(prompts) >= 2, f"expected a retry; got {len(prompts)} call(s)"
+    retry_prompt = prompts[1]
+    assert GOAL in retry_prompt, (
+        "retry prompt dropped the original goal -- the agent retries blind. "
+        "First 400 chars:\n" + retry_prompt[:400]
+    )
+
+
+class IncrementalRecoveryProvider(MockProvider):
+    """Writes a partial object (missing a required field) on the first call,
+    then the complete object on the retry — exercising incremental field-level
+    recovery without a real coding agent."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.prompts: list[str] = []
+
+    async def execute(self, prompt: str, options: dict) -> RawResult:
+        self.prompts.append(prompt)
+        match = re.search(r"(\S*\.agentfield_output\.json)", prompt)
+        assert match
+        output_path = match.group(1)
+        payload = (
+            json.dumps({"name": "x"})  # first attempt: missing 'count'
+            if self.call_count == 0
+            else json.dumps({"name": "x", "count": 5})  # retry: complete
+        )
+        with open(output_path, "w", encoding="utf-8") as file_obj:
+            file_obj.write(payload)
+        return await super().execute(prompt, options)
+
+
+@pytest.mark.asyncio
+async def test_incremental_mode_uses_incremental_suffix(tmp_path):
+    provider = PromptPathWritingProvider(json.dumps({"name": "x", "count": 1}))
+    runner = HarnessRunner()
+    with patch("agentfield.harness._runner.build_provider", return_value=provider):
+        result = await runner.run(
+            "do it",
+            schema=DemoSchema,
+            provider="opencode",
+            cwd=str(tmp_path),
+            schema_mode="incremental",
+        )
+    assert result.is_error is False
+    assert provider.last_prompt is not None
+    assert "incremental build" in provider.last_prompt.lower()
+
+
+@pytest.mark.asyncio
+async def test_auto_mode_small_schema_stays_single_shot(tmp_path):
+    provider = PromptPathWritingProvider(json.dumps({"name": "x", "count": 1}))
+    runner = HarnessRunner()
+    with patch("agentfield.harness._runner.build_provider", return_value=provider):
+        result = await runner.run(
+            "do it",
+            schema=DemoSchema,
+            provider="opencode",
+            cwd=str(tmp_path),
+            schema_mode="auto",
+        )
+    assert result.is_error is False
+    # DemoSchema is tiny, so auto stays single-shot (no incremental instructions).
+    assert "incremental build" not in (provider.last_prompt or "").lower()
+
+
+@pytest.mark.asyncio
+async def test_incremental_mode_recovers_by_patching_missing_field(tmp_path):
+    provider = IncrementalRecoveryProvider()
+    runner = HarnessRunner()
+    with patch("agentfield.harness._runner.build_provider", return_value=provider):
+        result = await runner.run(
+            "do it",
+            schema=DemoSchema,
+            provider="opencode",
+            cwd=str(tmp_path),
+            schema_mode="incremental",
+        )
+
+    assert result.is_error is False
+    assert result.parsed == DemoSchema(name="x", count=5)
+    # The retry prompt must be a targeted field patch, naming the failing field.
+    assert len(provider.prompts) >= 2
+    retry_prompt = provider.prompts[1].lower()
+    assert "patch only" in retry_prompt
+    assert "count" in retry_prompt

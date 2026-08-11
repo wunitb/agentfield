@@ -70,6 +70,13 @@ func DefaultEntries() []EndpointEntry {
 		{Method: "POST", Path: "/api/v1/skills/:skill_id", Group: "execute", Summary: "Execute a skill (legacy endpoint)", AuthLevel: "api_key", Tags: []string{"execute", "skill", "legacy"}},
 
 		// --- Executions ---
+		{Method: "GET", Path: "/api/v1/executions/active", Group: "executions", Summary: "List in-flight workflow runs (any run with a non-terminal execution) with live counts", AuthLevel: "api_key", Tags: []string{"executions", "status", "active", "in-flight"},
+			Parameters: []ParamEntry{
+				{Name: "agent_id", In: "query", Required: false, Type: "string", Desc: "Only runs touching this agent"},
+				{Name: "session_id", In: "query", Required: false, Type: "string", Desc: "Only runs in this session"},
+				{Name: "limit", In: "query", Required: false, Type: "integer", Desc: "Max runs returned (default 100, cap 200)"},
+			},
+		},
 		{Method: "GET", Path: "/api/v1/executions/:execution_id", Group: "executions", Summary: "Get execution status", AuthLevel: "api_key", Tags: []string{"executions", "status"},
 			Parameters: []ParamEntry{{Name: "execution_id", In: "path", Required: true, Type: "string", Desc: "Execution ID"}},
 		},
@@ -78,10 +85,12 @@ func DefaultEntries() []EndpointEntry {
 		{Method: "POST", Path: "/api/v1/executions/:execution_id/cancel", Group: "executions", Summary: "Cancel a running execution", AuthLevel: "api_key", Tags: []string{"executions", "cancel"}},
 		{Method: "POST", Path: "/api/v1/executions/:execution_id/pause", Group: "executions", Summary: "Pause an execution", AuthLevel: "api_key", Tags: []string{"executions", "pause"}},
 		{Method: "POST", Path: "/api/v1/executions/:execution_id/resume", Group: "executions", Summary: "Resume a paused execution", AuthLevel: "api_key", Tags: []string{"executions", "resume"}},
+		{Method: "POST", Path: "/api/v1/workflows/:workflowId/cancel-tree", Group: "workflows", Summary: "Cancel every non-terminal execution in a run (bottom-up)", AuthLevel: "api_key", Tags: []string{"workflows", "executions", "cancel"}},
 
 		// --- Approval ---
 		{Method: "POST", Path: "/api/v1/executions/:execution_id/request-approval", Group: "approval", Summary: "Request approval for an execution", AuthLevel: "api_key", Tags: []string{"approval", "request"}},
 		{Method: "GET", Path: "/api/v1/executions/:execution_id/approval-status", Group: "approval", Summary: "Get approval status", AuthLevel: "api_key", Tags: []string{"approval", "status"}},
+		{Method: "POST", Path: "/api/v1/executions/:execution_id/approval-response", Group: "approval", Summary: "Resolve a pending approval (approved/rejected/request_changes)", AuthLevel: "api_key", Tags: []string{"approval", "resolve"}},
 		{Method: "POST", Path: "/api/v1/agents/:node_id/executions/:execution_id/request-approval", Group: "approval", Summary: "Request approval (agent-scoped)", AuthLevel: "api_key", Tags: []string{"approval", "request", "agent-scoped"}},
 		{Method: "GET", Path: "/api/v1/agents/:node_id/executions/:execution_id/approval-status", Group: "approval", Summary: "Get approval status (agent-scoped)", AuthLevel: "api_key", Tags: []string{"approval", "status", "agent-scoped"}},
 		{Method: "POST", Path: "/api/v1/webhooks/approval-response", Group: "approval", Summary: "Webhook for approval responses (HMAC-signed)", AuthLevel: "webhook", Tags: []string{"approval", "webhook"}},
@@ -127,9 +136,13 @@ func DefaultEntries() []EndpointEntry {
 		{Method: "GET", Path: "/api/v1/agentic/kb/guide", Group: "agentic-kb", Summary: "Goal-oriented reading path for building agents", AuthLevel: "public", Tags: []string{"kb", "guide", "learning", "onboarding"}},
 
 		// --- Settings ---
-		{Method: "GET", Path: "/api/v1/settings/webhooks", Group: "settings", Summary: "List observability webhooks", AuthLevel: "api_key", Tags: []string{"settings", "webhooks", "observability"}},
-		{Method: "POST", Path: "/api/v1/settings/webhooks", Group: "settings", Summary: "Create observability webhook", AuthLevel: "api_key", Tags: []string{"settings", "webhooks", "observability"}},
-		{Method: "DELETE", Path: "/api/v1/settings/webhooks/:webhook_id", Group: "settings", Summary: "Delete observability webhook", AuthLevel: "api_key", Tags: []string{"settings", "webhooks"}},
+		{Method: "GET", Path: "/api/v1/settings/observability-webhook", Group: "settings", Summary: "Get the observability webhook config (singleton)", AuthLevel: "api_key", Tags: []string{"settings", "webhooks", "observability"}},
+		{Method: "POST", Path: "/api/v1/settings/observability-webhook", Group: "settings", Summary: "Create or update the observability webhook config", AuthLevel: "api_key", Tags: []string{"settings", "webhooks", "observability"}},
+		{Method: "DELETE", Path: "/api/v1/settings/observability-webhook", Group: "settings", Summary: "Delete the observability webhook config", AuthLevel: "api_key", Tags: []string{"settings", "webhooks", "observability"}},
+		{Method: "GET", Path: "/api/v1/settings/observability-webhook/status", Group: "settings", Summary: "Observability webhook delivery status and queue depth", AuthLevel: "api_key", Tags: []string{"settings", "webhooks", "observability"}},
+		{Method: "POST", Path: "/api/v1/settings/observability-webhook/redrive", Group: "settings", Summary: "Retry dead-lettered observability webhook deliveries", AuthLevel: "api_key", Tags: []string{"settings", "webhooks", "observability"}},
+		{Method: "GET", Path: "/api/v1/settings/observability-webhook/dlq", Group: "settings", Summary: "Inspect the observability webhook dead-letter queue", AuthLevel: "api_key", Tags: []string{"settings", "webhooks", "observability"}},
+		{Method: "DELETE", Path: "/api/v1/settings/observability-webhook/dlq", Group: "settings", Summary: "Clear the observability webhook dead-letter queue", AuthLevel: "api_key", Tags: []string{"settings", "webhooks", "observability"}},
 
 		// --- Admin ---
 		{Method: "GET", Path: "/api/v1/admin/tags/pending", Group: "admin", Summary: "List pending tag approval requests", AuthLevel: "admin", Tags: []string{"admin", "tags", "approval"}},

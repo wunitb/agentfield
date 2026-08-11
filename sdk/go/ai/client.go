@@ -34,6 +34,11 @@ func NewClient(config *Config) (*Client, error) {
 	}, nil
 }
 
+// Model returns the client's configured default model slug.
+func (c *Client) Model() string {
+	return c.config.Model
+}
+
 // Complete makes a chat completion request.
 func (c *Client) Complete(ctx context.Context, prompt string, opts ...Option) (*Response, error) {
 	// Build base request
@@ -82,8 +87,8 @@ func (c *Client) CompleteWithMessages(ctx context.Context, messages []Message, o
 }
 
 func (c *Client) doRequest(ctx context.Context, req *Request) (*Response, error) {
-	// Marshal request
-	body, err := json.Marshal(req)
+	// Apply provider-specific parameter rewrites before serialization.
+	body, err := c.marshalRequest(req)
 	if err != nil {
 		return nil, fmt.Errorf("marshal request: %w", err)
 	}
@@ -105,14 +110,12 @@ func (c *Client) doRequest(ctx context.Context, req *Request) (*Response, error)
 	}
 	httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 
-	// Add OpenRouter-specific headers if applicable
-	if c.config.IsOpenRouter() {
-		if c.config.SiteURL != "" {
-			httpReq.Header.Set("HTTP-Referer", c.config.SiteURL)
-		}
-		if c.config.SiteName != "" {
-			httpReq.Header.Set("X-Title", c.config.SiteName)
-		}
+	// Add gateway-specific attribution headers if applicable
+	switch {
+	case c.config.IsOpenRouter():
+		applyOpenRouterAttributionHeaders(httpReq.Header, c.config.SiteURL, c.config.SiteName)
+	case c.config.IsInfron():
+		applyInfronAttributionHeaders(httpReq.Header, c.config.SiteURL, c.config.SiteName)
 	}
 
 	// Execute request
@@ -142,6 +145,7 @@ func (c *Client) doRequest(ctx context.Context, req *Request) (*Response, error)
 	if err := json.Unmarshal(respBody, &response); err != nil {
 		return nil, fmt.Errorf("unmarshal response: %w", err)
 	}
+	response.normalizeNativeCost()
 
 	return &response, nil
 }
@@ -181,8 +185,8 @@ func (c *Client) StreamComplete(ctx context.Context, prompt string, opts ...Opti
 			}
 		}
 
-		// Marshal request
-		body, err := json.Marshal(req)
+		// Apply provider-specific parameter rewrites before serialization.
+		body, err := c.marshalRequest(req)
 		if err != nil {
 			errCh <- fmt.Errorf("marshal request: %w", err)
 			return
@@ -207,14 +211,12 @@ func (c *Client) StreamComplete(ctx context.Context, prompt string, opts ...Opti
 		httpReq.Header.Set("Authorization", "Bearer "+apiKey)
 		httpReq.Header.Set("Accept", "text/event-stream")
 
-		// Add OpenRouter-specific headers if applicable
-		if c.config.IsOpenRouter() {
-			if c.config.SiteURL != "" {
-				httpReq.Header.Set("HTTP-Referer", c.config.SiteURL)
-			}
-			if c.config.SiteName != "" {
-				httpReq.Header.Set("X-Title", c.config.SiteName)
-			}
+		// Add gateway-specific attribution headers if applicable
+		switch {
+		case c.config.IsOpenRouter():
+			applyOpenRouterAttributionHeaders(httpReq.Header, c.config.SiteURL, c.config.SiteName)
+		case c.config.IsInfron():
+			applyInfronAttributionHeaders(httpReq.Header, c.config.SiteURL, c.config.SiteName)
 		}
 
 		// Execute request
@@ -293,19 +295,26 @@ func (d *SSEDecoder) Decode() (StreamChunk, error) {
 				if err := json.Unmarshal([]byte(jsonData), &chunk); err != nil {
 					continue // Skip malformed chunks
 				}
+				chunk.normalizeNativeCost()
 
 				return chunk, nil
 			}
 			continue // Non-data message, try next
 		}
 
-		// Need more data
+		// Need more data. Per the io.Reader contract, a Read may return n > 0
+		// alongside a non-nil error (commonly the final body bytes together
+		// with io.EOF) — those bytes must be consumed before the error is
+		// surfaced, otherwise the stream's trailing messages (e.g. a terminal
+		// usage-accounting chunk) are silently dropped.
 		n, err := d.reader.Read(d.buf)
+		if n > 0 {
+			d.accumulated = append(d.accumulated, d.buf[:n]...)
+			continue
+		}
 		if err != nil {
 			return StreamChunk{}, err
 		}
-
-		d.accumulated = append(d.accumulated, d.buf[:n]...)
 	}
 }
 

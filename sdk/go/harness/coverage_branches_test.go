@@ -18,23 +18,23 @@ func TestResultText(t *testing.T) {
 
 func TestRunnerMergeOptions_AllOverrideBranches(t *testing.T) {
 	defaults := Options{
-		Provider:        ProviderOpenCode,
-		Model:           "base-model",
-		MaxTurns:        1,
-		PermissionMode:  "plan",
-		SystemPrompt:    "base system",
-		Env:             map[string]string{"BASE": "1"},
-		Cwd:             "/base/cwd",
-		ProjectDir:      "/base/project",
-		Tools:           []string{"base-tool"},
-		MaxBudgetUSD:    1.25,
-		ResumeSessionID: "base-session",
-		BinPath:         "/base/bin",
-		Timeout:         10,
-		MaxRetries:      1,
-		InitialDelay:    1.5,
-		MaxDelay:        2.5,
-		BackoffFactor:   3.5,
+		Provider:         ProviderOpenCode,
+		Model:            "base-model",
+		MaxTurns:         1,
+		PermissionMode:   "plan",
+		SystemPrompt:     "base system",
+		Env:              map[string]string{"BASE": "1"},
+		Cwd:              "/base/cwd",
+		ProjectDir:       "/base/project",
+		Tools:            []string{"base-tool"},
+		MaxBudgetUSD:     1.25,
+		ResumeSessionID:  "base-session",
+		BinPath:          "/base/bin",
+		Timeout:          10,
+		MaxRetries:       1,
+		InitialDelay:     1.5,
+		MaxDelay:         2.5,
+		BackoffFactor:    3.5,
 		SchemaMaxRetries: 1,
 	}
 
@@ -199,12 +199,26 @@ fi
 		raw, err := NewOpenCodeProvider(script, "").Execute(context.Background(), "prompt", Options{
 			Cwd:        dir,
 			ProjectDir: "/ignored/project",
+			Model:      "stub-model",
 		})
 		require.NoError(t, err)
 		assert.False(t, raw.IsError)
+		// $PWD reflects the subprocess working directory (Options.Cwd).
 		assert.Contains(t, raw.Result, dir)
-		assert.Contains(t, raw.Result, "-q")
-		assert.Contains(t, raw.Result, "-p prompt")
+		// opencode 1.14+ surface: `run` subcommand, --dir for project, -m
+		// for model, prompt is positional. -c, -q, -p are
+		// deprecated/rebound (see issue #517). --dangerously-skip-permissions
+		// is rejected by `run` on v1.14 — opencode prints help and exits 0,
+		// see agentfield#582 — so it must NOT be on the command line.
+		assert.Contains(t, raw.Result, "run")
+		assert.Contains(t, raw.Result, "--dir /ignored/project")
+		assert.Contains(t, raw.Result, "-m stub-model")
+		assert.NotContains(t, raw.Result, "--dangerously-skip-permissions")
+		// Prompt is the last positional argument (no -p flag in front).
+		assert.Regexp(t, `\sprompt$`, strings.TrimSpace(raw.Result))
+		assert.NotContains(t, raw.Result, "-q ")
+		assert.NotContains(t, raw.Result, "-p prompt")
+		assert.NotContains(t, raw.Result, "-c /ignored/project")
 	})
 }
 
@@ -282,6 +296,7 @@ func TestRunnerRetryAdditionalBranches(t *testing.T) {
 			prov,
 			Options{SchemaMaxRetries: 2},
 			"prompt",
+			false,
 		)
 
 		assert.True(t, result.IsError)

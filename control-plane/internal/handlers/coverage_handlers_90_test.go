@@ -13,6 +13,8 @@ import (
 	"time"
 
 	"github.com/Agent-Field/agentfield/control-plane/internal/events"
+	"github.com/Agent-Field/agentfield/control-plane/internal/server/middleware"
+	"github.com/Agent-Field/agentfield/control-plane/internal/services"
 	"github.com/Agent-Field/agentfield/control-plane/internal/storage"
 	"github.com/Agent-Field/agentfield/control-plane/pkg/types"
 	"github.com/gin-gonic/gin"
@@ -208,7 +210,7 @@ func TestExecutionNotesCoverageAdditional(t *testing.T) {
 	t.Run("add note validation and update failure", func(t *testing.T) {
 		router := gin.New()
 		stub := &executionNoteStorageStub{record: &types.Execution{ExecutionID: "exec-1"}, updateErr: errors.New("boom")}
-		router.POST("/notes", AddExecutionNoteHandler(stub))
+		router.POST("/notes", AddExecutionNoteHandler(stub, false))
 
 		req := httptest.NewRequest(http.MethodPost, "/notes", strings.NewReader(`{"message":"ok"}`))
 		req.Header.Set("Content-Type", "application/json")
@@ -229,13 +231,17 @@ func TestExecutionNotesCoverageAdditional(t *testing.T) {
 		require.Equal(t, http.StatusInternalServerError, rec.Code)
 	})
 
-	t.Run("add note initializes nil tags and uses header id", func(t *testing.T) {
+	t.Run("add note initializes nil tags with matching caller identity", func(t *testing.T) {
 		stub := &executionNoteStorageStub{
 			record:   &types.Execution{ExecutionID: "exec-2", RunID: "run-2", AgentNodeID: "node-2"},
 			eventBus: events.NewExecutionEventBus(),
 		}
 		router := gin.New()
-		router.POST("/notes", AddExecutionNoteHandler(stub))
+		router.POST("/notes", func(c *gin.Context) {
+			// Authenticated caller identity matching the execution owner.
+			c.Set(string(middleware.CallerAgentIDKey), "node-2")
+			AddExecutionNoteHandler(stub, true)(c)
+		})
 
 		req := httptest.NewRequest(http.MethodPost, "/notes", strings.NewReader(`{"message":" kept "}`))
 		req.Header.Set("Content-Type", "application/json")
@@ -251,8 +257,8 @@ func TestExecutionNotesCoverageAdditional(t *testing.T) {
 
 	t.Run("get notes errors and empty results", func(t *testing.T) {
 		router := gin.New()
-		router.GET("/notes/:execution_id", GetExecutionNotesHandler(&executionNoteStorageStub{getErr: errors.New("load failed")}))
-		router.GET("/missing", GetExecutionNotesHandler(&executionNoteStorageStub{}))
+		router.GET("/notes/:execution_id", GetExecutionNotesHandler(&executionNoteStorageStub{getErr: errors.New("load failed")}, false))
+		router.GET("/missing", GetExecutionNotesHandler(&executionNoteStorageStub{}, false))
 
 		rec := httptest.NewRecorder()
 		req := httptest.NewRequest(http.MethodGet, "/missing", nil)
@@ -266,14 +272,14 @@ func TestExecutionNotesCoverageAdditional(t *testing.T) {
 
 		rec = httptest.NewRecorder()
 		router = gin.New()
-		router.GET("/notes/:execution_id", GetExecutionNotesHandler(&executionNoteStorageStub{record: nil}))
+		router.GET("/notes/:execution_id", GetExecutionNotesHandler(&executionNoteStorageStub{record: nil}, false))
 		req = httptest.NewRequest(http.MethodGet, "/notes/exec-404", nil)
 		router.ServeHTTP(rec, req)
 		require.Equal(t, http.StatusNotFound, rec.Code)
 
 		rec = httptest.NewRecorder()
 		router = gin.New()
-		router.GET("/notes/:execution_id", GetExecutionNotesHandler(&executionNoteStorageStub{record: &types.Execution{ExecutionID: "exec-3"}}))
+		router.GET("/notes/:execution_id", GetExecutionNotesHandler(&executionNoteStorageStub{record: &types.Execution{ExecutionID: "exec-3"}}, false))
 		req = httptest.NewRequest(http.MethodGet, "/notes/exec-3?tags=debug,%20info%20", nil)
 		router.ServeHTTP(rec, req)
 		require.Equal(t, http.StatusOK, rec.Code)
@@ -492,6 +498,12 @@ func TestExecuteReasonerAndWebhookHelpersCoverage(t *testing.T) {
 
 		ctrl := &webhookApprovalController{}
 		response := `{"decision":"approved"}`
+
+		// Allowlist loopback so the httptest server is reachable via the
+		// SSRF-safe client used by notifyApprovalCallback (#435).
+		services.SetWebhookAllowedHosts([]string{"127.0.0.1"})
+		t.Cleanup(func() { services.SetWebhookAllowedHosts(nil) })
+
 		ctrl.notifyApprovalCallback(server.URL, "exec-1", "approved", "running", "ok", &response, "req-1")
 		ctrl.notifyApprovalCallback(server.URL+"/fail", "exec-2", "rejected", "cancelled", "", nil, "req-2")
 		ctrl.notifyApprovalCallback("http://127.0.0.1:1", "exec-3", "approved", "running", "", nil, "req-3")

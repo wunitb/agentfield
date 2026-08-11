@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"net/http"
@@ -67,6 +68,33 @@ func TestNew(t *testing.T) {
 			wantErr: false,
 			check: func(t *testing.T, a *Agent) {
 				assert.Nil(t, a.client)
+			},
+		},
+		{
+			name: "CallTimeout defaults to 15s when unset",
+			cfg: Config{
+				NodeID:        "node-1",
+				Version:       "1.0.0",
+				AgentFieldURL: "https://api.example.com",
+			},
+			wantErr: false,
+			check: func(t *testing.T, a *Agent) {
+				assert.Equal(t, 15*time.Second, a.cfg.CallTimeout)
+				assert.Equal(t, 15*time.Second, a.httpClient.Timeout)
+			},
+		},
+		{
+			name: "CallTimeout is honored when set",
+			cfg: Config{
+				NodeID:        "node-1",
+				Version:       "1.0.0",
+				AgentFieldURL: "https://api.example.com",
+				CallTimeout:   90 * time.Second,
+			},
+			wantErr: false,
+			check: func(t *testing.T, a *Agent) {
+				assert.Equal(t, 90*time.Second, a.cfg.CallTimeout)
+				assert.Equal(t, 90*time.Second, a.httpClient.Timeout)
 			},
 		},
 		{
@@ -386,6 +414,66 @@ func TestHandler(t *testing.T) {
 	assert.Equal(t, "ok", response["status"])
 }
 
+func TestStatusHandler(t *testing.T) {
+	cfg := Config{
+		NodeID:        "node-1",
+		Version:       "1.2.3",
+		AgentFieldURL: "https://api.example.com",
+		Logger:        log.New(io.Discard, "", 0),
+	}
+
+	agent, err := New(cfg)
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	w := httptest.NewRecorder()
+	agent.Handler().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code)
+	var response map[string]any
+	require.NoError(t, json.NewDecoder(w.Body).Decode(&response))
+	assert.Equal(t, "running", response["status"])
+	assert.Equal(t, "node-1", response["node_id"])
+	assert.Equal(t, "1.2.3", response["version"])
+	assert.Contains(t, response, "uptime_seconds")
+}
+
+func TestStatusHandler_ExemptFromOriginAuth(t *testing.T) {
+	cfg := Config{
+		NodeID:            "node-1",
+		Version:           "1.0.0",
+		AgentFieldURL:     "https://api.example.com",
+		Logger:            log.New(io.Discard, "", 0),
+		InternalToken:     "secret",
+		RequireOriginAuth: true,
+	}
+
+	agent, err := New(cfg)
+	require.NoError(t, err)
+
+	req := httptest.NewRequest(http.MethodGet, "/status", nil)
+	w := httptest.NewRecorder()
+	agent.Handler().ServeHTTP(w, req)
+
+	assert.Equal(t, http.StatusOK, w.Code, "status endpoint must stay reachable without auth so the control plane's health monitor can poll it")
+}
+
+func TestDiscoveryPayload_ReportsAuthRequired(t *testing.T) {
+	cfg := Config{
+		NodeID:        "node-1",
+		Version:       "1.0.0",
+		AgentFieldURL: "https://api.example.com",
+		Logger:        log.New(io.Discard, "", 0),
+	}
+
+	agent, err := New(cfg)
+	require.NoError(t, err)
+	assert.Equal(t, false, agent.discoveryPayload()["auth_required"])
+
+	agent.cfg.RequireOriginAuth = true
+	assert.Equal(t, true, agent.discoveryPayload()["auth_required"])
+}
+
 func TestHandleReasoner_Sync(t *testing.T) {
 	cfg := Config{
 		NodeID:        "node-1",
@@ -609,27 +697,64 @@ func TestHandleReasoner_Error(t *testing.T) {
 	assert.Contains(t, result["error"], "assert.AnError")
 }
 
+// TestCall pins the async-submit + wait contract. Contract: Call POSTs to the
+// ASYNC execute endpoint (/api/v1/execute/async/{target}) with the full set of
+// lineage headers (the control plane reads them identically for sync and async
+// via readExecutionHeaders, so DAG parentage is preserved), then polls
+// GET /api/v1/executions/{id} — with the same lineage headers — until the
+// execution succeeds, and returns the child's result map.
 func TestCall(t *testing.T) {
+	var polls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if strings.Contains(r.URL.Path, "/execute/") {
-			// Verify headers
+		switch {
+		case r.Method == http.MethodPost && r.URL.Path == "/api/v1/execute/async/target.node":
+			// Verify lineage headers on the submit
 			assert.Equal(t, "run-1", r.Header.Get("X-Run-ID"))
 			assert.Equal(t, "parent-exec", r.Header.Get("X-Parent-Execution-ID"))
 			assert.Equal(t, "session-1", r.Header.Get("X-Session-ID"))
 			assert.Equal(t, "actor-1", r.Header.Get("X-Actor-ID"))
+			assert.Equal(t, "node-1", r.Header.Get("X-Caller-Agent-ID"))
 
 			var reqBody map[string]any
 			json.NewDecoder(r.Body).Decode(&reqBody)
 			assert.Equal(t, map[string]any{"value": float64(42)}, reqBody["input"])
+			assert.Equal(t, map[string]any{
+				"home_id": "home-a", "run_id": "run-1", "lease_owner": "worker-a",
+			}, reqBody["authority"])
 
-			resp := map[string]any{
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"execution_id": "exec-1",
+				"run_id":       "run-1",
+				"status":       "queued",
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/executions/exec-1":
+			// Lineage headers ride along on polls too (Python parity: the
+			// wait loop reuses the submit headers).
+			assert.Equal(t, "run-1", r.Header.Get("X-Run-ID"))
+			assert.Equal(t, "parent-exec", r.Header.Get("X-Parent-Execution-ID"))
+
+			// First poll: still running; second poll: terminal result.
+			if polls.Add(1) == 1 {
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"execution_id": "exec-1",
+					"run_id":       "run-1",
+					"status":       "running",
+				})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
 				"execution_id": "exec-1",
 				"run_id":       "run-1",
 				"status":       "succeeded",
 				"result":       map[string]any{"output": "result"},
-			}
+			})
+		case strings.HasSuffix(r.URL.Path, "/logs"):
+			// Structured execution-log shipping — irrelevant to this contract.
 			w.WriteHeader(http.StatusOK)
-			json.NewEncoder(w).Encode(resp)
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
 		}
 	}))
 	defer server.Close()
@@ -646,43 +771,195 @@ func TestCall(t *testing.T) {
 
 	// Create context with execution context
 	ctx := contextWithExecution(context.Background(), ExecutionContext{
-		RunID:       "run-1",
-		ExecutionID: "parent-exec",
-		SessionID:   "session-1",
-		ActorID:     "actor-1",
+		RunID:               "run-1",
+		ExecutionID:         "parent-exec",
+		SessionID:           "session-1",
+		ActorID:             "actor-1",
+		AuthorityHomeID:     "home-a",
+		AuthorityRunID:      "run-1",
+		AuthorityLeaseOwner: "worker-a",
 	})
 
 	result, err := agent.Call(ctx, "target.node", map[string]any{"value": 42})
 	assert.NoError(t, err)
 	assert.NotNil(t, result)
 	assert.Equal(t, "result", result["output"])
+	assert.GreaterOrEqual(t, polls.Load(), int32(2), "expected at least two status polls")
+}
+
+// TestCall_OutlivesCallTimeout is the regression test for the 15s
+// 'context deadline exceeded' bug: a child reasoner that runs LONGER than
+// Config.CallTimeout must still complete successfully, because CallTimeout
+// bounds each HTTP request (submit + each poll), not the end-to-end call.
+func TestCall_OutlivesCallTimeout(t *testing.T) {
+	const callTimeout = 300 * time.Millisecond
+	start := time.Now()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/v1/execute/async/"):
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"execution_id": "exec-slow",
+				"run_id":       "run-slow",
+				"status":       "queued",
+			})
+		case r.Method == http.MethodGet && r.URL.Path == "/api/v1/executions/exec-slow":
+			// Child stays 'running' for 3x CallTimeout, then succeeds. Every
+			// individual poll response is fast — only the CHILD is slow.
+			if time.Since(start) < 3*callTimeout {
+				_ = json.NewEncoder(w).Encode(map[string]any{"status": "running"})
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"status": "succeeded",
+				"result": map[string]any{"took": "longer than CallTimeout"},
+			})
+		default:
+			t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	agent, err := New(Config{
+		NodeID:        "node-1",
+		Version:       "1.0.0",
+		AgentFieldURL: server.URL,
+		CallTimeout:   callTimeout,
+		Logger:        log.New(io.Discard, "", 0),
+	})
+	require.NoError(t, err)
+
+	result, err := agent.Call(context.Background(), "target.slow", map[string]any{})
+	require.NoError(t, err, "a child running longer than CallTimeout must not kill the call")
+	require.NotNil(t, result)
+	assert.Equal(t, "longer than CallTimeout", result["took"])
+	assert.GreaterOrEqual(t, time.Since(start), 3*callTimeout,
+		"call must actually have waited past CallTimeout")
+}
+
+// TestCall_CtxCancelAbortsWait: cancelling the caller's ctx aborts the wait
+// loop promptly (returning the context error). Note the contract: the child
+// execution is NOT cancelled server-side — matching the Python SDK.
+func TestCall_CtxCancelAbortsWait(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodPost && strings.HasPrefix(r.URL.Path, "/api/v1/execute/async/"):
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"execution_id": "exec-hang",
+				"run_id":       "run-hang",
+				"status":       "queued",
+			})
+		case r.Method == http.MethodGet:
+			// Child never finishes.
+			_ = json.NewEncoder(w).Encode(map[string]any{"status": "running"})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer server.Close()
+
+	agent, err := New(Config{
+		NodeID:        "node-1",
+		Version:       "1.0.0",
+		AgentFieldURL: server.URL,
+		Logger:        log.New(io.Discard, "", 0),
+	})
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	go func() {
+		time.Sleep(250 * time.Millisecond)
+		cancel()
+	}()
+
+	start := time.Now()
+	result, err := agent.Call(ctx, "target.hang", map[string]any{})
+	require.Error(t, err)
+	assert.ErrorIs(t, err, context.Canceled)
+	assert.Nil(t, result)
+	assert.Less(t, time.Since(start), 5*time.Second, "cancel must abort the wait promptly")
 }
 
 func TestCall_ErrorHandling(t *testing.T) {
 	tests := []struct {
 		name           string
 		serverResponse func(w http.ResponseWriter, r *http.Request)
-		wantErr        bool
+		wantErrSubstr  string
 	}{
 		{
-			name: "API error",
+			name: "API error on submit",
 			serverResponse: func(w http.ResponseWriter, r *http.Request) {
 				w.WriteHeader(http.StatusBadRequest)
 				w.Write([]byte("bad request"))
 			},
-			wantErr: true,
+			wantErrSubstr: "bad request",
 		},
 		{
-			name: "execution failed status",
+			name: "submission missing execution id",
 			serverResponse: func(w http.ResponseWriter, r *http.Request) {
-				resp := map[string]any{
+				w.WriteHeader(http.StatusAccepted)
+				_ = json.NewEncoder(w).Encode(map[string]any{"status": "queued"})
+			},
+			wantErrSubstr: "missing identifiers",
+		},
+		{
+			name: "execution failed status via poll",
+			serverResponse: func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPost {
+					w.WriteHeader(http.StatusAccepted)
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"execution_id": "exec-f",
+						"run_id":       "run-f",
+						"status":       "queued",
+					})
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{
 					"status":        "failed",
 					"error_message": "execution failed",
-				}
-				w.WriteHeader(http.StatusOK)
-				json.NewEncoder(w).Encode(resp)
+				})
 			},
-			wantErr: true,
+			wantErrSubstr: "execution failed",
+		},
+		{
+			name: "failed execution coalesces error field into message",
+			serverResponse: func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPost {
+					w.WriteHeader(http.StatusAccepted)
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"execution_id": "exec-e",
+						"run_id":       "run-e",
+						"status":       "queued",
+					})
+					return
+				}
+				// The status endpoint reports failures in "error"
+				// (ExecutionStatusResponse), not "error_message" — Python
+				// coalesces it (client.py:1000-1002) and so must we.
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"status": "failed",
+					"error":  "boom from error field",
+				})
+			},
+			wantErrSubstr: "boom from error field",
+		},
+		{
+			name: "cancelled execution is terminal",
+			serverResponse: func(w http.ResponseWriter, r *http.Request) {
+				if r.Method == http.MethodPost {
+					w.WriteHeader(http.StatusAccepted)
+					_ = json.NewEncoder(w).Encode(map[string]any{
+						"execution_id": "exec-c",
+						"run_id":       "run-c",
+						"status":       "queued",
+					})
+					return
+				}
+				_ = json.NewEncoder(w).Encode(map[string]any{"status": "cancelled"})
+			},
+			wantErrSubstr: "execute status cancelled",
 		},
 	}
 
@@ -702,13 +979,9 @@ func TestCall_ErrorHandling(t *testing.T) {
 			require.NoError(t, err)
 
 			result, err := agent.Call(context.Background(), "target", map[string]any{})
-			if tt.wantErr {
-				assert.Error(t, err)
-				assert.Nil(t, result)
-			} else {
-				assert.NoError(t, err)
-				assert.NotNil(t, result)
-			}
+			require.Error(t, err)
+			assert.Nil(t, result)
+			assert.Contains(t, err.Error(), tt.wantErrSubstr)
 		})
 	}
 }
@@ -906,8 +1179,11 @@ func TestAIWithTools(t *testing.T) {
 			switch r.URL.Path {
 			case "/api/v1/discovery/capabilities":
 				_, _ = w.Write([]byte(`{"discovered_at":"2025-01-01T00:00:00Z","total_agents":1,"total_reasoners":1,"total_skills":0,"pagination":{"limit":50,"offset":0,"has_more":false},"capabilities":[{"agent_id":"agent-1","reasoners":[{"id":"lookup","invocation_target":"agent-1.lookup","input_schema":{"type":"object"}}],"skills":[]}]}`))
-			case "/api/v1/execute/agent-1.lookup":
-				_, _ = w.Write([]byte(`{"status":"open"}`))
+			case "/api/v1/execute/async/agent-1.lookup":
+				w.WriteHeader(http.StatusAccepted)
+				_, _ = w.Write([]byte(`{"execution_id":"exec-tool-1","run_id":"run-tool-1","status":"queued"}`))
+			case "/api/v1/executions/exec-tool-1":
+				_, _ = w.Write([]byte(`{"execution_id":"exec-tool-1","run_id":"run-tool-1","status":"succeeded","result":{"status":"open"}}`))
 			case "/chat/completions":
 				count := chatRequests.Add(1)
 				if count == 1 {
@@ -935,6 +1211,78 @@ func TestAIWithTools(t *testing.T) {
 		require.Len(t, trace.Calls, 1)
 		assert.Equal(t, "agent-1.lookup", trace.Calls[0].ToolName)
 	})
+
+	t.Run("rejects model-invented tool targets before outbound execute request", func(t *testing.T) {
+		var executeCalls atomic.Int32
+		var chatRequests atomic.Int32
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case "/api/v1/discovery/capabilities":
+				_, _ = w.Write([]byte(`{"discovered_at":"2025-01-01T00:00:00Z","total_agents":1,"total_reasoners":1,"total_skills":0,"pagination":{"limit":50,"offset":0,"has_more":false},"capabilities":[{"agent_id":"agent-1","reasoners":[{"id":"lookup","invocation_target":"agent-1.lookup","input_schema":{"type":"object"}}],"skills":[]}]}`))
+			case "/chat/completions":
+				if chatRequests.Add(1) == 1 {
+					_ = json.NewEncoder(w).Encode(ai.Response{Choices: []ai.Choice{{Message: ai.Message{ToolCalls: []ai.ToolCall{{ID: "call-1", Type: "function", Function: ai.ToolCallFunction{Name: "agent-1.admin", Arguments: `{"query":"status"}`}}}}}}})
+					return
+				}
+				_ = json.NewEncoder(w).Encode(ai.Response{Choices: []ai.Choice{{Message: ai.Message{Content: []ai.ContentPart{{Type: "text", Text: "blocked"}}}}}})
+			case "/api/v1/execute/async/agent-1.lookup":
+				executeCalls.Add(1)
+				w.WriteHeader(http.StatusAccepted)
+				_, _ = w.Write([]byte(`{"execution_id":"exec-tool-2","run_id":"run-tool-2","status":"queued"}`))
+			default:
+				t.Fatalf("unexpected path %s", r.URL.Path)
+			}
+		}))
+		defer server.Close()
+
+		agent, err := New(Config{
+			NodeID:        "agent-1",
+			Version:       "1.0.0",
+			AgentFieldURL: server.URL,
+			Logger:        log.New(io.Discard, "", 0),
+			AIConfig:      &ai.Config{APIKey: "test-key", BaseURL: server.URL, Model: "gpt-4o"},
+		})
+		require.NoError(t, err)
+
+		resp, trace, err := agent.AIWithTools(context.Background(), "hello", ai.ToolCallConfig{MaxTurns: 1, MaxToolCalls: 1, PromptConfig: &ai.PromptConfig{}})
+		require.NoError(t, err)
+		require.NotNil(t, resp)
+		require.NotNil(t, trace)
+		require.Len(t, trace.Calls, 1)
+		assert.Contains(t, trace.Calls[0].Error, "not a discovered capability")
+		assert.Equal(t, "blocked", resp.Text())
+		assert.Equal(t, int32(0), executeCalls.Load())
+	})
+}
+
+func TestNormalizeToolInvocationTarget(t *testing.T) {
+	tests := []struct {
+		name   string
+		target string
+		want   string
+	}{
+		{
+			name:   "skill target",
+			target: "agent-1:skill:lookup",
+			want:   "agent-1.lookup",
+		},
+		{
+			name:   "reasoner target",
+			target: "agent-1:lookup",
+			want:   "agent-1.lookup",
+		},
+		{
+			name:   "already normalized",
+			target: "agent-1.lookup",
+			want:   "agent-1.lookup",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, normalizeToolInvocationTarget(tt.target))
+		})
+	}
 }
 
 func TestRunAndServe_ShutdownOnContextCancel(t *testing.T) {
@@ -1430,6 +1778,84 @@ func TestCallLocalEmitsStructuredExecutionLogs(t *testing.T) {
 	}
 }
 
+func TestCallLocalCoversCompletionAndFailureBranches(t *testing.T) {
+	tests := []struct {
+		name      string
+		handler   func(context.Context, map[string]any) (any, error)
+		wantEvent string
+		wantLevel string
+		wantErr   string
+	}{
+		{
+			name: "success",
+			handler: func(_ context.Context, input map[string]any) (any, error) {
+				return map[string]any{"echo": input["msg"]}, nil
+			},
+			wantEvent: "call.local.complete",
+			wantLevel: "info",
+		},
+		{
+			name: "failure",
+			handler: func(context.Context, map[string]any) (any, error) {
+				return nil, errors.New("handler failed")
+			},
+			wantEvent: "call.local.failed",
+			wantLevel: "error",
+			wantErr:   "handler failed",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			ag, err := New(Config{
+				NodeID:  "node-1",
+				Version: "1.0.0",
+				Logger:  log.New(io.Discard, "", 0),
+			})
+			require.NoError(t, err)
+			ag.RegisterReasoner("child", tt.handler)
+
+			parentCtx := contextWithExecution(context.Background(), ExecutionContext{
+				RunID:          "run-1",
+				ExecutionID:    "exec-parent",
+				WorkflowID:     "wf-1",
+				RootWorkflowID: "wf-1",
+				ReasonerName:   "parent",
+				AgentNodeID:    "node-1",
+			})
+
+			stdout, _, callErr := captureOutput(t, func() error {
+				_, err := ag.CallLocal(parentCtx, "child", map[string]any{"msg": "hi"})
+				return err
+			})
+
+			if tt.wantErr == "" {
+				require.NoError(t, callErr)
+			} else {
+				require.Error(t, callErr)
+				assert.Contains(t, callErr.Error(), tt.wantErr)
+			}
+
+			lines := strings.Split(strings.TrimSpace(stdout), "\n")
+			require.GreaterOrEqual(t, len(lines), 2)
+
+			var seen bool
+			for _, line := range lines {
+				var entry ExecutionLogEntry
+				require.NoError(t, json.Unmarshal([]byte(line), &entry))
+				if entry.EventType != tt.wantEvent {
+					continue
+				}
+				seen = true
+				assert.Equal(t, "child", entry.ReasonerID)
+				assert.Equal(t, tt.wantLevel, entry.Level)
+				assert.Equal(t, "sdk.runtime", entry.Source)
+			}
+			assert.True(t, seen, "expected %s log entry", tt.wantEvent)
+		})
+	}
+}
+
 func TestCallLocalUnknownReasoner(t *testing.T) {
 	cfg := Config{
 		NodeID:  "node-1",
@@ -1446,28 +1872,37 @@ func TestCallLocalUnknownReasoner(t *testing.T) {
 }
 
 func TestCall_TargetPrefixing(t *testing.T) {
-    var capturedPath string
+	var capturedSubmitPath string
 
-    server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-        capturedPath = r.URL.Path
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			capturedSubmitPath = r.URL.Path
+			w.WriteHeader(http.StatusAccepted)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"execution_id": "exec-p",
+				"run_id":       "run-p",
+				"status":       "queued",
+			})
+			return
+		}
 
-        resp := map[string]any{
-            "status": "succeeded",
-            "result": map[string]any{"ok": true},
-        }
-        _ = json.NewEncoder(w).Encode(resp)
-    }))
-    defer server.Close()
+		resp := map[string]any{
+			"status": "succeeded",
+			"result": map[string]any{"ok": true},
+		}
+		_ = json.NewEncoder(w).Encode(resp)
+	}))
+	defer server.Close()
 
-    agent, _ := New(Config{
-        NodeID:        "node-1",
-        Version:       "1.0.0",
-        AgentFieldURL: server.URL,
-        Logger:        log.New(io.Discard, "", 0),
-    })
+	agent, _ := New(Config{
+		NodeID:        "node-1",
+		Version:       "1.0.0",
+		AgentFieldURL: server.URL,
+		Logger:        log.New(io.Discard, "", 0),
+	})
 
-    _, err := agent.Call(context.Background(), "lookup", nil)
-    require.NoError(t, err)
+	_, err := agent.Call(context.Background(), "lookup", nil)
+	require.NoError(t, err)
 
-    assert.Contains(t, capturedPath, "/execute/node-1.lookup")
+	assert.Contains(t, capturedSubmitPath, "/execute/async/node-1.lookup")
 }

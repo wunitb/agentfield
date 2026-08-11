@@ -59,6 +59,8 @@ func mergeDBConfig(target, dbCfg *config.Config) {
 	if dbCfg.AgentField.NodeHealth.CheckInterval != 0 {
 		target.AgentField.NodeHealth = dbCfg.AgentField.NodeHealth
 	}
+	// ARD exposure is intentionally not merged from DB config. File/env config
+	// defines the deployment guardrails; runtime opt-in state lives in ard.state.
 	// Merge execution cleanup field-by-field to avoid zeroing out unset fields
 	if dbCfg.AgentField.ExecutionCleanup.RetentionPeriod != 0 {
 		target.AgentField.ExecutionCleanup.RetentionPeriod = dbCfg.AgentField.ExecutionCleanup.RetentionPeriod
@@ -113,6 +115,11 @@ func mergeDBConfig(target, dbCfg *config.Config) {
 	// Features
 	if dbCfg.Features.DID.Method != "" {
 		target.Features.DID = dbCfg.Features.DID
+	}
+	// MCP's default is enabled, so the pointer distinguishes an omitted setting
+	// from an explicit database-backed `features.mcp.enabled: false` kill switch.
+	if dbCfg.Features.MCP.Enabled != nil {
+		target.Features.MCP.Enabled = dbCfg.Features.MCP.Enabled
 	}
 	// NOTE: Connector config (token, capabilities) is intentionally NOT merged
 	// from DB. These are security-sensitive and must come from file/env config,

@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/Agent-Field/agentfield/control-plane/internal/services"
 	"github.com/Agent-Field/agentfield/control-plane/pkg/types"
 
 	"github.com/gin-gonic/gin"
@@ -557,12 +558,79 @@ func TestApprovalWebhook_HaxSignatureFormat(t *testing.T) {
 	require.Equal(t, http.StatusOK, resp.Code)
 }
 
+func TestApprovalWebhook_HaxSignatureRejectsStaleTimestamp(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	secret := "hax-webhook-secret"
+	store := seedWaitingExecution(t, "exec-hax-stale", "agent-1", "req-hax-stale")
+
+	router := gin.New()
+	router.POST("/api/v1/webhooks/approval-response", ApprovalWebhookHandler(store, secret))
+
+	body, _ := json.Marshal(map[string]any{
+		"requestId": "req-hax-stale",
+		"decision":  "approved",
+	})
+
+	// Use a timestamp 10 minutes in the past (outside 5-minute tolerance)
+	timestamp := fmt.Sprintf("%d", time.Now().Unix()-600)
+	signedPayload := timestamp + "." + string(body)
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(signedPayload))
+	sig := hex.EncodeToString(mac.Sum(nil))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/approval-response", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Hax-Signature", fmt.Sprintf("t=%s,v1=%s", timestamp, sig))
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	// Should be rejected due to stale timestamp
+	require.Equal(t, http.StatusUnauthorized, resp.Code)
+}
+
+func TestApprovalWebhook_HaxSignatureRejectsNonNumericTimestamp(t *testing.T) {
+	gin.SetMode(gin.TestMode)
+
+	secret := "hax-webhook-secret"
+	store := seedWaitingExecution(t, "exec-hax-nan", "agent-1", "req-hax-nan")
+
+	router := gin.New()
+	router.POST("/api/v1/webhooks/approval-response", ApprovalWebhookHandler(store, secret))
+
+	body, _ := json.Marshal(map[string]any{
+		"requestId": "req-hax-nan",
+		"decision":  "approved",
+	})
+
+	// Non-numeric timestamp
+	timestamp := "not-a-number"
+	signedPayload := timestamp + "." + string(body)
+	mac := hmac.New(sha256.New, []byte(secret))
+	mac.Write([]byte(signedPayload))
+	sig := hex.EncodeToString(mac.Sum(nil))
+
+	req := httptest.NewRequest(http.MethodPost, "/api/v1/webhooks/approval-response", bytes.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Hax-Signature", fmt.Sprintf("t=%s,v1=%s", timestamp, sig))
+	resp := httptest.NewRecorder()
+	router.ServeHTTP(resp, req)
+
+	// Should be rejected due to non-numeric timestamp
+	require.Equal(t, http.StatusUnauthorized, resp.Code)
+}
+
 // ---------------------------------------------------------------------------
 // Callback notification
 // ---------------------------------------------------------------------------
 
 func TestApprovalWebhook_CallbackNotification(t *testing.T) {
 	gin.SetMode(gin.TestMode)
+
+	// Allow loopback for httptest server — the SSRF-safe client blocks
+	// private IPs by default; tests need the allowlist to reach 127.0.0.1.
+	services.SetWebhookAllowedHosts([]string{"127.0.0.1"})
+	t.Cleanup(func() { services.SetWebhookAllowedHosts(nil) })
 
 	agent := &types.AgentNode{ID: "agent-1"}
 	store := newTestExecutionStorage(agent)

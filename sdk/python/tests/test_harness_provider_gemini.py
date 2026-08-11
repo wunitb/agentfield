@@ -6,10 +6,18 @@ from typing import Any
 from unittest.mock import patch
 
 import pytest
+from agentfield.exceptions import HarnessProviderUnavailable
 
 from agentfield.harness.providers._factory import build_provider
 from agentfield.harness.providers.gemini import GeminiProvider
 from agentfield.types import HarnessConfig
+
+
+@pytest.fixture(autouse=True)
+def mock_gemini_available(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        "agentfield.harness._availability.shutil.which", lambda path: path
+    )
 
 
 @pytest.mark.asyncio
@@ -26,7 +34,6 @@ async def test_gemini_provider_constructs_command_and_maps_result(
         return "final text\n", "", 0
 
     monkeypatch.setattr("agentfield.harness.providers.gemini.run_cli", fake_run_cli)
-
     provider = GeminiProvider(bin_path="/usr/local/bin/gemini")
     raw = await provider.execute(
         "hello",
@@ -37,11 +44,12 @@ async def test_gemini_provider_constructs_command_and_maps_result(
         },
     )
 
+    # gemini has no -C flag (it crashes on unknown args); the working dir is set
+    # via the process cwd. --yolo is the auto-approve flag (not --sandbox, which
+    # restricts execution). See agentfield#686, #687.
     assert captured["cmd"] == [
         "/usr/local/bin/gemini",
-        "-C",
-        "/tmp/work",
-        "--sandbox",
+        "--yolo",
         "-p",
         "hello",
     ]
@@ -64,10 +72,8 @@ async def test_gemini_provider_returns_helpful_binary_not_found_error(
     monkeypatch.setattr("agentfield.harness.providers.gemini.run_cli", fake_run_cli)
 
     provider = GeminiProvider(bin_path="gemini-missing")
-    raw = await provider.execute("hello", {})
-
-    assert raw.is_error is True
-    assert "Gemini binary not found at 'gemini-missing'" in (raw.error_message or "")
+    with pytest.raises(HarnessProviderUnavailable, match="gemini-missing"):
+        await provider.execute("hello", {})
 
 
 @pytest.mark.asyncio
@@ -148,3 +154,73 @@ async def test_gemini_cost_none_without_model(monkeypatch: pytest.MonkeyPatch):
     raw = await provider.execute("hello", {})
 
     assert raw.metrics.total_cost_usd is None
+
+
+@pytest.mark.asyncio
+async def test_gemini_never_uses_dash_C_and_project_dir_is_cwd(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """agentfield#686/#687: gemini has no -C (it crashes); project_dir is the
+    process cwd; plan -> --approval-mode plan; never --sandbox for permissions."""
+    captured: dict[str, Any] = {}
+
+    async def fake_run_cli(cmd, *, env=None, cwd=None, timeout=None):
+        _ = (env, timeout)
+        captured["cmd"] = cmd
+        captured["cwd"] = cwd
+        return "ok\n", "", 0
+
+    monkeypatch.setattr("agentfield.harness.providers.gemini.run_cli", fake_run_cli)
+
+    provider = GeminiProvider()
+    await provider.execute(
+        "hi",
+        {
+            "cwd": "/root/tasks/a",
+            "project_dir": "/root",
+            "permission_mode": "plan",
+        },
+    )
+
+    cmd = captured["cmd"]
+    assert "-C" not in cmd  # gemini rejects -C ("Unknown argument: C")
+    assert captured["cwd"] == "/root"  # project_dir is the process root
+    am_idx = cmd.index("--approval-mode")
+    assert cmd[am_idx + 1] == "plan"
+    assert "--sandbox" not in cmd
+
+
+@pytest.mark.asyncio
+async def test_gemini_auto_uses_yolo_not_sandbox(monkeypatch: pytest.MonkeyPatch):
+    captured: dict[str, Any] = {}
+
+    async def fake_run_cli(cmd, *, env=None, cwd=None, timeout=None):
+        _ = (env, cwd, timeout)
+        captured["cmd"] = cmd
+        return "ok\n", "", 0
+
+    monkeypatch.setattr("agentfield.harness.providers.gemini.run_cli", fake_run_cli)
+
+    provider = GeminiProvider()
+    await provider.execute("hi", {"permission_mode": "auto"})
+
+    assert "--yolo" in captured["cmd"]
+    assert "--sandbox" not in captured["cmd"]
+
+
+@pytest.mark.asyncio
+async def test_gemini_strips_model_variant_suffix(monkeypatch: pytest.MonkeyPatch):
+    captured: dict[str, Any] = {}
+
+    async def fake_run_cli(cmd, *, env=None, cwd=None, timeout=None):
+        _ = (env, cwd, timeout)
+        captured["cmd"] = cmd
+        return "final text\n", "", 0
+
+    monkeypatch.setattr("agentfield.harness.providers.gemini.run_cli", fake_run_cli)
+    provider = GeminiProvider()
+    await provider.execute("hello", {"model": "gemini-2.5-pro#high"})
+
+    m_idx = captured["cmd"].index("-m")
+    assert captured["cmd"][m_idx + 1] == "gemini-2.5-pro"
+    assert "--variant" not in captured["cmd"]

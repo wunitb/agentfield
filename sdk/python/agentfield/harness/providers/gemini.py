@@ -5,7 +5,13 @@ from __future__ import annotations
 import time
 from typing import Dict, Optional
 
-from agentfield.harness._cli import estimate_cli_cost, run_cli, strip_ansi
+from agentfield.harness._cli import (
+    estimate_cli_cost,
+    resolve_model_and_variant,
+    run_cli,
+    strip_ansi,
+)
+from agentfield.harness._availability import ensure_cli_available, provider_unavailable
 from agentfield.harness._result import FailureType, Metrics, RawResult
 
 
@@ -16,14 +22,24 @@ class GeminiProvider:
         self._bin = bin_path
 
     async def execute(self, prompt: str, options: dict[str, object]) -> RawResult:
+        ensure_cli_available("gemini", self._bin)
         cmd = [self._bin]
 
-        if options.get("cwd"):
-            cmd.extend(["-C", str(options["cwd"])])
-        if options.get("permission_mode") == "auto":
-            cmd.extend(["--sandbox"])
-        if options.get("model"):
-            cmd.extend(["-m", str(options["model"])])
+        # permission_mode → approval mode (agentfield#687). NOTE: gemini's
+        # --sandbox RESTRICTS execution (runs tools in a container); it does NOT
+        # grant access. The old code used --sandbox for "auto", which was
+        # backwards. --yolo auto-approves all actions.
+        permission_mode = options.get("permission_mode")
+        if permission_mode == "auto":
+            cmd.append("--yolo")
+        elif permission_mode == "plan":
+            cmd.extend(["--approval-mode", "plan"])
+
+        # gemini has no reasoning-effort flag; strip any "#variant" suffix so
+        # the CLI still receives a valid model id.
+        model_value, _variant_value = resolve_model_and_variant(options)
+        if model_value:
+            cmd.extend(["-m", model_value])
         cmd.extend(["-p", prompt])
 
         env: Dict[str, str] = {}
@@ -35,25 +51,21 @@ class GeminiProvider:
                 if isinstance(key, str) and isinstance(value, str)
             }
 
+        # Gemini has NO -C/--cd flag — it rejects unknown args outright
+        # ("Unknown argument: C"), so the previous `-C <cwd>` crashed every call.
+        # The agent root is the process working directory; project_dir is the
+        # canonical field, cwd is the fallback (agentfield#686).
         cwd: Optional[str] = None
-        cwd_value = options.get("cwd")
-        if isinstance(cwd_value, str):
-            cwd = cwd_value
+        root = options.get("project_dir") or options.get("cwd")
+        if isinstance(root, str):
+            cwd = root
 
         start_api = time.monotonic()
 
         try:
             stdout, stderr, returncode = await run_cli(cmd, env=env, cwd=cwd)
-        except FileNotFoundError:
-            return RawResult(
-                is_error=True,
-                error_message=(
-                    f"Gemini binary not found at '{self._bin}'. "
-                    "Install Gemini CLI: https://github.com/google-gemini/gemini-cli"
-                ),
-                failure_type=FailureType.CRASH,
-                metrics=Metrics(),
-            )
+        except FileNotFoundError as exc:
+            raise provider_unavailable("gemini", self._bin) from exc
         except TimeoutError as exc:
             return RawResult(
                 is_error=True,
@@ -88,7 +100,7 @@ class GeminiProvider:
             error_message = None
 
         estimated_cost = estimate_cli_cost(
-            model=str(options.get("model", "")),
+            model=model_value or "",
             prompt=prompt,
             result_text=result_text,
         )

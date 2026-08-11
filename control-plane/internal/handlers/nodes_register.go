@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/Agent-Field/agentfield/control-plane/internal/events"
 	"github.com/Agent-Field/agentfield/control-plane/internal/logger"
 	"github.com/Agent-Field/agentfield/control-plane/internal/services"
 	"github.com/Agent-Field/agentfield/control-plane/internal/storage"
@@ -379,9 +380,10 @@ func RegisterNodeHandler(storageProvider storage.StorageProvider, uiService *ser
 		if newNode.GroupID == "" {
 			newNode.GroupID = newNode.ID
 		}
+		types.HydrateAgentSessions(&newNode)
 
 		// Normalize proposed_tags → tags for backward compatibility.
-		// If a skill/reasoner has proposed_tags but no tags, copy proposed_tags to tags.
+		// If a skill/reasoner/session has proposed_tags but no tags, copy proposed_tags to tags.
 		for i := range newNode.Reasoners {
 			if len(newNode.Reasoners[i].ProposedTags) > 0 && len(newNode.Reasoners[i].Tags) == 0 {
 				newNode.Reasoners[i].Tags = newNode.Reasoners[i].ProposedTags
@@ -398,6 +400,15 @@ func RegisterNodeHandler(storageProvider storage.StorageProvider, uiService *ser
 				newNode.Skills[i].ProposedTags = newNode.Skills[i].Tags
 			}
 		}
+		for i := range newNode.Sessions {
+			if len(newNode.Sessions[i].ProposedTags) > 0 && len(newNode.Sessions[i].Tags) == 0 {
+				newNode.Sessions[i].Tags = newNode.Sessions[i].ProposedTags
+			}
+			if len(newNode.Sessions[i].Tags) > 0 && len(newNode.Sessions[i].ProposedTags) == 0 {
+				newNode.Sessions[i].ProposedTags = newNode.Sessions[i].Tags
+			}
+		}
+		types.SyncAgentSessionsToMetadata(&newNode)
 
 		candidateList, defaultPort := gatherCallbackCandidates(newNode.BaseURL, newNode.CallbackDiscovery, c.ClientIP())
 		resolvedBaseURL := ""
@@ -557,6 +568,20 @@ func RegisterNodeHandler(storageProvider storage.StorageProvider, uiService *ser
 						}
 						newNode.Skills[i].ApprovedTags = approved
 					}
+					for i := range newNode.Sessions {
+						var approved []string
+						proposed := newNode.Sessions[i].ProposedTags
+						if len(proposed) == 0 {
+							proposed = newNode.Sessions[i].Tags
+						}
+						for _, t := range proposed {
+							if _, ok := approvedSet[strings.ToLower(strings.TrimSpace(t))]; ok {
+								approved = append(approved, t)
+							}
+						}
+						newNode.Sessions[i].ApprovedTags = approved
+					}
+					types.SyncAgentSessionsToMetadata(&newNode)
 				}
 
 				// If lifecycle was offline or empty, reset to starting so the
@@ -603,13 +628,67 @@ func RegisterNodeHandler(storageProvider storage.StorageProvider, uiService *ser
 			}
 		}
 
+		// Detect a mid-flight redeploy BEFORE storing the new row, so we can
+		// compare the *previously stored* instance_id against the one the new
+		// process is sending. If they're both non-empty and differ, the previous
+		// OS process is gone — every in-flight Agent.call awaiting a result
+		// inside that process is orphaned (its in-memory poll died with the
+		// process). We must fail those rows or the parent reasoner sits in
+		// `running` forever in the DAG. See PR #532 for the production trace
+		// (run_1778004368903_9345a88f).
+		//
+		// Strict guard: BOTH must be non-empty. An empty stored value means
+		// the prior process was on an older SDK that didn't report instance_id;
+		// we can't safely conclude its work is dead, so we don't reap.
+		shouldReapOrphans := isReRegistration &&
+			existingNode != nil &&
+			strings.TrimSpace(existingNode.InstanceID) != "" &&
+			strings.TrimSpace(newNode.InstanceID) != "" &&
+			existingNode.InstanceID != newNode.InstanceID
+		oldInstanceID := ""
+		if shouldReapOrphans {
+			oldInstanceID = existingNode.InstanceID
+		}
+
 		// Store the new node
 		if err := storageProvider.RegisterAgent(ctx, &newNode); err != nil {
 			logger.Logger.Error().Err(err).Msg("❌ Storage error")
 			c.JSON(http.StatusInternalServerError, gin.H{"error": "Failed to store node: " + err.Error()})
 			return
 		}
+		events.PublishNodeRegistered(newNode.ID, &newNode)
 		InvalidateDiscoveryCache()
+
+		if shouldReapOrphans {
+			reason := fmt.Sprintf(
+				"agent_restart_orphaned: %s re-registered with new instance %s (was %s); previous process is gone, in-flight reasoner cannot be revived",
+				newNode.ID, newNode.InstanceID, oldInstanceID,
+			)
+			reaped, reapErr := storageProvider.MarkAgentExecutionsOrphaned(ctx, newNode.ID, reason)
+			if reapErr != nil {
+				// Best-effort: log loudly but don't fail the registration. The agent
+				// is already persisted; the existing stale-execution sweep will
+				// eventually clean these up via the 30-minute updated_at fallback.
+				logger.Logger.Error().Err(reapErr).
+					Str("agent_node_id", newNode.ID).
+					Str("old_instance_id", oldInstanceID).
+					Str("new_instance_id", newNode.InstanceID).
+					Msg("⚠️ Failed to reap orphaned executions on agent restart; falling back to stale-execution sweep")
+			} else if reaped > 0 {
+				logger.Logger.Warn().
+					Int("orphans_reaped", reaped).
+					Str("agent_node_id", newNode.ID).
+					Str("old_instance_id", oldInstanceID).
+					Str("new_instance_id", newNode.InstanceID).
+					Msg("🧹 Reaped in-flight executions orphaned by agent restart")
+			} else {
+				logger.Logger.Debug().
+					Str("agent_node_id", newNode.ID).
+					Str("old_instance_id", oldInstanceID).
+					Str("new_instance_id", newNode.InstanceID).
+					Msg("Agent restart detected; no in-flight executions to reap")
+			}
+		}
 
 		logger.Logger.Debug().Msgf("✅ Successfully registered node: %s", newNode.ID)
 
@@ -679,6 +758,12 @@ func RegisterNodeHandler(storageProvider storage.StorageProvider, uiService *ser
 			presenceManager.Touch(newNode.ID, newNode.Version, time.Now().UTC())
 		}
 
+		// Upsert code-managed triggers for any reasoner that declared bindings.
+		// These rows are owned by agent code; the UI cannot delete them. We
+		// echo the assigned trigger IDs back so the SDK can log public webhook
+		// URLs at startup.
+		triggerSummary := upsertCodeManagedTriggers(ctx, storageProvider, &newNode)
+
 		responsePayload := gin.H{
 			"success": true,
 			"message": "Node registered successfully",
@@ -691,6 +776,10 @@ func RegisterNodeHandler(storageProvider storage.StorageProvider, uiService *ser
 
 		if newNode.CallbackDiscovery != nil {
 			responsePayload["callback_discovery"] = newNode.CallbackDiscovery
+		}
+
+		if len(triggerSummary) > 0 {
+			responsePayload["triggers"] = triggerSummary
 		}
 
 		// Include tag approval status in response when agent is pending
@@ -793,9 +882,10 @@ func RegisterServerlessAgentHandler(storageProvider storage.StorageProvider, uiS
 
 		// Parse discovery response
 		var discoveryData struct {
-			NodeID    string `json:"node_id"`
-			Version   string `json:"version"`
-			Reasoners []struct {
+			NodeID       string `json:"node_id"`
+			Version      string `json:"version"`
+			AuthRequired bool   `json:"auth_required"`
+			Reasoners    []struct {
 				ID           string                 `json:"id"`
 				Name         string                 `json:"name"`
 				Description  string                 `json:"description"`
@@ -840,6 +930,7 @@ func RegisterServerlessAgentHandler(storageProvider storage.StorageProvider, uiS
 			outputSchemaBytes, _ := json.Marshal(r.OutputSchema)
 			reasoners[i] = types.ReasonerDefinition{
 				ID:           r.ID,
+				Description:  r.Description,
 				InputSchema:  json.RawMessage(inputSchemaBytes),
 				OutputSchema: json.RawMessage(outputSchemaBytes),
 				Tags:         r.Tags,
@@ -856,6 +947,7 @@ func RegisterServerlessAgentHandler(storageProvider storage.StorageProvider, uiS
 			inputSchemaBytes, _ := json.Marshal(s.InputSchema)
 			skills[i] = types.SkillDefinition{
 				ID:          s.ID,
+				Description: s.Description,
 				InputSchema: json.RawMessage(inputSchemaBytes),
 				Tags:        s.Tags,
 			}
@@ -879,8 +971,9 @@ func RegisterServerlessAgentHandler(storageProvider storage.StorageProvider, uiS
 			LifecycleStatus: types.AgentStatusReady,    // Serverless agents are always ready
 			Metadata: types.AgentMetadata{
 				Custom: map[string]interface{}{
-					"serverless":    true,
-					"discovery_url": discoveryURL,
+					"serverless":           true,
+					"discovery_url":        discoveryURL,
+					"origin_auth_required": discoveryData.AuthRequired,
 				},
 			},
 		}
@@ -954,6 +1047,7 @@ func RegisterServerlessAgentHandler(storageProvider storage.StorageProvider, uiS
 			})
 			return
 		}
+		events.PublishNodeRegistered(newNode.ID, &newNode)
 		InvalidateDiscoveryCache()
 
 		logger.Logger.Info().Msgf("✅ Successfully registered serverless agent: %s", newNode.ID)

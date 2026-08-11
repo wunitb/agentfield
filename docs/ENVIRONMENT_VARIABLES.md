@@ -45,10 +45,46 @@ If set, the control plane requires an API key for most endpoints.
 
 - `AGENTFIELD_API_KEY` or `AGENTFIELD_API_AUTH_API_KEY`: API key checked by the control plane.
 
+It is optional only for a control plane used from the machine it runs on. The
+endpoints that install packages or read and write credentials — package
+install/update/uninstall, the secret store, agent `env` and agent `config` —
+additionally require the caller to be on the local host while no key is set, and
+refuse everything else with `401`. That covers the default single-user setup
+without a key, and means any other topology needs one:
+
+- another machine on the network, including a browser on your laptop pointed at
+  a control plane running on a server
+- a container, where a client on the host reaches the server through a bridge
+  network rather than loopback
+- anything behind a reverse proxy or tunnel
+
+The reverse-proxy case needs a key for a different reason than the others: the
+check looks at the connection's real peer address, so if the proxy runs on the
+same host as the control plane, every forwarded request already looks local and
+the restriction protects nothing. Forwarded headers such as `X-Forwarded-For`
+are deliberately ignored here — trusting them would let any caller claim to be
+local — so a proxied deployment must set a key.
+
+Clients send the key as the `X-API-Key` header (or `Authorization: Bearer`). For
+the CLI, `af auth login` stores it and every later command sends it
+automatically.
+
 ### UI
 
 - `AGENTFIELD_UI_ENABLED` (default: `true`)
 - `AGENTFIELD_UI_MODE` (default: `embedded`)
+
+### Anonymous Telemetry
+
+Anonymous usage telemetry is enabled by default to help us improve AgentField. It records coarse product signals such as startup, agent registration, SDK language, runtime type, storage mode, and execution status buckets. Events use a pseudonymous, installation-scoped identifier; it represents an AgentField installation, not a person or account.
+
+The telemetry payload does not include prompts, inputs, outputs, logs, secrets, API keys, IP addresses, hostnames, user IDs, DIDs, or raw error text. Sending is best-effort and does not affect control-plane or execution behavior.
+
+- `AGENTFIELD_TELEMETRY_ENABLED` (default: `true`): Set to `false` to disable anonymous usage telemetry.
+- `AGENTFIELD_TELEMETRY_ENDPOINT` (default: `https://agentfield.ai/api/oss/telemetry`): Hosted anonymous telemetry endpoint.
+- `AGENTFIELD_TELEMETRY_INSTALL_ID` (optional): Stable externally managed installation ID. Use a random, opaque value—not an email, account name, hostname, or other identifying value. The control plane hashes it before sending.
+- `AGENTFIELD_TELEMETRY_INSTALL_ID_PATH` (optional): Path for the persisted local install ID.
+- `AGENTFIELD_TELEMETRY_TIMEOUT` (default: `800ms`): Per-event send timeout. Failures are ignored.
 
 ### CORS (HTTP API)
 
@@ -56,7 +92,7 @@ These map to `api.cors.*` in config. When set via env, use comma-separated value
 
 - `AGENTFIELD_API_CORS_ALLOWED_ORIGINS` (comma-separated)
 - `AGENTFIELD_API_CORS_ALLOWED_METHODS` (comma-separated)
-- `AGENTFIELD_API_CORS_ALLOWED_HEADERS` (comma-separated)
+- `AGENTFIELD_API_CORS_ALLOWED_HEADERS` (comma-separated): Include `X-Admin-Token` when browser clients access admin or `/debug/pprof/*` endpoints.
 - `AGENTFIELD_API_CORS_EXPOSED_HEADERS` (comma-separated)
 - `AGENTFIELD_API_CORS_ALLOW_CREDENTIALS` (`true`/`false`)
 
@@ -65,8 +101,10 @@ These map to `api.cors.*` in config. When set via env, use comma-separated value
 When enabled, the control plane issues DID identities to agents and enforces tag-based access policies on agent-to-agent calls.
 
 - `AGENTFIELD_AUTHORIZATION_ENABLED` (default: `false`): Enable VC-based authorization.
+- `AGENTFIELD_AUTHORIZATION_ADMIN_TOKEN` (recommended): Separate token for admin operations and `/debug/pprof/*`; clients send it in `X-Admin-Token`. Without it, those endpoints rely on the global API key, so do not expose pprof outside trusted networks unless authentication is configured.
 - `AGENTFIELD_AUTHORIZATION_MASTER_SEED` (required when enabled): Master seed for deriving Ed25519 keypairs for agent DIDs. Keep this secret and consistent across restarts — changing it invalidates all existing DID signatures.
 - `AGENTFIELD_AUTHORIZATION_TAG_APPROVAL_MODE` (default: `auto`): `auto` (tags approved immediately) or `admin` (tags require admin approval before the agent becomes ready).
+- `AGENTFIELD_AUTHORIZATION_DEFAULT_DENY` (default: `false`): When `true`, the tag policy middleware returns HTTP 403 for any request where no access policy matches the `(caller_tags, target_tags, function)` tuple. Default is `false`, preserving the existing behavior of allowing unmatched requests. The unmatched tuple is logged at `DEBUG` in both modes for diagnosis. Equivalent YAML: `features.did.authorization.default_deny`.
 
 ### Connector (External Management API)
 
@@ -108,3 +146,35 @@ The same concept applies to **Docker**:
 - `AGENT_CALLBACK_URL` (recommended in Docker/Kubernetes): URL the control plane will call back to (examples: `http://my-agent:8001`, or for host-run agents with Dockerized control plane: `http://host.docker.internal:8001`).
 
 Many Python examples also require model provider credentials (for example `OPENAI_API_KEY`), depending on the `AIConfig` you choose.
+
+### MiniMax video generation
+
+- `MINIMAX_API_KEY`: API key used by the Python SDK's MiniMax media provider.
+- `MINIMAX_BASE_URL` (optional): API base URL. Defaults to `https://api.minimax.io/v1`; use `https://api.minimaxi.com/v1` for the China endpoint.
+
+MiniMax video models are routed with the `minimax/` model prefix. The model suffix is sent unchanged to the video generation API.
+
+### OpenRouter attribution
+
+OpenRouter attribution is request metadata, not authentication. AgentField SDKs send these as `HTTP-Referer`, `X-OpenRouter-Title`, and `X-Title` for OpenRouter requests.
+
+- `AGENTFIELD_OPENROUTER_SITE_URL` (default: `https://agentfield.ai`)
+- `AGENTFIELD_OPENROUTER_APP_NAME` (default: `AgentField AI`)
+- `OR_SITE_URL`, `OR_APP_NAME`: LiteLLM-compatible attribution env vars.
+- `AGENTFIELD_OPENROUTER_ATTRIBUTION=false`: Disable OpenRouter attribution headers/env propagation.
+
+Explicit SDK config or explicit request headers win over env defaults. `AGENTFIELD_API_KEY`, SDK `api_key` / `apiKey`, Go `WithAPIKey`, and the `X-API-Key` header are only for AgentField control-plane authentication and are not used for OpenRouter attribution.
+
+### Infron
+
+- `INFRON_API_KEY`: API key for the Infron gateway. When it is the only gateway key set, the Go SDK's `ai.DefaultConfig()` points at `https://llm.onerouter.pro/v1` (`onerouter.pro` is the domain Infron serves its gateway from). `OPENAI_API_KEY` and `OPENROUTER_API_KEY` both keep precedence over it, so adding this key never reroutes an existing deployment.
+
+Infron is OpenAI-compatible and serves the standard `<provider>/<model>` ids, so a model moves across by prefix alone (`infron/moonshotai/kimi-k2.6`). The `infron/` prefix is a routing marker only and is stripped before the request is sent, since the gateway serves the bare id.
+
+Attribution is sent as `HTTP-Referer` and `X-Title`:
+
+- `AGENTFIELD_INFRON_SITE_URL` (default: `https://agentfield.ai`)
+- `AGENTFIELD_INFRON_APP_NAME` (default: `AgentField AI`)
+- `AGENTFIELD_INFRON_ATTRIBUTION=false`: Disable Infron attribution headers.
+
+When the `AGENTFIELD_INFRON_*` vars are unset, these OpenRouter attribution values are used as fallbacks, so a deployment that already declares its identity keeps it after switching gateways: `AGENTFIELD_OPENROUTER_SITE_URL`, `OR_SITE_URL`, `AGENTFIELD_OPENROUTER_APP_NAME`, `OR_APP_NAME`. The opt-out travels with them: when `AGENTFIELD_OPENROUTER_ATTRIBUTION=false`, these values are not inherited and the Infron defaults apply instead. To control Infron attribution specifically, set the `AGENTFIELD_INFRON_*` vars explicitly or disable it with `AGENTFIELD_INFRON_ATTRIBUTION=false`.

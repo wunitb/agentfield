@@ -3,6 +3,7 @@ package handlers
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,8 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/Agent-Field/agentfield/control-plane/internal/ard"
+	"github.com/Agent-Field/agentfield/control-plane/internal/config"
 	"github.com/Agent-Field/agentfield/control-plane/internal/events"
 	"github.com/Agent-Field/agentfield/control-plane/internal/logger"
 	"github.com/Agent-Field/agentfield/control-plane/internal/server/middleware"
@@ -33,6 +36,7 @@ type ExecutionStore interface {
 	ListAgentVersions(ctx context.Context, id string) ([]*types.AgentNode, error)
 	CreateExecutionRecord(ctx context.Context, execution *types.Execution) error
 	GetExecutionRecord(ctx context.Context, executionID string) (*types.Execution, error)
+	GetExecutionRecordsBatch(ctx context.Context, executionIDs []string) (map[string]*types.Execution, error)
 	UpdateExecutionRecord(ctx context.Context, executionID string, update func(*types.Execution) (*types.Execution, error)) (*types.Execution, error)
 	QueryExecutionRecords(ctx context.Context, filter types.ExecutionFilter) ([]*types.Execution, error)
 	RegisterExecutionWebhook(ctx context.Context, webhook *types.ExecutionWebhook) error
@@ -46,9 +50,10 @@ type ExecutionStore interface {
 
 // ExecuteRequest represents an execution request from an agent client.
 type ExecuteRequest struct {
-	Input   map[string]interface{} `json:"input"`
-	Context map[string]interface{} `json:"context,omitempty"`
-	Webhook *WebhookRequest        `json:"webhook,omitempty"`
+	Input     map[string]interface{} `json:"input"`
+	Context   map[string]interface{} `json:"context,omitempty"`
+	Webhook   *WebhookRequest        `json:"webhook,omitempty"`
+	Authority *RunAuthorityRef       `json:"authority,omitempty"`
 }
 
 // WebhookRequest represents webhook registration parameters supplied by the client.
@@ -121,16 +126,29 @@ type executionStatusUpdateRequest struct {
 	DurationMS   *int64                 `json:"duration_ms,omitempty"`
 	CompletedAt  *time.Time             `json:"completed_at,omitempty"`
 	Progress     *int                   `json:"progress,omitempty"`
+	// Usage is the optional token/cost usage object the agent SDK attaches at
+	// the top level of the status-callback body. It is a sibling of Result, so
+	// it is never persisted into the result payload. Absent = no-op.
+	Usage map[string]interface{} `json:"usage,omitempty"`
+}
+
+type replayHit struct {
+	SourceExecutionID string
+	SourceRunID       string
+	Result            json.RawMessage
 }
 
 type executionController struct {
-	store         ExecutionStore
-	httpClient    *http.Client
-	payloads      services.PayloadStore
-	webhooks      services.WebhookDispatcher
-	eventBus      *events.ExecutionEventBus
-	timeout       time.Duration
-	internalToken string // sent as Authorization header when forwarding to agents
+	store          ExecutionStore
+	httpClient     *http.Client
+	payloads       services.PayloadStore
+	webhooks       services.WebhookDispatcher
+	eventBus       *events.ExecutionEventBus
+	timeout        time.Duration
+	internalToken  string // sent as Authorization header when forwarding to agents
+	readARDConfig  func() config.ARDConfig
+	runAuthority   *RunAuthorityVerifier
+	redactPayloads bool
 }
 
 type asyncExecutionJob struct {
@@ -157,46 +175,85 @@ var (
 
 	completionOnce  sync.Once
 	completionQueue chan completionJob
+
+	// defaultRedactPayloads controls whether execution input/output data is
+	// excluded from internal event bus payloads. Set at server startup from
+	// config.Logging.ShouldRedactPayloads(). Default true (safe).
+	defaultRedactPayloads = true
 )
+
+// SetRedactPayloads configures the package-level default for payload redaction.
+// Call this once at server startup after loading config.
+func SetRedactPayloads(redact bool) {
+	defaultRedactPayloads = redact
+}
 
 const (
 	maxWebhookHeaders      = 20
 	maxWebhookHeaderLength = 512
 	maxWebhookSecretLength = 4096
+
+	// maxBatchStatusIDs caps the number of execution IDs a single
+	// batch-status request may fetch, matching the storage-layer cap.
+	maxBatchStatusIDs = 500
 )
 
 // ExecuteHandler handles synchronous execution requests.
 func ExecuteHandler(store ExecutionStore, payloads services.PayloadStore, webhooks services.WebhookDispatcher, timeout time.Duration, internalToken string) gin.HandlerFunc {
-	controller := newExecutionController(store, payloads, webhooks, timeout, internalToken)
+	controller := newExecutionController(store, payloads, webhooks, timeout, internalToken, nil)
+	return controller.handleSync
+}
+
+// ExecuteHandlerWithARD handles synchronous execution requests and can route
+// explicitly-callable imported ARD resources through the same SDK app.call path.
+func ExecuteHandlerWithARD(store ExecutionStore, payloads services.PayloadStore, webhooks services.WebhookDispatcher, timeout time.Duration, internalToken string, readARDConfig func() config.ARDConfig) gin.HandlerFunc {
+	return ExecuteHandlerWithARDAndRunAuthority(store, payloads, webhooks, timeout, internalToken, readARDConfig, nil)
+}
+
+// ExecuteHandlerWithARDAndRunAuthority additionally enforces an optional outer lifecycle authority.
+func ExecuteHandlerWithARDAndRunAuthority(store ExecutionStore, payloads services.PayloadStore, webhooks services.WebhookDispatcher, timeout time.Duration, internalToken string, readARDConfig func() config.ARDConfig, authority *RunAuthorityVerifier) gin.HandlerFunc {
+	controller := newExecutionControllerWithRunAuthority(store, payloads, webhooks, timeout, internalToken, readARDConfig, authority)
 	return controller.handleSync
 }
 
 // ExecuteAsyncHandler handles asynchronous execution requests.
 func ExecuteAsyncHandler(store ExecutionStore, payloads services.PayloadStore, webhooks services.WebhookDispatcher, timeout time.Duration, internalToken string) gin.HandlerFunc {
-	controller := newExecutionController(store, payloads, webhooks, timeout, internalToken)
+	return ExecuteAsyncHandlerWithRunAuthority(store, payloads, webhooks, timeout, internalToken, nil)
+}
+
+// ExecuteAsyncHandlerWithRunAuthority enforces an optional outer lifecycle authority for queued work.
+func ExecuteAsyncHandlerWithRunAuthority(store ExecutionStore, payloads services.PayloadStore, webhooks services.WebhookDispatcher, timeout time.Duration, internalToken string, authority *RunAuthorityVerifier) gin.HandlerFunc {
+	controller := newExecutionControllerWithRunAuthority(store, payloads, webhooks, timeout, internalToken, nil, authority)
 	return controller.handleAsync
 }
 
 // GetExecutionStatusHandler resolves a single execution record.
 func GetExecutionStatusHandler(store ExecutionStore) gin.HandlerFunc {
-	controller := newExecutionController(store, nil, nil, 0, "")
+	controller := newExecutionController(store, nil, nil, 0, "", nil)
 	return controller.handleStatus
 }
 
 // BatchExecutionStatusHandler resolves multiple execution records.
 func BatchExecutionStatusHandler(store ExecutionStore) gin.HandlerFunc {
-	controller := newExecutionController(store, nil, nil, 0, "")
+	controller := newExecutionController(store, nil, nil, 0, "", nil)
 	return controller.handleBatchStatus
 }
 
 // UpdateExecutionStatusHandler ingests status callbacks from agent nodes.
 func UpdateExecutionStatusHandler(store ExecutionStore, payloads services.PayloadStore, webhooks services.WebhookDispatcher, timeout time.Duration) gin.HandlerFunc {
-	controller := newExecutionController(store, payloads, webhooks, timeout, "")
+	controller := newExecutionController(store, payloads, webhooks, timeout, "", nil)
 	return controller.handleStatusUpdate
 }
 
-func newExecutionController(store ExecutionStore, payloads services.PayloadStore, webhooks services.WebhookDispatcher, timeout time.Duration, internalToken string) *executionController {
-	// Use default timeout if not provided (0 or negative)
+func newExecutionController(store ExecutionStore, payloads services.PayloadStore, webhooks services.WebhookDispatcher, timeout time.Duration, internalToken string, readARDConfig ...func() config.ARDConfig) *executionController {
+	var ardConfigReader func() config.ARDConfig
+	if len(readARDConfig) > 0 {
+		ardConfigReader = readARDConfig[0]
+	}
+	return newExecutionControllerWithRunAuthority(store, payloads, webhooks, timeout, internalToken, ardConfigReader, nil)
+}
+
+func newExecutionControllerWithRunAuthority(store ExecutionStore, payloads services.PayloadStore, webhooks services.WebhookDispatcher, timeout time.Duration, internalToken string, readARDConfig func() config.ARDConfig, authority *RunAuthorityVerifier) *executionController {
 	if timeout <= 0 {
 		timeout = 90 * time.Second
 	}
@@ -205,19 +262,64 @@ func newExecutionController(store ExecutionStore, payloads services.PayloadStore
 		httpClient: &http.Client{
 			Timeout: timeout,
 		},
-		payloads:      payloads,
-		webhooks:      webhooks,
-		eventBus:      store.GetExecutionEventBus(),
-		timeout:       timeout,
-		internalToken: internalToken,
+		payloads:       payloads,
+		webhooks:       webhooks,
+		eventBus:       store.GetExecutionEventBus(),
+		timeout:        timeout,
+		internalToken:  internalToken,
+		readARDConfig:  readARDConfig,
+		runAuthority:   authority,
+		redactPayloads: defaultRedactPayloads,
 	}
 }
 
 func (c *executionController) handleSync(ctx *gin.Context) {
+	if c.tryHandleExternalARDCall(ctx) {
+		return
+	}
+
 	reqCtx := ctx.Request.Context()
 	plan, err := c.prepareExecution(reqCtx, ctx)
 	if err != nil {
 		writeExecutionError(ctx, err)
+		return
+	}
+	plan.executionMode = "sync"
+
+	guardedCtx, stopAuthorityGuard, err := c.guardRunAuthority(reqCtx, plan)
+	if err != nil {
+		_ = c.failExecution(reqCtx, plan, err, 0, nil)
+		writeExecutionError(ctx, err)
+		return
+	}
+	defer stopAuthorityGuard()
+	reqCtx = guardedCtx
+
+	if plan.authorityDuplicate {
+		writeExecutionError(ctx, &callError{
+			statusCode: http.StatusConflict,
+			message:    "authority-bound synchronous execution has already been submitted",
+		})
+		return
+	}
+
+	if plan.replayHit != nil {
+		if err := c.completeReplayHit(reqCtx, plan); err != nil {
+			writeExecutionError(ctx, err)
+			return
+		}
+		ctx.Header("X-Execution-ID", plan.exec.ExecutionID)
+		ctx.Header("X-Run-ID", plan.exec.RunID)
+		ctx.Header("X-AgentField-Replay-Hit", plan.replayHit.SourceExecutionID)
+		ctx.JSON(http.StatusOK, ExecuteResponse{
+			ExecutionID:       plan.exec.ExecutionID,
+			RunID:             plan.exec.RunID,
+			Status:            types.ExecutionStatusSucceeded,
+			Result:            decodeJSON(plan.replayHit.Result),
+			DurationMS:        0,
+			FinishedAt:        time.Now().UTC().Format(time.RFC3339),
+			WebhookRegistered: plan.webhookRegistered,
+		})
 		return
 	}
 
@@ -233,6 +335,10 @@ func (c *executionController) handleSync(ctx *gin.Context) {
 	c.publishExecutionStartedEvent(plan)
 
 	resultBody, elapsed, asyncAccepted, callErr := c.callAgent(reqCtx, plan)
+	if authorityErr := c.runAuthorityRevocationError(reqCtx, plan, elapsed); authorityErr != nil {
+		writeExecutionError(ctx, authorityErr)
+		return
+	}
 
 	// If agent returned HTTP 202 (async acknowledgment), wait for callback completion
 	if callErr == nil && asyncAccepted {
@@ -246,6 +352,10 @@ func (c *executionController) handleSync(ctx *gin.Context) {
 		// Use configured timeout to match the HTTP client timeout
 		exec, waitErr := c.waitForExecutionCompletion(reqCtx, plan.exec.ExecutionID, c.timeout)
 		if waitErr != nil {
+			if authorityErr := c.runAuthorityRevocationError(reqCtx, plan, time.Since(plan.exec.StartedAt)); authorityErr != nil {
+				writeExecutionError(ctx, authorityErr)
+				return
+			}
 			logger.Logger.Error().
 				Err(waitErr).
 				Str("execution_id", plan.exec.ExecutionID).
@@ -272,25 +382,25 @@ func (c *executionController) handleSync(ctx *gin.Context) {
 			finishedAt = time.Now().UTC().Format(time.RFC3339)
 		}
 
-		// Check if execution failed
-		if exec.Status == types.ExecutionStatusFailed {
-			errMsg := "execution failed"
+		if exec.Status != types.ExecutionStatusSucceeded {
+			errMsg := "execution did not succeed"
 			if exec.ErrorMessage != nil {
 				errMsg = *exec.ErrorMessage
 			}
 			response := ExecuteResponse{
-				ExecutionID:       exec.ExecutionID,
-				RunID:             exec.RunID,
-				Status:            string(exec.Status),
-				ErrorMessage:      &errMsg,
-				ErrorDetails:      decodeJSON(exec.ResultPayload),
-				DurationMS:        durationMS,
-				FinishedAt:        finishedAt,
-				WebhookRegistered: exec.WebhookRegistered,
+				ExecutionID: exec.ExecutionID, RunID: exec.RunID, Status: string(exec.Status), ErrorMessage: &errMsg,
+				ErrorDetails: decodeJSON(exec.ResultPayload), DurationMS: durationMS, FinishedAt: finishedAt, WebhookRegistered: exec.WebhookRegistered,
+			}
+			statusCode := http.StatusBadGateway
+			switch exec.Status {
+			case types.ExecutionStatusCancelled:
+				statusCode = http.StatusConflict
+			case types.ExecutionStatusTimeout:
+				statusCode = http.StatusGatewayTimeout
 			}
 			ctx.Header("X-Execution-ID", exec.ExecutionID)
 			ctx.Header("X-Run-ID", exec.RunID)
-			ctx.JSON(http.StatusBadGateway, response)
+			ctx.JSON(statusCode, response)
 			return
 		}
 
@@ -313,7 +423,17 @@ func (c *executionController) handleSync(ctx *gin.Context) {
 		return
 	}
 
-	// Agent returned HTTP 200 (synchronous result), process completion normally
+	// Agent returned HTTP 200 (synchronous result). Extract any token/cost
+	// usage the SDK attached to the result envelope, persist it (best-effort),
+	// and strip it so it never leaks into the stored/returned result payload.
+	if callErr == nil {
+		if usageRaw, stripped := extractUsageFromResult(resultBody); usageRaw != nil {
+			resultBody = stripped
+			c.ingestUsage(reqCtx, plan.exec, usageRaw)
+		}
+	}
+
+	// Process completion normally
 	job := completionJob{
 		controller: c,
 		plan:       plan,
@@ -355,11 +475,399 @@ func (c *executionController) handleSync(ctx *gin.Context) {
 	ctx.JSON(http.StatusOK, response)
 }
 
+func (c *executionController) tryHandleExternalARDCall(ctx *gin.Context) bool {
+	if c.readARDConfig == nil {
+		return false
+	}
+	targetParam := strings.TrimSpace(ctx.Param("target"))
+	if !strings.HasPrefix(targetParam, "external.") {
+		return false
+	}
+
+	var req ExecuteRequest
+	if err := ctx.ShouldBindJSON(&req); err != nil {
+		RespondBadRequest(ctx, "invalid request body: "+err.Error())
+		return true
+	}
+	if req.Input == nil {
+		req.Input = map[string]interface{}{}
+	}
+	if req.Authority != nil {
+		if err := normalizeRunAuthorityRef(req.Authority); err != nil {
+			writeExecutionError(ctx, &callError{statusCode: http.StatusBadRequest, message: err.Error()})
+			return true
+		}
+	}
+
+	reader, ok := c.store.(ard.StateReader)
+	if !ok {
+		RespondInternalError(ctx, "external ARD invocation state is unavailable")
+		return true
+	}
+	state, err := ard.LoadStateReadOnly(ctx.Request.Context(), reader)
+	if err != nil {
+		RespondInternalError(ctx, err.Error())
+		return true
+	}
+	effective := ard.Effective(c.readARDConfig(), state)
+	if !effective.ExternalInvocationEnabled {
+		RespondError(ctx, http.StatusForbidden, "external ARD invocation is disabled by config")
+		return true
+	}
+
+	entry, binding, ok := externalARDBindingForTarget(state, targetParam)
+	if !ok {
+		RespondNotFound(ctx, "external ARD target is not imported and callable")
+		return true
+	}
+	if err := validateExternalARDOperation(req, binding); err != nil {
+		writeExecutionError(ctx, err)
+		return true
+	}
+
+	headers := readExecutionHeaders(ctx)
+	runID := headers.runID
+	if runID == "" {
+		runID = utils.GenerateRunID()
+	}
+	executionID := utils.GenerateExecutionID()
+	if req.Authority != nil {
+		executionID = authorityExecutionID(*req.Authority, nil)
+	}
+	start := time.Now().UTC()
+	clientPayload := map[string]interface{}{"input": req.Input}
+	if len(req.Context) > 0 {
+		clientPayload["context"] = req.Context
+	}
+	storedPayload, err := json.Marshal(clientPayload)
+	if err != nil {
+		writeExecutionError(ctx, fmt.Errorf("encode execution payload: %w", err))
+		return true
+	}
+	externalReasonerID := strings.TrimPrefix(targetParam, "external.")
+	exec := &types.Execution{
+		ExecutionID:       executionID,
+		RunID:             runID,
+		ParentExecutionID: headers.parentExecutionID,
+		AgentNodeID:       "external",
+		ReasonerID:        externalReasonerID,
+		NodeID:            "external",
+		Status:            types.ExecutionStatusRunning,
+		InputPayload:      json.RawMessage(storedPayload),
+		StartedAt:         start,
+		CreatedAt:         start,
+		UpdatedAt:         start,
+	}
+	bindExecutionAuthority(exec, req.Authority)
+	if headers.sessionID != nil {
+		exec.SessionID = headers.sessionID
+	}
+	if headers.actorID != nil {
+		exec.ActorID = headers.actorID
+	}
+	preAdmission := &preparedExecution{exec: exec, runAuthority: req.Authority}
+	if err := c.verifyRunAuthority(ctx.Request.Context(), preAdmission); err != nil {
+		writeExecutionError(ctx, err)
+		return true
+	}
+	exec.InputURI = c.savePayload(ctx.Request.Context(), storedPayload)
+	if err := c.store.CreateExecutionRecord(ctx.Request.Context(), exec); err != nil {
+		writeExecutionError(ctx, fmt.Errorf("create external ARD execution record: %w", err))
+		return true
+	}
+	plan := &preparedExecution{exec: exec, runAuthority: req.Authority}
+	guardedCtx, stopAuthorityGuard, err := c.guardRunAuthority(ctx.Request.Context(), plan)
+	if err != nil {
+		_ = c.finishExternalARDExecution(ctx.Request.Context(), executionID, types.ExecutionStatusFailed, time.Since(start), nil, err)
+		writeExecutionError(ctx, err)
+		return true
+	}
+	defer stopAuthorityGuard()
+
+	result, err := c.callExternalARD(guardedCtx, req, entry, binding, runID, executionID)
+	if err != nil {
+		if authorityErr := c.runAuthorityRevocationError(guardedCtx, plan, time.Since(start)); authorityErr != nil {
+			writeExecutionError(ctx, authorityErr)
+			return true
+		}
+		_ = c.finishExternalARDExecution(ctx.Request.Context(), executionID, types.ExecutionStatusFailed, time.Since(start), nil, err)
+		writeExecutionError(ctx, err)
+		return true
+	}
+	if authorityErr := c.runAuthorityRevocationError(guardedCtx, plan, time.Since(start)); authorityErr != nil {
+		writeExecutionError(ctx, authorityErr)
+		return true
+	}
+	resultBytes, err := json.Marshal(result)
+	if err != nil {
+		_ = c.finishExternalARDExecution(ctx.Request.Context(), executionID, types.ExecutionStatusFailed, time.Since(start), nil, err)
+		writeExecutionError(ctx, fmt.Errorf("encode external ARD result: %w", err))
+		return true
+	}
+	if err := c.finishExternalARDExecution(ctx.Request.Context(), executionID, types.ExecutionStatusSucceeded, time.Since(start), resultBytes, nil); err != nil {
+		writeExecutionError(ctx, err)
+		return true
+	}
+
+	ctx.Header("X-Execution-ID", executionID)
+	ctx.Header("X-Run-ID", runID)
+	ctx.JSON(http.StatusOK, ExecuteResponse{
+		ExecutionID: executionID,
+		RunID:       runID,
+		Status:      types.ExecutionStatusSucceeded,
+		Result:      result,
+		DurationMS:  time.Since(start).Milliseconds(),
+		FinishedAt:  time.Now().UTC().Format(time.RFC3339),
+	})
+	return true
+}
+
+func (c *executionController) callExternalARD(ctx context.Context, req ExecuteRequest, entry *ard.ExternalEntry, binding *ard.ExternalBinding, runID string, executionID string) (interface{}, error) {
+	endpoint := strings.TrimSpace(entry.URL)
+	if endpoint == "" {
+		return nil, &callError{statusCode: http.StatusNotImplemented, message: "external ARD entry has no URL-backed adapter"}
+	}
+	parsed, err := url.Parse(endpoint)
+	if err != nil || parsed.Host == "" || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.User != nil {
+		return nil, &callError{statusCode: http.StatusBadGateway, message: "external ARD entry URL is invalid"}
+	}
+	if err := services.ValidateWebhookURL(endpoint); err != nil {
+		return nil, &callError{statusCode: http.StatusBadGateway, message: "external ARD entry URL rejected: " + err.Error()}
+	}
+
+	payload := map[string]interface{}{"input": req.Input}
+	if req.Authority != nil {
+		payload["authority"] = req.Authority
+	}
+	if len(req.Context) > 0 {
+		payload["context"] = req.Context
+	}
+	body, err := json.Marshal(payload)
+	if err != nil {
+		return nil, fmt.Errorf("encode external ARD request: %w", err)
+	}
+
+	timeout := time.Duration(binding.TimeoutMS) * time.Millisecond
+	if timeout <= 0 {
+		timeout = 30 * time.Second
+	}
+	client := services.NewSSRFSafeClient(timeout)
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, parsed.String(), bytes.NewReader(body))
+	if err != nil {
+		return nil, fmt.Errorf("create external ARD request: %w", err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+	httpReq.Header.Set("X-Run-ID", runID)
+	httpReq.Header.Set("X-Execution-ID", executionID)
+	httpReq.Header.Set("X-AgentField-ARD-Target", binding.LocalTarget)
+	httpReq.Header.Set("X-AgentField-ARD-Adapter", binding.Adapter)
+	if req.Authority != nil {
+		httpReq.Header.Set("X-AgentField-Authority-Home-ID", req.Authority.HomeID)
+		httpReq.Header.Set("X-AgentField-Authority-Run-ID", req.Authority.RunID)
+		httpReq.Header.Set("X-AgentField-Authority-Lease-Owner", req.Authority.LeaseOwner)
+	}
+
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return nil, fmt.Errorf("external ARD call failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read external ARD response: %w", err)
+	}
+	if resp.StatusCode >= http.StatusBadRequest {
+		return nil, &callError{
+			statusCode: resp.StatusCode,
+			message:    fmt.Sprintf("external ARD error (%d): %s", resp.StatusCode, truncateForLog(respBody)),
+			body:       respBody,
+		}
+	}
+	decoded := decodeJSON(respBody)
+	if envelope, ok := decoded.(map[string]interface{}); ok {
+		if result, ok := envelope["result"]; ok {
+			return result, nil
+		}
+	}
+	return decoded, nil
+}
+
+func (c *executionController) finishExternalARDExecution(ctx context.Context, executionID string, status string, elapsed time.Duration, result []byte, callErr error) error {
+	resultURI := c.savePayload(ctx, result)
+	mutation := terminalExecutionMutation{status: status, result: result, resultURI: resultURI, completedAt: time.Now().UTC(), durationMS: elapsed.Milliseconds(), compareDuration: true}
+	if callErr != nil {
+		errMessage := callErr.Error()
+		reason := string(classifyExecutionError(callErr))
+		mutation.errorMessage = &errMessage
+		mutation.statusReason = &reason
+	}
+	_, _, err := c.writeTerminalExecution(ctx, executionID, mutation)
+	if err != nil {
+		return fmt.Errorf("update external ARD execution record: %w", err)
+	}
+	return nil
+}
+
+func externalARDBindingForTarget(state ard.State, target string) (*ard.ExternalEntry, *ard.ExternalBinding, bool) {
+	for entryID, binding := range state.Bindings {
+		if !binding.Callable || strings.TrimSpace(binding.LocalTarget) != target {
+			continue
+		}
+		for i := range state.Imports {
+			if state.Imports[i].ID == entryID || state.Imports[i].ID == binding.ExternalEntryID {
+				return &state.Imports[i], &binding, true
+			}
+		}
+	}
+	return nil, nil, false
+}
+
+func validateExternalARDOperation(req ExecuteRequest, binding *ard.ExternalBinding) error {
+	if len(binding.AllowedOperations) == 0 {
+		return nil
+	}
+	contextOperation := stringValue(req.Context["operation"])
+	inputOperation := stringValue(req.Input["operation"])
+	if contextOperation != "" && inputOperation != "" && !strings.EqualFold(contextOperation, inputOperation) {
+		return &callError{statusCode: http.StatusBadRequest, message: "external ARD operation is ambiguous between input.operation and context.operation"}
+	}
+	operation := firstNonEmpty(contextOperation, inputOperation)
+	if operation == "" {
+		return &callError{statusCode: http.StatusForbidden, message: "external ARD operation is required by binding policy"}
+	}
+	for _, allowed := range binding.AllowedOperations {
+		if strings.EqualFold(strings.TrimSpace(allowed), operation) {
+			return nil
+		}
+	}
+	return &callError{statusCode: http.StatusForbidden, message: fmt.Sprintf("external ARD operation %q is not allowed by binding policy", operation)}
+}
+
+func authorityExecutionID(authority RunAuthorityRef, _ *parsedTarget) string {
+	digest := sha256.Sum256([]byte(strings.Join([]string{
+		authority.HomeID, authority.RunID, authority.LeaseOwner, strconv.Itoa(authority.Attempt),
+	}, "\x00")))
+	return fmt.Sprintf("exec_authority_%x", digest)
+}
+
+func bindExecutionAuthority(exec *types.Execution, authority *RunAuthorityRef) {
+	if exec == nil || authority == nil {
+		return
+	}
+	homeID, runID, leaseOwner, attempt := authority.HomeID, authority.RunID, authority.LeaseOwner, authority.Attempt
+	exec.AuthorityHomeID = &homeID
+	exec.AuthorityRunID = &runID
+	exec.AuthorityLeaseOwner = &leaseOwner
+	exec.AuthorityAttempt = &attempt
+}
+
+func executionAuthorityRef(exec *types.Execution) (*RunAuthorityRef, bool) {
+	if exec == nil || exec.AuthorityHomeID == nil || exec.AuthorityRunID == nil || exec.AuthorityLeaseOwner == nil || exec.AuthorityAttempt == nil {
+		return nil, false
+	}
+	ref := &RunAuthorityRef{HomeID: *exec.AuthorityHomeID, RunID: *exec.AuthorityRunID, LeaseOwner: *exec.AuthorityLeaseOwner, Attempt: *exec.AuthorityAttempt}
+	return ref, normalizeRunAuthorityRef(ref) == nil
+}
+
+func sameAuthorityExecution(existing, requested *types.Execution) bool {
+	return existing.ExecutionID == requested.ExecutionID &&
+		existing.RunID == requested.RunID &&
+		existing.AgentNodeID == requested.AgentNodeID &&
+		existing.ReasonerID == requested.ReasonerID &&
+		existing.NodeID == requested.NodeID &&
+		sameOptionalString(existing.ParentExecutionID, requested.ParentExecutionID) &&
+		sameOptionalString(existing.AuthorityHomeID, requested.AuthorityHomeID) &&
+		sameOptionalString(existing.AuthorityRunID, requested.AuthorityRunID) &&
+		sameOptionalString(existing.AuthorityLeaseOwner, requested.AuthorityLeaseOwner) &&
+		sameOptionalInt(existing.AuthorityAttempt, requested.AuthorityAttempt) &&
+		bytes.Equal(existing.InputPayload, requested.InputPayload)
+}
+
+func sameOptionalInt(left, right *int) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
+func sameOptionalString(left, right *string) bool {
+	if left == nil || right == nil {
+		return left == nil && right == nil
+	}
+	return *left == *right
+}
+
+func stringValue(value interface{}) string {
+	switch typed := value.(type) {
+	case nil:
+		return ""
+	case string:
+		return strings.TrimSpace(typed)
+	default:
+		return strings.TrimSpace(fmt.Sprint(typed))
+	}
+}
+
 func (c *executionController) handleAsync(ctx *gin.Context) {
 	reqCtx := ctx.Request.Context()
 	plan, err := c.prepareExecution(reqCtx, ctx)
 	if err != nil {
 		writeExecutionError(ctx, err)
+		return
+	}
+	plan.executionMode = "async"
+
+	if err := c.verifyRunAuthority(reqCtx, plan); err != nil {
+		_ = c.failExecution(reqCtx, plan, err, 0, nil)
+		writeExecutionError(ctx, err)
+		return
+	}
+
+	if plan.authorityDuplicate {
+		createdAt := plan.exec.CreatedAt.UTC().Format(time.RFC3339)
+		ctx.Header("X-Execution-ID", plan.exec.ExecutionID)
+		ctx.Header("X-Run-ID", plan.exec.RunID)
+		ctx.Header("X-AgentField-Authority-Replay", "true")
+		ctx.JSON(http.StatusAccepted, AsyncExecuteResponse{
+			ExecutionID: plan.exec.ExecutionID,
+			RunID:       plan.exec.RunID,
+			WorkflowID:  plan.exec.RunID,
+			Status:      plan.exec.Status,
+			Target:      fmt.Sprintf("%s.%s", plan.target.NodeID, plan.target.TargetName),
+			Type:        plan.targetType,
+			CreatedAt:   createdAt,
+			EnqueuedAt:  createdAt,
+		})
+		return
+	}
+
+	if plan.replayHit != nil {
+		if err := c.completeReplayHit(reqCtx, plan); err != nil {
+			writeExecutionError(ctx, err)
+			return
+		}
+
+		createdAt := plan.exec.CreatedAt.UTC().Format(time.RFC3339)
+		targetLabel := fmt.Sprintf("%s.%s", plan.target.NodeID, plan.target.TargetName)
+		response := AsyncExecuteResponse{
+			ExecutionID:       plan.exec.ExecutionID,
+			RunID:             plan.exec.RunID,
+			WorkflowID:        plan.exec.RunID,
+			Status:            string(types.ExecutionStatusSucceeded),
+			Target:            targetLabel,
+			Type:              plan.targetType,
+			CreatedAt:         createdAt,
+			EnqueuedAt:        createdAt,
+			WebhookRegistered: plan.webhookRegistered,
+		}
+		if plan.webhookError != nil {
+			response.WebhookError = plan.webhookError
+		}
+		ctx.Header("X-Execution-ID", plan.exec.ExecutionID)
+		ctx.Header("X-Run-ID", plan.exec.RunID)
+		ctx.Header("X-AgentField-Replay-Hit", plan.replayHit.SourceExecutionID)
+		ctx.JSON(http.StatusAccepted, response)
 		return
 	}
 
@@ -446,19 +954,41 @@ func (c *executionController) handleBatchStatus(ctx *gin.Context) {
 		ctx.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
 		return
 	}
+	if len(request.ExecutionIDs) > maxBatchStatusIDs {
+		ctx.JSON(http.StatusBadRequest, gin.H{"error": fmt.Sprintf("batch status supports at most %d execution IDs, got %d", maxBatchStatusIDs, len(request.ExecutionIDs))})
+		return
+	}
+
+	// Use one storage fetch for the normal path. If it fails, fall back to
+	// individual reads so the established per-ID error contract is preserved.
+	records, err := c.store.GetExecutionRecordsBatch(reqCtx, request.ExecutionIDs)
 
 	response := make(BatchStatusResponse, len(request.ExecutionIDs))
 	for _, id := range request.ExecutionIDs {
-		exec, err := c.store.GetExecutionRecord(reqCtx, id)
 		if err != nil {
-			response[id] = ExecutionStatusResponse{
-				ExecutionID: id,
-				Status:      "error",
-				Error:       pointerString(fmt.Sprintf("load execution: %v", err)),
+			exec, getErr := c.store.GetExecutionRecord(reqCtx, id)
+			if getErr != nil {
+				response[id] = ExecutionStatusResponse{
+					ExecutionID: id,
+					Status:      "error",
+					Error:       pointerString(fmt.Sprintf("load execution: %v", getErr)),
+				}
+				continue
 			}
+			if exec == nil {
+				response[id] = ExecutionStatusResponse{
+					ExecutionID: id,
+					Status:      "not_found",
+				}
+				continue
+			}
+			response[id] = c.renderStatusWithApproval(reqCtx, exec)
 			continue
 		}
-		if exec == nil {
+
+		exec, ok := records[id]
+		if !ok || exec == nil {
+			// Missing IDs preserve the prior per-ID response behavior.
 			response[id] = ExecutionStatusResponse{
 				ExecutionID: id,
 				Status:      "not_found",
@@ -505,6 +1035,7 @@ func (c *executionController) handleStatusUpdate(ctx *gin.Context) {
 
 	resultURI := c.savePayload(reqCtx, resultBytes)
 	isTerminal := types.IsTerminalExecutionStatus(normalizedStatus)
+	transitioned := true
 	var elapsed time.Duration
 	var errorMsg *string
 
@@ -532,6 +1063,17 @@ func (c *executionController) handleStatusUpdate(ctx *gin.Context) {
 					Msg("rejecting status update: execution is waiting for approval")
 				return nil, fmt.Errorf("execution %s is in 'waiting' state; only running, cancelled, or failed transitions are allowed", executionID)
 			}
+		}
+
+		if types.IsTerminalExecutionStatus(current.Status) {
+			if terminalCallbackMatches(current, normalizedStatus, req, resultBytes) {
+				transitioned = false
+				return current, nil
+			}
+			return nil, fmt.Errorf("%w: execution %s is already %s", errTerminalExecutionConflict, executionID, current.Status)
+		}
+		if isTerminal && current.AuthorityRevokedAt != nil && normalizedStatus != string(types.ExecutionStatusCancelled) {
+			return nil, ErrRunAuthorityRevoked
 		}
 
 		current.Status = normalizedStatus
@@ -583,7 +1125,11 @@ func (c *executionController) handleStatusUpdate(ctx *gin.Context) {
 		return current, nil
 	})
 	if err != nil {
-		ctx.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("failed to update execution: %v", err)})
+		statusCode := http.StatusInternalServerError
+		if errors.Is(err, errTerminalExecutionConflict) || errors.Is(err, ErrRunAuthorityRevoked) {
+			statusCode = http.StatusConflict
+		}
+		ctx.JSON(statusCode, gin.H{"error": fmt.Sprintf("failed to update execution: %v", err)})
 		return
 	}
 	if updated == nil {
@@ -593,6 +1139,14 @@ func (c *executionController) handleStatusUpdate(ctx *gin.Context) {
 	if elapsed == 0 && updated.DurationMS != nil {
 		elapsed = time.Duration(*updated.DurationMS) * time.Millisecond
 	}
+	if !transitioned {
+		ctx.JSON(http.StatusOK, c.renderStatusWithApproval(reqCtx, updated))
+		return
+	}
+
+	// Persist token/cost usage reported alongside the status callback.
+	// Best-effort: failures are logged and never fail the status update.
+	c.ingestUsage(reqCtx, updated, req.Usage)
 
 	c.updateWorkflowExecutionStatus(reqCtx, executionID, normalizedStatus, req.StatusReason)
 
@@ -604,15 +1158,18 @@ func (c *executionController) handleStatusUpdate(ctx *gin.Context) {
 	}
 
 	eventData := map[string]interface{}{
-		"result":   req.Result,
-		"error":    req.Error,
-		"progress": req.Progress,
+		"error":             req.Error,
+		"progress":          req.Progress,
+		"transition_source": "status_callback",
 	}
 	if req.StatusReason != nil && strings.TrimSpace(*req.StatusReason) != "" {
 		eventData["status_reason"] = strings.TrimSpace(*req.StatusReason)
 	}
-	if inputPayload := decodeJSON(updated.InputPayload); inputPayload != nil {
-		eventData["input"] = inputPayload
+	if !c.redactPayloads {
+		eventData["result"] = req.Result
+		if inputPayload := decodeJSON(updated.InputPayload); inputPayload != nil {
+			eventData["input"] = inputPayload
+		}
 	}
 	c.publishExecutionEvent(updated, normalizedStatus, eventData)
 
@@ -671,6 +1228,65 @@ func (c *executionController) publishExecutionEvent(exec *types.Execution, statu
 	c.publishExecutionEventWithReasonerInfo(exec, status, data, nil, nil)
 }
 
+// enrichExecutionLifecycleData adds low-cardinality lifecycle dimensions used by
+// observability consumers. It does not mutate execution state or include payloads.
+func enrichExecutionLifecycleData(data map[string]interface{}, exec *types.Execution, status string) {
+	if data == nil || exec == nil {
+		return
+	}
+
+	data["is_root_execution"] = exec.ParentExecutionID == nil || strings.TrimSpace(*exec.ParentExecutionID) == ""
+	if _, ok := data["workflow_depth"]; !ok {
+		if data["is_root_execution"] == true {
+			data["workflow_depth"] = 0
+		}
+	}
+	if exec.DurationMS != nil {
+		data["duration_ms"] = *exec.DurationMS
+	}
+
+	switch status {
+	case string(types.ExecutionStatusSucceeded):
+		data["outcome"] = "succeeded"
+	case string(types.ExecutionStatusFailed):
+		data["outcome"] = "failed"
+		data["failure_category"] = canonicalFailureCategory(exec.StatusReason, "unknown")
+	case string(types.ExecutionStatusCancelled):
+		data["outcome"] = "cancelled"
+		data["failure_category"] = "cancelled"
+	case string(types.ExecutionStatusTimeout):
+		data["outcome"] = "timeout"
+		data["failure_category"] = "timeout"
+	}
+}
+
+func canonicalFailureCategory(statusReason *string, fallback string) string {
+	if statusReason == nil {
+		return fallback
+	}
+	category := strings.TrimSpace(*statusReason)
+	if separator := strings.Index(category, ":"); separator >= 0 {
+		category = strings.TrimSpace(category[:separator])
+	}
+	switch category {
+	case string(ErrorCategoryLLMUnavailable),
+		string(ErrorCategoryConcurrencyLimit),
+		string(ErrorCategoryAgentTimeout),
+		string(ErrorCategoryAgentError),
+		string(ErrorCategoryAgentUnreachable),
+		string(ErrorCategoryBadResponse),
+		string(ErrorCategoryInternal),
+		"agent_restart_orphaned",
+		"validation",
+		"permission_denied",
+		"node_unavailable",
+		"target_not_found":
+		return category
+	default:
+		return fallback
+	}
+}
+
 func (c *executionController) publishExecutionEventWithReasonerInfo(exec *types.Execution, status string, data map[string]interface{}, agent *types.AgentNode, reasonerID *string) {
 	if exec == nil {
 		return
@@ -680,8 +1296,10 @@ func (c *executionController) publishExecutionEventWithReasonerInfo(exec *types.
 	switch status {
 	case string(types.ExecutionStatusSucceeded):
 		eventType = events.ExecutionCompleted
-	case string(types.ExecutionStatusFailed):
+	case string(types.ExecutionStatusFailed), string(types.ExecutionStatusTimeout):
 		eventType = events.ExecutionFailed
+	case string(types.ExecutionStatusCancelled):
+		eventType = events.ExecutionCancelledEvent
 	case string(types.ExecutionStatusRunning):
 		eventType = events.ExecutionStarted
 	case "created":
@@ -692,6 +1310,7 @@ func (c *executionController) publishExecutionEventWithReasonerInfo(exec *types.
 	if data == nil {
 		data = make(map[string]interface{})
 	}
+	enrichExecutionLifecycleData(data, exec, status)
 
 	// Add reasoner_id to the event data
 	rID := exec.ReasonerID
@@ -727,11 +1346,12 @@ func (c *executionController) publishExecutionEventWithReasonerInfo(exec *types.
 		data["actor_id"] = *exec.ActorID
 	}
 	storedPayload := types.DecodeStoredExecutionPayload(exec.InputPayload)
-	if storedPayload.Context != nil {
+	if !c.redactPayloads && storedPayload.Context != nil {
 		data["context"] = storedPayload.Context
 	}
 	if workflowExec, err := c.store.GetWorkflowExecution(context.Background(), exec.ExecutionID); err == nil && workflowExec != nil {
 		data["retry_count"] = workflowExec.RetryCount
+		data["workflow_depth"] = workflowExec.WorkflowDepth
 	}
 
 	// Add reasoner definitions if agent info is available
@@ -818,7 +1438,9 @@ func (c *executionController) publishExecutionStartedEvent(plan *preparedExecuti
 	}
 
 	data := map[string]interface{}{
-		"target_type": plan.targetType,
+		"target_type":       plan.targetType,
+		"execution_mode":    plan.executionMode,
+		"transition_source": "execution_controller",
 	}
 
 	// Include input payload info (not the full payload, just metadata)
@@ -833,6 +1455,33 @@ func (c *executionController) publishExecutionStartedEvent(plan *preparedExecuti
 		plan.agent,
 		&plan.target.TargetName,
 	)
+}
+
+func (c *executionController) terminalizeExecutionTimeout(ctx context.Context, executionID string, elapsed time.Duration) (*types.Execution, error) {
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer cancel()
+	reason := string(ErrorCategoryAgentTimeout)
+	errMessage := fmt.Sprintf("execution timeout after %v", elapsed)
+	now := time.Now().UTC()
+	updated, transitioned, err := c.writeTerminalExecution(persistCtx, executionID, terminalExecutionMutation{
+		status: string(types.ExecutionStatusTimeout), statusReason: &reason, errorMessage: &errMessage,
+		completedAt: now, durationMS: elapsed.Milliseconds(), compareDuration: true,
+	})
+	if err != nil {
+		return nil, err
+	}
+	if !transitioned {
+		return updated, nil
+	}
+	c.updateWorkflowExecutionFinalState(persistCtx, executionID, types.ExecutionStatusTimeout, nil, elapsed, &errMessage)
+	c.updateWorkflowExecutionStatus(persistCtx, executionID, string(types.ExecutionStatusTimeout), &reason)
+	if updated.WebhookRegistered {
+		c.triggerWebhook(executionID)
+	}
+	c.publishExecutionEvent(updated, string(types.ExecutionStatusTimeout), map[string]interface{}{
+		"error": errMessage, "transition_source": "execution_deadline",
+	})
+	return updated, nil
 }
 
 // waitForExecutionCompletion waits for an execution to complete by subscribing to the event bus.
@@ -881,7 +1530,14 @@ func (c *executionController) waitForExecutionCompletion(ctx context.Context, ex
 				Str("execution_id", executionID).
 				Dur("timeout", timeout).
 				Msg("execution completion timeout")
-			return nil, fmt.Errorf("execution timeout after %v", timeout)
+			updated, err := c.terminalizeExecutionTimeout(ctx, executionID, timeout)
+			if err != nil {
+				if current, lookupErr := c.store.GetExecutionRecord(context.WithoutCancel(ctx), executionID); lookupErr == nil && current != nil && types.IsTerminalExecutionStatus(current.Status) {
+					return current, nil
+				}
+				return nil, fmt.Errorf("terminalize execution timeout: %w", err)
+			}
+			return updated, nil
 
 		case event := <-eventChan:
 			// Only process events for this specific execution
@@ -890,7 +1546,7 @@ func (c *executionController) waitForExecutionCompletion(ctx context.Context, ex
 			}
 
 			// Check if this is a terminal event
-			if event.Type == events.ExecutionCompleted || event.Type == events.ExecutionFailed {
+			if event.Type == events.ExecutionCompleted || event.Type == events.ExecutionFailed || event.Type == events.ExecutionCancelledEvent {
 				logger.Logger.Debug().
 					Str("execution_id", executionID).
 					Str("event_type", string(event.Type)).
@@ -980,6 +1636,7 @@ type preparedExecution struct {
 	agent             *types.AgentNode
 	target            *parsedTarget
 	targetType        string
+	executionMode     string
 	llmEndpoint       string
 	webhookRegistered bool
 	webhookError      *string
@@ -987,23 +1644,45 @@ type preparedExecution struct {
 	callerDID string
 	targetDID string
 	// Version that was selected during routing (empty if default/unversioned agent)
-	routedVersion string
+	routedVersion           string
+	replaySourceRunID       string
+	replayBeforeExecutionID string
+	replayMode              string
+	replayHit               *replayHit
+	authorityDuplicate      bool
+	runAuthority            *RunAuthorityRef
 }
 
 func (c *executionController) prepareExecution(ctx context.Context, ginCtx *gin.Context) (*preparedExecution, error) {
 	targetParam := ginCtx.Param("target")
+	var req ExecuteRequest
+	if err := ginCtx.ShouldBindJSON(&req); err != nil {
+		return nil, fmt.Errorf("invalid request body: %w", err)
+	}
+	return c.prepareExecutionForTarget(
+		ctx,
+		targetParam,
+		req,
+		readExecutionHeaders(ginCtx),
+		middleware.GetVerifiedCallerDID(ginCtx),
+		middleware.GetTargetDID(ginCtx),
+	)
+}
+
+func (c *executionController) prepareExecutionForTarget(ctx context.Context, targetParam string, req ExecuteRequest, headers executionHeaders, callerDID, targetDID string) (*preparedExecution, error) {
 	target, err := parseTarget(targetParam)
 	if err != nil {
 		return nil, fmt.Errorf("invalid target: %w", err)
 	}
 
-	var req ExecuteRequest
-	if err := ginCtx.ShouldBindJSON(&req); err != nil {
-		return nil, fmt.Errorf("invalid request body: %w", err)
-	}
 	// Allow empty input for skills/reasoners that take no parameters (issue #196).
 	if req.Input == nil {
 		req.Input = map[string]interface{}{}
+	}
+	if req.Authority != nil {
+		if err := normalizeRunAuthorityRef(req.Authority); err != nil {
+			return nil, &callError{statusCode: http.StatusBadRequest, message: err.Error()}
+		}
 	}
 
 	var (
@@ -1071,13 +1750,15 @@ func (c *executionController) prepareExecution(ctx context.Context, ginCtx *gin.
 	}
 	target.TargetType = targetType
 
-	headers := readExecutionHeaders(ginCtx)
 	runID := headers.runID
 	if runID == "" {
 		runID = utils.GenerateRunID()
 	}
 
 	executionID := utils.GenerateExecutionID()
+	if req.Authority != nil {
+		executionID = authorityExecutionID(*req.Authority, target)
+	}
 	now := time.Now().UTC()
 
 	clientPayload := map[string]interface{}{
@@ -1105,6 +1786,7 @@ func (c *executionController) prepareExecution(ctx context.Context, ginCtx *gin.
 		CreatedAt:         now,
 		UpdatedAt:         now,
 	}
+	bindExecutionAuthority(exec, req.Authority)
 
 	agentPayload := make(map[string]interface{}, len(req.Input))
 	for key, value := range req.Input {
@@ -1113,7 +1795,7 @@ func (c *executionController) prepareExecution(ctx context.Context, ginCtx *gin.
 
 	var agentPayloadBytes []byte
 	if agent.DeploymentType == "serverless" {
-		agentPayloadBytes, err = json.Marshal(buildServerlessPayload(target, exec, headers, agentPayload))
+		agentPayloadBytes, err = json.Marshal(buildServerlessPayload(target, exec, headers, agentPayload, req.Authority))
 	} else {
 		agentPayloadBytes, err = json.Marshal(agentPayload)
 	}
@@ -1121,17 +1803,58 @@ func (c *executionController) prepareExecution(ctx context.Context, ginCtx *gin.
 		return nil, fmt.Errorf("encode agent payload: %w", err)
 	}
 
-	inputURI := c.savePayload(ctx, storedPayload)
-	exec.InputURI = inputURI
-
 	if headers.sessionID != nil {
 		exec.SessionID = headers.sessionID
 	}
 	if headers.actorID != nil {
 		exec.ActorID = headers.actorID
 	}
+	if req.Authority != nil {
+		preAdmission := &preparedExecution{exec: exec, runAuthority: req.Authority}
+		if err := c.verifyRunAuthority(ctx, preAdmission); err != nil {
+			return nil, err
+		}
+	}
+
+	authorityDuplicatePlan := func(existing *types.Execution) (*preparedExecution, error) {
+		if !sameAuthorityExecution(existing, exec) {
+			return nil, &callError{
+				statusCode: http.StatusConflict,
+				message:    "authority tuple is already bound to a different execution request",
+			}
+		}
+		return &preparedExecution{
+			exec:                    existing,
+			requestBody:             agentPayloadBytes,
+			agent:                   agent,
+			target:                  target,
+			targetType:              targetType,
+			llmEndpoint:             extractRequestedLLMEndpoint(req),
+			callerDID:               callerDID,
+			targetDID:               targetDID,
+			routedVersion:           routedVersion,
+			replaySourceRunID:       headers.replaySourceRunID,
+			replayBeforeExecutionID: headers.replayBeforeExecutionID,
+			replayMode:              headers.replayMode,
+			authorityDuplicate:      true,
+			runAuthority:            req.Authority,
+		}, nil
+	}
+	if req.Authority != nil {
+		if existing, lookupErr := c.store.GetExecutionRecord(ctx, executionID); lookupErr == nil && existing != nil {
+			return authorityDuplicatePlan(existing)
+		}
+	}
+
+	inputURI := c.savePayload(ctx, storedPayload)
+	exec.InputURI = inputURI
 
 	if err := c.store.CreateExecutionRecord(ctx, exec); err != nil {
+		if req.Authority != nil {
+			if existing, lookupErr := c.store.GetExecutionRecord(ctx, executionID); lookupErr == nil && existing != nil {
+				return authorityDuplicatePlan(existing)
+			}
+		}
 		return nil, fmt.Errorf("create execution record: %w", err)
 	}
 
@@ -1164,19 +1887,273 @@ func (c *executionController) prepareExecution(ctx context.Context, ginCtx *gin.
 
 	c.ensureWorkflowExecutionRecord(ctx, exec, target, storedPayload)
 
+	hit, err := c.findReplayHit(ctx, headers, target, storedPayload)
+	if err != nil {
+		return nil, err
+	}
+
 	return &preparedExecution{
-		exec:              exec,
-		requestBody:       agentPayloadBytes,
-		agent:             agent,
-		target:            target,
-		targetType:        targetType,
-		llmEndpoint:       extractRequestedLLMEndpoint(req),
-		webhookRegistered: webhookRegistered,
-		webhookError:      webhookError,
-		callerDID:         middleware.GetVerifiedCallerDID(ginCtx),
-		targetDID:         middleware.GetTargetDID(ginCtx),
-		routedVersion:     routedVersion,
+		exec:                    exec,
+		requestBody:             agentPayloadBytes,
+		agent:                   agent,
+		target:                  target,
+		targetType:              targetType,
+		llmEndpoint:             extractRequestedLLMEndpoint(req),
+		webhookRegistered:       webhookRegistered,
+		webhookError:            webhookError,
+		callerDID:               callerDID,
+		targetDID:               targetDID,
+		routedVersion:           routedVersion,
+		replaySourceRunID:       headers.replaySourceRunID,
+		replayBeforeExecutionID: headers.replayBeforeExecutionID,
+		replayMode:              headers.replayMode,
+		replayHit:               hit,
+		runAuthority:            req.Authority,
 	}, nil
+}
+
+// findReplayHit returns a previously-succeeded child output to reuse for the
+// current app.call, or nil to run it normally. Only child executions (those with
+// a parent) are eligible — the restarted root always re-runs.
+//
+// Matching is keyed solely on (node id, reasoner id, canonical input+context);
+// among matches the earliest-started succeeded source execution wins. This is
+// intentionally position- and ordering-agnostic, so two calls to the same
+// reasoner with identical input+context within a run will both reuse the first
+// source result. That is correct for deterministic graphs; callers that need a
+// distinct result per identical call should vary the input/context or restart
+// with reuse=none.
+func (c *executionController) findReplayHit(ctx context.Context, headers executionHeaders, target *parsedTarget, storedPayload []byte) (*replayHit, error) {
+	if target == nil || headers.parentExecutionID == nil {
+		return nil, nil
+	}
+	sourceRunID := strings.TrimSpace(headers.replaySourceRunID)
+	if sourceRunID == "" {
+		return nil, nil
+	}
+	mode := strings.TrimSpace(headers.replayMode)
+	if mode == "" {
+		mode = "succeeded-before"
+	}
+	if mode == "none" {
+		return nil, nil
+	}
+	if mode != "succeeded-before" && mode != "all-succeeded" {
+		return nil, fmt.Errorf("unsupported replay mode %q", mode)
+	}
+
+	executions, err := c.store.QueryExecutionRecords(ctx, types.ExecutionFilter{
+		RunID:          &sourceRunID,
+		SortBy:         "started_at",
+		SortDescending: false,
+	})
+	if err != nil {
+		return nil, fmt.Errorf("query replay source run: %w", err)
+	}
+	if len(executions) == 0 {
+		return nil, nil
+	}
+
+	var beforeTime *time.Time
+	if mode == "succeeded-before" && strings.TrimSpace(headers.replayBeforeExecutionID) != "" {
+		for _, exec := range executions {
+			if exec != nil && exec.ExecutionID == headers.replayBeforeExecutionID {
+				t := exec.StartedAt
+				beforeTime = &t
+				break
+			}
+		}
+		if beforeTime == nil {
+			return nil, nil
+		}
+	}
+
+	newKey, ok := canonicalReplayPayload(storedPayload)
+	if !ok {
+		return nil, nil
+	}
+	for _, exec := range executions {
+		if exec == nil {
+			continue
+		}
+		if beforeTime != nil && !exec.StartedAt.Before(*beforeTime) {
+			continue
+		}
+		if exec.Status != types.ExecutionStatusSucceeded {
+			continue
+		}
+		if exec.NodeID != target.NodeID || exec.ReasonerID != target.TargetName {
+			continue
+		}
+		if len(exec.ResultPayload) == 0 {
+			continue
+		}
+		oldKey, oldOK := canonicalReplayPayload(exec.InputPayload)
+		if !oldOK || oldKey != newKey {
+			continue
+		}
+		return &replayHit{
+			SourceExecutionID: exec.ExecutionID,
+			SourceRunID:       exec.RunID,
+			Result:            json.RawMessage(cloneBytes(exec.ResultPayload)),
+		}, nil
+	}
+	return nil, nil
+}
+
+func canonicalReplayPayload(raw []byte) (string, bool) {
+	if len(raw) == 0 {
+		return "", false
+	}
+	var v interface{}
+	if err := json.Unmarshal(raw, &v); err != nil {
+		return "", false
+	}
+	encoded, err := json.Marshal(v)
+	if err != nil {
+		return "", false
+	}
+	return string(encoded), true
+}
+
+var errTerminalExecutionConflict = errors.New("execution terminal state conflict")
+
+type terminalExecutionMutation struct {
+	status           string
+	statusReason     *string
+	result           []byte
+	resultURI        *string
+	errorMessage     *string
+	completedAt      time.Time
+	durationMS       int64
+	compareDuration  bool
+	compareCompleted bool
+}
+
+func (c *executionController) writeTerminalExecution(ctx context.Context, executionID string, desired terminalExecutionMutation) (*types.Execution, bool, error) {
+	transitioned := false
+	updated, err := c.store.UpdateExecutionRecord(ctx, executionID, func(current *types.Execution) (*types.Execution, error) {
+		if current == nil {
+			return nil, fmt.Errorf("execution %s not found", executionID)
+		}
+		if types.IsTerminalExecutionStatus(current.Status) {
+			if terminalExecutionMatches(current, desired) {
+				return current, nil
+			}
+			return nil, fmt.Errorf("%w: execution %s is already %s", errTerminalExecutionConflict, executionID, current.Status)
+		}
+		if current.Status == types.ExecutionStatusWaiting {
+			return current, nil
+		}
+		if current.AuthorityRevokedAt != nil && desired.status != string(types.ExecutionStatusCancelled) {
+			return nil, ErrRunAuthorityRevoked
+		}
+		current.Status = desired.status
+		current.StatusReason = cloneStringPointer(desired.statusReason)
+		current.ResultPayload = cloneBytes(desired.result)
+		current.ResultURI = cloneStringPointer(desired.resultURI)
+		current.ErrorMessage = cloneStringPointer(desired.errorMessage)
+		completedAt := desired.completedAt.UTC()
+		current.CompletedAt = &completedAt
+		durationMS := desired.durationMS
+		current.DurationMS = &durationMS
+		transitioned = true
+		return current, nil
+	})
+	return updated, transitioned, err
+}
+
+func terminalExecutionMatches(current *types.Execution, desired terminalExecutionMutation) bool {
+	if current == nil || current.Status != desired.status || !sameOptionalString(current.StatusReason, desired.statusReason) ||
+		!sameOptionalString(current.ErrorMessage, desired.errorMessage) || !bytes.Equal(current.ResultPayload, desired.result) {
+		return false
+	}
+	if desired.compareDuration && (current.DurationMS == nil || *current.DurationMS != desired.durationMS) {
+		return false
+	}
+	if desired.compareCompleted && (current.CompletedAt == nil || !current.CompletedAt.Equal(desired.completedAt)) {
+		return false
+	}
+	return true
+}
+
+func cloneStringPointer(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	copy := *value
+	return &copy
+}
+
+func terminalCallbackMatches(current *types.Execution, status string, req executionStatusUpdateRequest, result []byte) bool {
+	if current == nil || current.Status != status {
+		return false
+	}
+	if req.StatusReason != nil && !sameOptionalString(current.StatusReason, req.StatusReason) {
+		return false
+	}
+	if len(result) > 0 && !bytes.Equal(current.ResultPayload, result) {
+		return false
+	}
+	if req.Error != "" && (current.ErrorMessage == nil || *current.ErrorMessage != req.Error) {
+		return false
+	}
+	if status == string(types.ExecutionStatusSucceeded) && current.ErrorMessage != nil {
+		return false
+	}
+	if req.DurationMS != nil && (current.DurationMS == nil || *current.DurationMS != *req.DurationMS) {
+		return false
+	}
+	if req.CompletedAt != nil && !req.CompletedAt.IsZero() && (current.CompletedAt == nil || !current.CompletedAt.Equal(req.CompletedAt.UTC())) {
+		return false
+	}
+	return true
+}
+
+func (c *executionController) completeReplayHit(ctx context.Context, plan *preparedExecution) error {
+	if plan == nil || plan.exec == nil || plan.replayHit == nil {
+		return fmt.Errorf("missing replay execution plan")
+	}
+	reason := "replayed_from_execution:" + plan.replayHit.SourceExecutionID
+	now := time.Now().UTC()
+	duration := int64(0)
+	result := cloneBytes(plan.replayHit.Result)
+	resultURI := c.savePayload(ctx, result)
+
+	updated, transitioned, err := c.writeTerminalExecution(ctx, plan.exec.ExecutionID, terminalExecutionMutation{
+		status: string(types.ExecutionStatusSucceeded), statusReason: &reason, result: result, resultURI: resultURI,
+		completedAt: now, durationMS: duration, compareDuration: true,
+	})
+	if err != nil {
+		return err
+	}
+	if !transitioned {
+		return nil
+	}
+
+	c.updateWorkflowExecutionFinalState(ctx, plan.exec.ExecutionID, types.ExecutionStatusSucceeded, result, 0, nil)
+	c.updateWorkflowExecutionStatus(ctx, plan.exec.ExecutionID, types.ExecutionStatusSucceeded, &reason)
+	if plan.webhookRegistered || (updated != nil && updated.WebhookRegistered) {
+		c.triggerWebhook(plan.exec.ExecutionID)
+	}
+
+	eventData := map[string]interface{}{
+		"target_type":       plan.targetType,
+		"execution_mode":    plan.executionMode,
+		"transition_source": "replay",
+		"replay": map[string]interface{}{
+			"source_execution_id": plan.replayHit.SourceExecutionID,
+			"source_run_id":       plan.replayHit.SourceRunID,
+		},
+	}
+	if !c.redactPayloads {
+		eventData["result"] = decodeJSON(result)
+		if inputPayload := decodeJSON(plan.exec.InputPayload); inputPayload != nil {
+			eventData["input"] = inputPayload
+		}
+	}
+	c.publishExecutionEventWithReasonerInfo(updated, string(types.ExecutionStatusSucceeded), eventData, plan.agent, &plan.target.TargetName)
+	return nil
 }
 
 func extractRequestedLLMEndpoint(req ExecuteRequest) string {
@@ -1225,6 +2202,12 @@ func (c *executionController) callAgent(ctx context.Context, plan *preparedExecu
 	req.Header.Set("X-Run-ID", plan.exec.RunID)
 	req.Header.Set("X-Execution-ID", plan.exec.ExecutionID)
 	req.Header.Set("X-Workflow-ID", plan.exec.RunID)
+	if plan.runAuthority != nil {
+		req.Header.Set("X-AgentField-Authority-Home-ID", plan.runAuthority.HomeID)
+		req.Header.Set("X-AgentField-Authority-Run-ID", plan.runAuthority.RunID)
+		req.Header.Set("X-AgentField-Authority-Lease-Owner", plan.runAuthority.LeaseOwner)
+		req.Header.Set("X-AgentField-Authority-Attempt", strconv.Itoa(plan.runAuthority.Attempt))
+	}
 	if plan.exec.ParentExecutionID != nil {
 		req.Header.Set("X-Parent-Execution-ID", *plan.exec.ParentExecutionID)
 	}
@@ -1242,6 +2225,15 @@ func (c *executionController) callAgent(ctx context.Context, plan *preparedExecu
 	}
 	if plan.targetDID != "" {
 		req.Header.Set("X-Target-DID", plan.targetDID)
+	}
+	if plan.replaySourceRunID != "" {
+		req.Header.Set("X-AgentField-Replay-Source-Run-ID", plan.replaySourceRunID)
+	}
+	if plan.replayBeforeExecutionID != "" {
+		req.Header.Set("X-AgentField-Replay-Before-Execution-ID", plan.replayBeforeExecutionID)
+	}
+	if plan.replayMode != "" {
+		req.Header.Set("X-AgentField-Replay-Mode", plan.replayMode)
 	}
 
 	resp, err := c.httpClient.Do(req)
@@ -1295,35 +2287,15 @@ func (c *executionController) completeExecution(ctx context.Context, plan *prepa
 	resultURI := c.savePayload(ctx, result)
 
 	var lastErr error
-	var alreadyCancelled bool
 	for attempt := 0; attempt < 5; attempt++ {
-		updated, err := c.store.UpdateExecutionRecord(ctx, plan.exec.ExecutionID, func(current *types.Execution) (*types.Execution, error) {
-			if current == nil {
-				return nil, fmt.Errorf("execution %s not found", plan.exec.ExecutionID)
-			}
-			// Guard: don't overwrite if already cancelled (e.g. by approval rejection webhook)
-			// or waiting for approval — the approval webhook handler manages the transition.
-			if current.Status == types.ExecutionStatusCancelled || current.Status == types.ExecutionStatusWaiting {
-				logger.Logger.Info().
-					Str("execution_id", plan.exec.ExecutionID).
-					Str("current_status", string(current.Status)).
-					Msg("skipping completion update; execution already cancelled or waiting for approval")
-				alreadyCancelled = true
-				return current, nil
-			}
-			now := time.Now().UTC()
-			current.Status = types.ExecutionStatusSucceeded
-			current.ResultPayload = json.RawMessage(result)
-			current.ErrorMessage = nil
-			current.CompletedAt = pointerTime(now)
-			duration := elapsed.Milliseconds()
-			current.DurationMS = &duration
-			current.UpdatedAt = now
-			current.ResultURI = resultURI
-			return current, nil
+		now := time.Now().UTC()
+		duration := elapsed.Milliseconds()
+		updated, transitioned, err := c.writeTerminalExecution(ctx, plan.exec.ExecutionID, terminalExecutionMutation{
+			status: string(types.ExecutionStatusSucceeded), result: result, resultURI: resultURI, completedAt: now,
+			durationMS: duration, compareDuration: true,
 		})
 		if err == nil {
-			if alreadyCancelled {
+			if !transitioned {
 				return nil
 			}
 			c.updateWorkflowExecutionFinalState(
@@ -1337,12 +2309,18 @@ func (c *executionController) completeExecution(ctx context.Context, plan *prepa
 			if plan.webhookRegistered || (updated != nil && updated.WebhookRegistered) {
 				c.triggerWebhook(plan.exec.ExecutionID)
 			}
-			eventData := map[string]interface{}{}
-			if payload := decodeJSON(result); payload != nil {
-				eventData["result"] = payload
+			eventData := map[string]interface{}{
+				"target_type":       plan.targetType,
+				"execution_mode":    plan.executionMode,
+				"transition_source": "execution_controller",
 			}
-			if inputPayload := decodeJSON(plan.exec.InputPayload); inputPayload != nil {
-				eventData["input"] = inputPayload
+			if !c.redactPayloads {
+				if payload := decodeJSON(result); payload != nil {
+					eventData["result"] = payload
+				}
+				if inputPayload := decodeJSON(plan.exec.InputPayload); inputPayload != nil {
+					eventData["input"] = inputPayload
+				}
 			}
 			c.publishExecutionEventWithReasonerInfo(updated, string(types.ExecutionStatusSucceeded), eventData, plan.agent, &plan.target.TargetName)
 			return nil
@@ -1373,39 +2351,16 @@ func (c *executionController) failExecution(ctx context.Context, plan *preparedE
 	errMsg := callErr.Error()
 	resultURI := c.savePayload(ctx, result)
 	var lastErr error
-	var alreadyCancelled bool
+	categoryStr := string(category)
 	for attempt := 0; attempt < 5; attempt++ {
-		updated, err := c.store.UpdateExecutionRecord(ctx, plan.exec.ExecutionID, func(current *types.Execution) (*types.Execution, error) {
-			if current == nil {
-				return nil, fmt.Errorf("execution %s not found", plan.exec.ExecutionID)
-			}
-			// Guard: don't overwrite if already cancelled (e.g. by approval rejection webhook)
-			// or waiting for approval — the approval webhook handler manages the transition.
-			if current.Status == types.ExecutionStatusCancelled || current.Status == types.ExecutionStatusWaiting {
-				logger.Logger.Info().
-					Str("execution_id", plan.exec.ExecutionID).
-					Str("current_status", string(current.Status)).
-					Msg("skipping failure update; execution already cancelled or waiting for approval")
-				alreadyCancelled = true
-				return current, nil
-			}
-			now := time.Now().UTC()
-			current.Status = types.ExecutionStatusFailed
-			current.ErrorMessage = &errMsg
-			categoryStr := string(category)
-			current.StatusReason = &categoryStr
-			current.CompletedAt = pointerTime(now)
-			duration := elapsed.Milliseconds()
-			current.DurationMS = &duration
-			current.UpdatedAt = now
-			if len(result) > 0 {
-				current.ResultPayload = json.RawMessage(result)
-			}
-			current.ResultURI = resultURI
-			return current, nil
+		now := time.Now().UTC()
+		duration := elapsed.Milliseconds()
+		updated, transitioned, err := c.writeTerminalExecution(ctx, plan.exec.ExecutionID, terminalExecutionMutation{
+			status: string(types.ExecutionStatusFailed), statusReason: &categoryStr, result: result, resultURI: resultURI,
+			errorMessage: &errMsg, completedAt: now, durationMS: duration, compareDuration: true,
 		})
 		if err == nil {
-			if alreadyCancelled {
+			if !transitioned {
 				return nil
 			}
 			c.updateWorkflowExecutionFinalState(
@@ -1420,13 +2375,19 @@ func (c *executionController) failExecution(ctx context.Context, plan *preparedE
 				c.triggerWebhook(plan.exec.ExecutionID)
 			}
 			eventData := map[string]interface{}{
-				"error": errMsg,
+				"error":             errMsg,
+				"target_type":       plan.targetType,
+				"execution_mode":    plan.executionMode,
+				"failure_category":  string(category),
+				"transition_source": "execution_controller",
 			}
-			if payload := decodeJSON(result); payload != nil {
-				eventData["result"] = payload
-			}
-			if inputPayload := decodeJSON(plan.exec.InputPayload); inputPayload != nil {
-				eventData["input"] = inputPayload
+			if !c.redactPayloads {
+				if payload := decodeJSON(result); payload != nil {
+					eventData["result"] = payload
+				}
+				if inputPayload := decodeJSON(plan.exec.InputPayload); inputPayload != nil {
+					eventData["input"] = inputPayload
+				}
 			}
 			c.publishExecutionEventWithReasonerInfo(updated, string(types.ExecutionStatusFailed), eventData, plan.agent, &plan.target.TargetName)
 			return nil
@@ -1451,10 +2412,13 @@ func (c *executionController) triggerWebhook(executionID string) {
 }
 
 type executionHeaders struct {
-	runID             string
-	parentExecutionID *string
-	sessionID         *string
-	actorID           *string
+	runID                   string
+	parentExecutionID       *string
+	sessionID               *string
+	actorID                 *string
+	replaySourceRunID       string
+	replayBeforeExecutionID string
+	replayMode              string
 }
 
 func readExecutionHeaders(ctx *gin.Context) executionHeaders {
@@ -1462,6 +2426,9 @@ func readExecutionHeaders(ctx *gin.Context) executionHeaders {
 	parent := strings.TrimSpace(ctx.GetHeader("X-Parent-Execution-ID"))
 	session := strings.TrimSpace(ctx.GetHeader("X-Session-ID"))
 	actor := strings.TrimSpace(ctx.GetHeader("X-Actor-ID"))
+	replaySourceRunID := strings.TrimSpace(ctx.GetHeader("X-AgentField-Replay-Source-Run-ID"))
+	replayBeforeExecutionID := strings.TrimSpace(ctx.GetHeader("X-AgentField-Replay-Before-Execution-ID"))
+	replayMode := strings.TrimSpace(ctx.GetHeader("X-AgentField-Replay-Mode"))
 
 	var parentPtr *string
 	if parent != "" {
@@ -1479,10 +2446,13 @@ func readExecutionHeaders(ctx *gin.Context) executionHeaders {
 	}
 
 	return executionHeaders{
-		runID:             runID,
-		parentExecutionID: parentPtr,
-		sessionID:         sessionPtr,
-		actorID:           actorPtr,
+		runID:                   runID,
+		parentExecutionID:       parentPtr,
+		sessionID:               sessionPtr,
+		actorID:                 actorPtr,
+		replaySourceRunID:       replaySourceRunID,
+		replayBeforeExecutionID: replayBeforeExecutionID,
+		replayMode:              replayMode,
 	}
 }
 
@@ -1609,7 +2579,7 @@ func selectVersionedAgent(versions []*types.AgentNode) (*types.AgentNode, string
 	return healthy[0], healthy[0].Version
 }
 
-func buildServerlessPayload(target *parsedTarget, exec *types.Execution, headers executionHeaders, input map[string]interface{}) map[string]interface{} {
+func buildServerlessPayload(target *parsedTarget, exec *types.Execution, headers executionHeaders, input map[string]interface{}, authority *RunAuthorityRef) map[string]interface{} {
 	if target == nil || exec == nil {
 		return map[string]interface{}{
 			"input": input,
@@ -1630,6 +2600,14 @@ func buildServerlessPayload(target *parsedTarget, exec *types.Execution, headers
 	}
 	if headers.actorID != nil && *headers.actorID != "" {
 		execCtx["actor_id"] = *headers.actorID
+	}
+	if authority != nil {
+		execCtx["run_authority"] = map[string]interface{}{
+			"home_id":     authority.HomeID,
+			"run_id":      authority.RunID,
+			"lease_owner": authority.LeaseOwner,
+			"attempt":     authority.Attempt,
+		}
 	}
 
 	payload := map[string]interface{}{
@@ -2128,13 +3106,34 @@ func (j asyncExecutionJob) process() {
 		}
 	}
 
-	resultBody, elapsed, asyncAccepted, callErr := j.controller.callAgent(bgCtx, &j.plan)
+	guardedCtx, stopAuthorityGuard, err := j.controller.guardRunAuthority(bgCtx, &j.plan)
+	if err != nil {
+		_ = j.controller.failExecution(bgCtx, &j.plan, err, 0, nil)
+		return
+	}
+	defer stopAuthorityGuard()
+
+	resultBody, elapsed, asyncAccepted, callErr := j.controller.callAgent(guardedCtx, &j.plan)
+	if authorityErr := j.controller.runAuthorityRevocationError(guardedCtx, &j.plan, elapsed); authorityErr != nil {
+		return
+	}
 	if callErr == nil && asyncAccepted {
 		logger.Logger.Info().
 			Str("execution_id", j.plan.exec.ExecutionID).
 			Msg("agent accepted execution for async processing")
+		j.controller.monitorAcceptedRunAuthority(j.plan)
 		return
 	}
+
+	// Extract, persist (best-effort), and strip token/cost usage from the
+	// synchronous result envelope so it never leaks into the stored payload.
+	if callErr == nil {
+		if usageRaw, stripped := extractUsageFromResult(resultBody); usageRaw != nil {
+			resultBody = stripped
+			j.controller.ingestUsage(bgCtx, j.plan.exec, usageRaw)
+		}
+	}
+
 	job := completionJob{
 		controller: j.controller,
 		plan:       &j.plan,

@@ -12,19 +12,21 @@ import (
 
 // RunSummaryAggregation holds aggregated statistics for a single workflow run
 type RunSummaryAggregation struct {
-	RunID            string
-	TotalExecutions  int
-	StatusCounts     map[string]int
-	EarliestStarted  time.Time
-	LatestStarted    time.Time
-	RootExecutionID  *string
-	RootStatus       *string
-	RootAgentNodeID  *string
-	RootReasonerID   *string
-	SessionID        *string
-	ActorID          *string
-	MaxDepth         int
-	ActiveExecutions int
+	RunID             string
+	TotalExecutions   int
+	StatusCounts      map[string]int
+	EarliestStarted   time.Time
+	LatestStarted     time.Time
+	RootExecutionID   *string
+	RootStatus        *string
+	RootErrorCategory *string
+	RootErrorMessage  *string
+	RootAgentNodeID   *string
+	RootReasonerID    *string
+	SessionID         *string
+	ActorID           *string
+	MaxDepth          int
+	ActiveExecutions  int
 }
 
 // ConfigEntry represents a database-stored configuration file.
@@ -93,6 +95,11 @@ type StorageProvider interface {
 	// The ctx scopes the read, and executionID selects the record to fetch.
 	// Returns the execution record or an error if it is missing or unreadable.
 	GetExecutionRecord(ctx context.Context, executionID string) (*types.Execution, error)
+	// GetExecutionRecordsBatch fetches multiple primary execution records in a
+	// single query. IDs that do not exist are absent from the returned map.
+	// The ctx scopes the read, and executionIDs lists the records to fetch.
+	// Returns executions keyed by execution_id or an error if the query fails.
+	GetExecutionRecordsBatch(ctx context.Context, executionIDs []string) (map[string]*types.Execution, error)
 	// UpdateExecutionRecord updates a primary execution record through a callback.
 	// The ctx scopes the operation, executionID selects the record, and update transforms it.
 	// Returns the updated execution or an error if the update cannot be completed.
@@ -157,6 +164,34 @@ type StorageProvider interface {
 	ListExecutionLogEntries(ctx context.Context, executionID string, afterSeq *int64, limit int, levels []string, nodeIDs []string, sources []string, query string) ([]*types.ExecutionLogEntry, error)
 	PruneExecutionLogEntries(ctx context.Context, executionID string, maxEntries int, olderThan time.Time) error
 
+	// Token/cost usage operations
+	// CreateExecutionUsage persists a batch of token/cost usage rows for an execution.
+	// The ctx scopes the write, and rows carries the usage entries to insert.
+	// A nil/empty slice is a no-op. Returns an error if the rows cannot be stored.
+	CreateExecutionUsage(ctx context.Context, rows []*types.ExecutionUsage) error
+	// GetUsageStats aggregates token/cost usage over the window starting at since (inclusive).
+	// The ctx scopes the query, and a nil since aggregates over all rows.
+	// Returns the aggregation or an error if the query fails.
+	GetUsageStats(ctx context.Context, since *time.Time) (*types.UsageStatsAggregation, error)
+	// GetUsageTimeseries returns a bucketed token/cost series over the window
+	// ending at now, divided into exactly `buckets` equal buckets. The ctx scopes
+	// the query, a nil since spans from the oldest row to now ("all" window), and
+	// the result is zero-filled with exactly `buckets` ascending points.
+	// Returns the series or an error if the query fails.
+	GetUsageTimeseries(ctx context.Context, since *time.Time, now time.Time, buckets int) (*types.UsageTimeseries, error)
+	// GetUsageTimeseriesByModel returns per-model bucketed token series over the
+	// same aligned grid as GetUsageTimeseries. The ctx scopes the query and a nil
+	// since spans from the oldest row to now ("all" window). The top models by
+	// in-window tokens each get a series (descending); the remainder is rolled up
+	// into a trailing "other" series (omitted when there is no remainder). Each
+	// series is zero-filled with exactly `buckets` ascending points (tokens only).
+	// Returns the series or an error if the query fails.
+	GetUsageTimeseriesByModel(ctx context.Context, since *time.Time, now time.Time, buckets int) ([]types.UsageModelSeries, error)
+	// GetExecutionUsageTotals sums cost and total tokens for a single execution.
+	// The ctx scopes the query, and executionID selects the execution.
+	// Cost is nil when there are no rows or all costs are null. Returns an error if the query fails.
+	GetExecutionUsageTotals(ctx context.Context, executionID string) (*float64, int64, error)
+
 	// Execution cleanup operations
 	// CleanupOldExecutions deletes execution data older than the retention period.
 	// The ctx scopes the cleanup, retentionPeriod sets the age threshold, and batchSize limits each pass.
@@ -173,6 +208,15 @@ type StorageProvider interface {
 	// RetryStaleWorkflowExecutions resets stale workflow executions with retry_count < maxRetries
 	// back to "pending" status with incremented retry_count. Returns IDs of retried executions.
 	RetryStaleWorkflowExecutions(ctx context.Context, staleAfter time.Duration, maxRetries int, limit int) ([]string, error)
+
+	// MarkAgentExecutionsOrphaned fails every still-running execution and workflow
+	// execution owned by the given agent_node_id. Used when an agent re-registers
+	// with a new instance_id, signalling that the previous OS process is gone and
+	// any in-flight reasoner execution running inside it cannot be revived (its
+	// in-process wait_for_execution_result poll died with the process). The
+	// reasonMessage is written to the row's error_message / status_reason.
+	// Returns total rows updated across both tables.
+	MarkAgentExecutionsOrphaned(ctx context.Context, agentNodeID string, reasonMessage string) (int, error)
 
 	// Workflow cleanup operations - deletes all data related to a workflow ID
 	// CleanupWorkflow removes all stored data associated with a workflow.
@@ -502,6 +546,13 @@ type StorageProvider interface {
 	// The ctx scopes the write, and the identifiers, hashes, document, signature, and storage fields describe the VC record.
 	// Returns an error if the execution VC cannot be saved.
 	StoreExecutionVC(ctx context.Context, vcID, executionID, workflowID, sessionID, issuerDID, targetDID, callerDID, inputHash, outputHash, status string, vcDocument []byte, signature string, storageURI string, documentSizeBytes int64) error
+	// StoreExecutionVCRecord persists a full ExecutionVC including the new
+	// kind discriminator, parent_vc_id chain pointer, and trigger-event
+	// metadata. Use this for any new VC write — the older scalar-parameter
+	// StoreExecutionVC stays for backward compatibility but cannot express
+	// kind='trigger_event' or chain pointers. Returns an error if the row
+	// cannot be saved.
+	StoreExecutionVCRecord(ctx context.Context, vc *types.ExecutionVC) error
 	// GetExecutionVC retrieves execution verifiable credential data by VC identifier.
 	// The ctx scopes the read, and vcID identifies the execution VC record to load.
 	// Returns the execution VC info or an error if it is missing or unreadable.
@@ -636,6 +687,55 @@ type StorageProvider interface {
 	// The ctx scopes the query, and status identifies which lifecycle state to filter by.
 	// Returns matching agents or an error if the query fails.
 	ListAgentsByLifecycleStatus(ctx context.Context, status types.AgentLifecycleStatus) ([]*types.AgentNode, error)
+
+	// Trigger and inbound event operations (webhook plugin system).
+	// CreateTrigger inserts a new trigger row.
+	CreateTrigger(ctx context.Context, t *types.Trigger) error
+	// GetTrigger fetches a single trigger by ID.
+	GetTrigger(ctx context.Context, id string) (*types.Trigger, error)
+	// ListTriggers returns triggers, optionally filtered by target node and source.
+	ListTriggers(ctx context.Context, targetNodeID, sourceName string) ([]*types.Trigger, error)
+	// UpdateTrigger writes a full trigger record.
+	UpdateTrigger(ctx context.Context, t *types.Trigger) error
+	// DeleteTrigger removes a trigger by ID.
+	DeleteTrigger(ctx context.Context, id string) error
+	// UpsertCodeManagedTrigger idempotently inserts or updates a code-managed
+	// trigger keyed by (target_node_id, target_reasoner, source_name) and
+	// returns the row's ID.
+	UpsertCodeManagedTrigger(ctx context.Context, t *types.Trigger) (string, error)
+	// MarkOrphanedTriggers flips orphaned=true on code-managed triggers for
+	// the given node whose (source, target_reasoner) tuple is missing from
+	// declaredKeys. Used by the registration handler after upserting all
+	// declared bindings to surface decorators removed from user code.
+	MarkOrphanedTriggers(ctx context.Context, nodeID string, declaredKeys []string) error
+	// SetTriggerOverride sets/clears the sticky-pause flag and updates
+	// enabled atomically. Used by the /pause and /resume endpoints.
+	SetTriggerOverride(ctx context.Context, triggerID string, override bool, enabled bool) error
+	// ConvertTriggerToUIManaged flips an orphaned code-managed trigger to
+	// UI-managed so the operator can edit/delete it via the UI.
+	ConvertTriggerToUIManaged(ctx context.Context, triggerID string) error
+	// InsertInboundEvent persists a received event before dispatch.
+	InsertInboundEvent(ctx context.Context, e *types.InboundEvent) error
+	// InboundEventExistsByIdempotency reports whether an event with the given
+	// (source_name, idempotency_key) is already persisted.
+	InboundEventExistsByIdempotency(ctx context.Context, sourceName, idempotencyKey string) (bool, error)
+	// GetInboundEvent fetches a stored event by ID for replay or inspection.
+	GetInboundEvent(ctx context.Context, id string) (*types.InboundEvent, error)
+	// ListInboundEvents returns recent events for a trigger, newest first.
+	ListInboundEvents(ctx context.Context, triggerID string, limit int) ([]*types.InboundEvent, error)
+	// MarkInboundEventProcessed updates an event's status after dispatch finishes.
+	MarkInboundEventProcessed(ctx context.Context, id, status, errorMessage, vcID string) error
+	// SetInboundEventDispatchedWorkflow records the dispatcher-generated
+	// workflow ID against the inbound event so runs-list / run-dag handlers
+	// can correlate a run to its triggering event without traversing the
+	// DID/VC chain.
+	SetInboundEventDispatchedWorkflow(ctx context.Context, eventID, workflowID string) error
+	// GetInboundEventByWorkflowID looks up an inbound event by the
+	// dispatcher-recorded workflow ID. Returns (nil, nil) when no row matches.
+	GetInboundEventByWorkflowID(ctx context.Context, workflowID string) (*types.InboundEvent, error)
+	// TriggerMetrics returns aggregate statistics for the dashboard tile
+	// (global across all triggers).
+	TriggerMetrics(ctx context.Context) (*types.TriggerMetrics, error)
 }
 
 // ComponentDIDRequest represents a component DID to be stored

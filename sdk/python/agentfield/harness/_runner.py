@@ -1,20 +1,28 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import random
+import shutil
+import tempfile
 import time
 from typing import Any, Dict, List, Optional
 
 from agentfield.harness._result import FailureType, HarnessResult, RawResult
 from agentfield.harness._schema import (
     build_followup_prompt,
+    build_incremental_followup,
+    build_incremental_prompt_suffix,
     build_prompt_suffix,
     cleanup_temp_files,
+    diagnose_field_failures,
     diagnose_output_failure,
     get_output_path,
+    is_large_schema,
     parse_and_validate,
+    schema_to_json_schema,
     try_parse_from_text,
 )
 from agentfield.harness.providers._base import HarnessProvider
@@ -26,8 +34,11 @@ TRANSIENT_PATTERNS = {
     "rate limit",
     "rate_limit",
     "overloaded",
-    "timeout",
-    "timed out",
+    # Note: "timeout" / "timed out" are intentionally NOT here. The opencode
+    # provider's wall-clock timeout (default 30 min) is the cap on a *single*
+    # subprocess; if that hits, the prompt or model is wrong and re-running
+    # the entire 30-min subprocess won't fix it. Real network blips that
+    # surface as "connection reset" / "503" still trigger retry.
     "connection reset",
     "connection refused",
     "temporarily unavailable",
@@ -41,10 +52,103 @@ TRANSIENT_PATTERNS = {
 
 DEFAULT_SCHEMA_RETRIES = 2
 
+# Wall-clock cap on a single AI-based JSON repair call. The repair is one
+# LLM call with no tools, no repo access — it should finish in seconds.
+# If it doesn't, fall through to the existing harness retry path.
+_SCHEMA_REPAIR_TIMEOUT_SECONDS = 90
+
 
 def _is_transient(error_str: str) -> bool:
     lower = error_str.lower()
     return any(pattern in lower for pattern in TRANSIENT_PATTERNS)
+
+
+async def _ai_schema_repair(
+    text: str,
+    schema: Any,
+    options: Dict[str, Any],
+) -> Optional[Any]:
+    """Try to coerce raw text into a valid pydantic schema instance via ONE LLM call.
+
+    The harness's older fallback for schema-validation failures was to re-run the
+    *entire* opencode subprocess (30-minute wall-clock, full repo browsing) hoping
+    the model re-emitted something parseable. That's wildly expensive when the
+    actual problem is just "the JSON closes with an extra trailing comma" or
+    similar surface-level malformation — the model already produced the correct
+    information, it just didn't structure it cleanly.
+
+    This helper attempts cheap repair instead: take the existing text + the
+    pydantic schema, ask a fresh LLM call to re-emit valid JSON conforming to
+    the schema, and parse. No tools, no exploration, just reformatting.
+
+    Returns the parsed instance on success, None on any failure (caller falls
+    through to the existing retry-with-harness path). Skipped entirely when
+    `text` is empty — there's nothing to repair from in that case, and a real
+    rerun is the only option.
+    """
+    if not text or not text.strip():
+        # Nothing to repair from. The user explicitly called out this case:
+        # "if it actually failed and there was no output, then we can't do
+        # an AI-based JSON repair." Fall through to existing retry path.
+        return None
+
+    try:
+        import litellm  # type: ignore[import-not-found]
+    except ImportError:
+        return None
+
+    schema_json: Optional[Dict[str, Any]] = None
+    try:
+        if hasattr(schema, "model_json_schema"):
+            schema_json = schema.model_json_schema()
+    except Exception:
+        schema_json = None
+
+    schema_section = (
+        f"Target JSON schema:\n```json\n{json.dumps(schema_json, indent=2)}\n```\n\n"
+        if schema_json is not None
+        else ""
+    )
+
+    repair_prompt = (
+        "The text below was produced as the answer to a structured-output task, "
+        "but it did not parse as valid JSON conforming to the expected schema. "
+        "Re-emit the SAME content as valid JSON matching the schema. Preserve "
+        "every fact and finding from the original text — do NOT invent new "
+        "information or drop fields. Output ONLY the JSON object, no surrounding "
+        "prose, no markdown code fences, no commentary.\n\n"
+        f"{schema_section}"
+        f"Original text:\n{text}"
+    )
+
+    model = options.get("model")
+    if not model:
+        # No model configured — caller's harness call should have set one.
+        # Bail rather than guess; the existing retry path will handle this.
+        return None
+
+    try:
+        response = await asyncio.wait_for(
+            litellm.acompletion(
+                model=str(model),
+                messages=[{"role": "user", "content": repair_prompt}],
+                temperature=0.0,
+                response_format={"type": "json_object"},
+            ),
+            timeout=_SCHEMA_REPAIR_TIMEOUT_SECONDS,
+        )
+        content = response.choices[0].message.content  # type: ignore[union-attr]
+    except Exception as exc:
+        logger.info(
+            "AI schema repair: LLM call failed (%s); falling through to harness retry",
+            exc,
+        )
+        return None
+
+    if not content:
+        return None
+
+    return try_parse_from_text(content, schema)
 
 
 def _resolve_options(
@@ -71,6 +175,7 @@ def _resolve_options(
             "gemini_bin",
             "opencode_bin",
             "schema_max_retries",
+            "schema_mode",
         ]:
             val = getattr(config, field_name, None)
             if val is not None:
@@ -84,11 +189,18 @@ def _resolve_options(
 
 def _accumulate_metrics(
     all_raws: List[RawResult],
-) -> tuple[Optional[float], int, str, List[Dict[str, Any]]]:
+) -> tuple[Optional[float], int, str, List[Dict[str, Any]], Dict[str, Any]]:
     total_cost: Optional[float] = None
     total_turns = 0
     session_id = ""
     all_messages: List[Dict[str, Any]] = []
+    tokens: Dict[str, Any] = {
+        "input_tokens": 0,
+        "output_tokens": 0,
+        "cache_read_tokens": 0,
+        "cache_creation_tokens": 0,
+        "model": None,
+    }
 
     for raw in all_raws:
         if raw.metrics.total_cost_usd is not None:
@@ -97,8 +209,30 @@ def _accumulate_metrics(
         if raw.metrics.session_id:
             session_id = raw.metrics.session_id
         all_messages.extend(raw.messages)
+        tokens["input_tokens"] += raw.metrics.input_tokens
+        tokens["output_tokens"] += raw.metrics.output_tokens
+        tokens["cache_read_tokens"] += raw.metrics.cache_read_tokens
+        tokens["cache_creation_tokens"] += raw.metrics.cache_creation_tokens
+        if raw.metrics.model and not tokens["model"]:
+            tokens["model"] = raw.metrics.model
 
-    return total_cost, total_turns, session_id, all_messages
+    return total_cost, total_turns, session_id, all_messages, tokens
+
+
+def _token_result_kwargs(tokens: Dict[str, Any]) -> Dict[str, Any]:
+    """Build the HarnessResult token kwargs from an aggregated token dict."""
+    input_tokens = tokens.get("input_tokens", 0)
+    output_tokens = tokens.get("output_tokens", 0)
+    cache_read = tokens.get("cache_read_tokens", 0)
+    cache_creation = tokens.get("cache_creation_tokens", 0)
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_tokens": cache_read,
+        "cache_creation_tokens": cache_creation,
+        "total_tokens": input_tokens + output_tokens,
+        "model": tokens.get("model"),
+    }
 
 
 class HarnessRunner:
@@ -119,6 +253,7 @@ class HarnessRunner:
         system_prompt: Optional[str] = None,
         env: Optional[Dict[str, str]] = None,
         cwd: Optional[str] = None,
+        project_dir: Optional[str] = None,
         **kwargs: Any,
     ) -> HarnessResult:
         overrides = {
@@ -131,6 +266,7 @@ class HarnessRunner:
             "system_prompt": system_prompt,
             "env": env,
             "cwd": cwd,
+            "project_dir": project_dir,
             **kwargs,
         }
         options = _resolve_options(self._config, overrides)
@@ -142,14 +278,45 @@ class HarnessRunner:
                 "or pass it to .harness() call."
             )
 
-        resolved_cwd = str(options.get("cwd", "."))
+        resolved_cwd = str(options.get("cwd") or ".")
         provider_instance = self._build_provider(str(resolved_provider), options)
 
-        output_dir = resolved_cwd
+        # Where the schema output file (.agentfield_output.json) is written and
+        # read back. It MUST sit inside the agent's allowed root, or providers
+        # like OpenCode reject the write as an external-directory access
+        # (agentfield#684). When project_dir is set, the agent's root is
+        # project_dir (see each provider's --dir / -C handling), which may differ
+        # from cwd — so the output file goes in an isolated temp dir *under*
+        # project_dir, never in a sibling/nested cwd. When project_dir is unset,
+        # cwd is the root and the output file goes directly in cwd (unchanged).
+        # This mirrors the Go SDK runner.
+        resolved_project_dir = options.get("project_dir")
+        temp_output_dir: Optional[str] = None
+        if isinstance(resolved_project_dir, str) and resolved_project_dir:
+            os.makedirs(resolved_project_dir, exist_ok=True)
+            temp_output_dir = tempfile.mkdtemp(
+                prefix=".agentfield-out-", dir=resolved_project_dir
+            )
+            output_dir = temp_output_dir
+        else:
+            output_dir = resolved_cwd
+
+        # schema_mode selects how the agent is asked to produce the output:
+        #   "single"      — one Write of the whole object (default, cheapest)
+        #   "incremental" — build the object one top-level field at a time, with
+        #                   field-level recovery (robust for large/deep schemas)
+        #   "auto"        — incremental only when the schema is large, else single
+        use_incremental = self._resolve_incremental(schema, options)
+        options["_use_incremental"] = use_incremental
 
         effective_prompt = prompt
         if schema is not None:
-            effective_prompt = prompt + build_prompt_suffix(schema, output_dir)
+            suffix = (
+                build_incremental_prompt_suffix(schema, output_dir)
+                if use_incremental
+                else build_prompt_suffix(schema, output_dir)
+            )
+            effective_prompt = prompt + suffix
         options["_original_prompt"] = effective_prompt
 
         start_time = time.monotonic()
@@ -169,6 +336,7 @@ class HarnessRunner:
                 )
 
             elapsed = int((time.monotonic() - start_time) * 1000)
+            _cost, _turns, _sid, _msgs, _tokens = _accumulate_metrics([raw])
             return HarnessResult(
                 result=raw.result,
                 parsed=None,
@@ -180,10 +348,29 @@ class HarnessRunner:
                 duration_ms=elapsed,
                 session_id=raw.metrics.session_id,
                 messages=raw.messages,
+                **_token_result_kwargs(_tokens),
             )
         finally:
             if schema is not None:
                 cleanup_temp_files(output_dir)
+            if temp_output_dir is not None:
+                shutil.rmtree(temp_output_dir, ignore_errors=True)
+
+    @staticmethod
+    def _resolve_incremental(schema: Any, options: Dict[str, Any]) -> bool:
+        """Decide whether to use the incremental field-by-field schema build."""
+        if schema is None:
+            return False
+        mode = str(options.get("schema_mode") or "single").lower()
+        if mode == "incremental":
+            return True
+        if mode == "auto":
+            try:
+                schema_json = json.dumps(schema_to_json_schema(schema))
+            except Exception:
+                return False
+            return is_large_schema(schema_json)
+        return False
 
     def _build_provider(
         self, provider_name: str, options: Dict[str, Any]
@@ -249,6 +436,16 @@ class HarnessRunner:
             options.get("schema_max_retries", DEFAULT_SCHEMA_RETRIES)
         )
 
+        # Surfaced on every terminal schema failure so callers can immediately
+        # see which directory the agent was rooted at vs. where the output file
+        # was expected — the two most common causes of "output not created"
+        # (agentfield#684, issue ask #5).
+        dir_context = (
+            f" [provider={options.get('provider')!r}, "
+            f"project_dir={options.get('project_dir')!r}, "
+            f"cwd={options.get('cwd')!r}, output_path={output_path!r}]"
+        )
+
         all_raws: List[RawResult] = [initial_raw]
 
         validated = parse_and_validate(output_path, schema)
@@ -262,9 +459,20 @@ class HarnessRunner:
             if validated is not None:
                 logger.info("Stdout fallback succeeded")
 
+        # Cheap-repair tier: if we have non-empty text but still no valid
+        # parse, try one focused LLM call that just reformats the text into
+        # valid JSON. This is dramatically cheaper than the retry loop below
+        # (which spawns a whole new opencode subprocess), so we prefer it
+        # whenever there's text to work with.
+        if validated is None and initial_raw.result and initial_raw.result.strip():
+            logger.info("Attempting AI-based JSON repair before harness retry")
+            validated = await _ai_schema_repair(initial_raw.result, schema, options)
+            if validated is not None:
+                logger.info("AI schema repair succeeded — skipped harness retry")
+
         if validated is not None:
             elapsed = int((time.monotonic() - start_time) * 1000)
-            cost, turns, sid, msgs = _accumulate_metrics(all_raws)
+            cost, turns, sid, msgs, tokens = _accumulate_metrics(all_raws)
             return HarnessResult(
                 result=initial_raw.result,
                 parsed=validated,
@@ -274,6 +482,7 @@ class HarnessRunner:
                 duration_ms=elapsed,
                 session_id=sid,
                 messages=msgs,
+                **_token_result_kwargs(tokens),
             )
 
         _retryable = {FailureType.CRASH, FailureType.NO_OUTPUT, FailureType.NONE}
@@ -287,14 +496,15 @@ class HarnessRunner:
             and not os.path.exists(output_path)
         ):
             elapsed = int((time.monotonic() - start_time) * 1000)
-            cost, turns, sid, msgs = _accumulate_metrics(all_raws)
+            cost, turns, sid, msgs, tokens = _accumulate_metrics(all_raws)
             provider_error = initial_raw.error_message or "Provider execution failed."
             return HarnessResult(
                 result=initial_raw.result,
                 parsed=None,
                 is_error=True,
                 error_message=(
-                    f"{provider_error} Output file was not created at {output_path}."
+                    f"{provider_error} Output file was not created at "
+                    f"{output_path}.{dir_context}"
                 ),
                 failure_type=initial_raw.failure_type,
                 cost_usd=cost,
@@ -302,6 +512,7 @@ class HarnessRunner:
                 duration_ms=elapsed,
                 session_id=sid,
                 messages=msgs,
+                **_token_result_kwargs(tokens),
             )
 
         last_session_id = initial_raw.metrics.session_id
@@ -323,8 +534,21 @@ class HarnessRunner:
                     )
                 )
             else:
-                error_detail = diagnose_output_failure(output_path, schema)
-                retry_prompt = build_followup_prompt(error_detail, cwd, schema)
+                _orig = options.get("_original_prompt", "")
+                if options.get("_use_incremental"):
+                    # Incremental mode: patch only the fields that are missing or
+                    # invalid, one at a time, instead of regenerating the whole
+                    # object. The partial output file persists on disk between
+                    # attempts, so the agent edits it in place.
+                    field_errors = diagnose_field_failures(output_path, schema)
+                    _followup = build_incremental_followup(field_errors, cwd, schema)
+                else:
+                    error_detail = diagnose_output_failure(output_path, schema)
+                    _followup = build_followup_prompt(error_detail, cwd, schema)
+                # Keep the original goal/task on non-crash retries. Without this
+                # the agent retries with only the schema-correction text and loses
+                # the goal (e.g. PM emits a placeholder PRD that poisons the run).
+                retry_prompt = (_orig + "\n\n" + _followup) if _orig else _followup
 
             detail_for_log = diagnose_output_failure(output_path, schema)
 
@@ -367,7 +591,7 @@ class HarnessRunner:
 
             if validated is not None:
                 elapsed = int((time.monotonic() - start_time) * 1000)
-                cost, turns, sid, msgs = _accumulate_metrics(all_raws)
+                cost, turns, sid, msgs, tokens = _accumulate_metrics(all_raws)
                 logger.info("Schema validation succeeded on retry %d", retry_num + 1)
                 return HarnessResult(
                     result=retry_raw.result,
@@ -378,10 +602,11 @@ class HarnessRunner:
                     duration_ms=elapsed,
                     session_id=sid,
                     messages=msgs,
+                    **_token_result_kwargs(tokens),
                 )
 
         elapsed = int((time.monotonic() - start_time) * 1000)
-        cost, turns, sid, msgs = _accumulate_metrics(all_raws)
+        cost, turns, sid, msgs, tokens = _accumulate_metrics(all_raws)
         final_diagnosis = diagnose_output_failure(output_path, schema)
         return HarnessResult(
             result=all_raws[-1].result,
@@ -389,7 +614,7 @@ class HarnessRunner:
             is_error=True,
             error_message=(
                 f"Schema validation failed after {schema_max_retries} "
-                f"retry attempt(s). Last error: {final_diagnosis}"
+                f"retry attempt(s). Last error: {final_diagnosis}{dir_context}"
             ),
             failure_type=FailureType.SCHEMA,
             cost_usd=cost,
@@ -397,4 +622,5 @@ class HarnessRunner:
             duration_ms=elapsed,
             session_id=sid,
             messages=msgs,
+            **_token_result_kwargs(tokens),
         )

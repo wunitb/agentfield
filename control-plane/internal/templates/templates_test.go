@@ -2,6 +2,9 @@ package templates
 
 import (
 	"bytes"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"slices"
 	"strings"
 	"testing"
@@ -81,37 +84,40 @@ func TestGetTemplateFiles(t *testing.T) {
 			name:     "python templates",
 			language: "python",
 			want: map[string]string{
-				"python/.env.example.tmpl":     ".env.example",
-				"python/.gitignore.tmpl":       ".gitignore",
-				"python/README.md.tmpl":        "README.md",
-				"python/main.py.tmpl":          "main.py",
-				"python/reasoners.py.tmpl":     "reasoners.py",
-				"python/requirements.txt.tmpl": "requirements.txt",
+				"python/agentfield-package.yaml.tmpl": "agentfield-package.yaml",
+				"python/.env.example.tmpl":            ".env.example",
+				"python/.gitignore.tmpl":              ".gitignore",
+				"python/README.md.tmpl":               "README.md",
+				"python/main.py.tmpl":                 "main.py",
+				"python/reasoners.py.tmpl":            "reasoners.py",
+				"python/requirements.txt.tmpl":        "requirements.txt",
 			},
 		},
 		{
 			name:     "go templates",
 			language: "go",
 			want: map[string]string{
-				"go/.env.example.tmpl": ".env.example",
-				"go/.gitignore.tmpl":   ".gitignore",
-				"go/README.md.tmpl":    "README.md",
-				"go/go.mod.tmpl":       "go.mod",
-				"go/main.go.tmpl":      "main.go",
-				"go/reasoners.go.tmpl": "reasoners.go",
+				"go/agentfield-package.yaml.tmpl": "agentfield-package.yaml",
+				"go/.env.example.tmpl":            ".env.example",
+				"go/.gitignore.tmpl":              ".gitignore",
+				"go/README.md.tmpl":               "README.md",
+				"go/go.mod.tmpl":                  "go.mod",
+				"go/main.go.tmpl":                 "main.go",
+				"go/reasoners.go.tmpl":            "reasoners.go",
 			},
 		},
 		{
 			name:     "typescript templates",
 			language: "typescript",
 			want: map[string]string{
-				"typescript/.env.example.tmpl":  ".env.example",
-				"typescript/.gitignore.tmpl":    ".gitignore",
-				"typescript/README.md.tmpl":     "README.md",
-				"typescript/main.ts.tmpl":       "main.ts",
-				"typescript/package.json.tmpl":  "package.json",
-				"typescript/reasoners.ts.tmpl":  "reasoners.ts",
-				"typescript/tsconfig.json.tmpl": "tsconfig.json",
+				"typescript/agentfield-package.yaml.tmpl": "agentfield-package.yaml",
+				"typescript/.env.example.tmpl":            ".env.example",
+				"typescript/.gitignore.tmpl":              ".gitignore",
+				"typescript/README.md.tmpl":               "README.md",
+				"typescript/main.ts.tmpl":                 "main.ts",
+				"typescript/package.json.tmpl":            "package.json",
+				"typescript/reasoners.ts.tmpl":            "reasoners.ts",
+				"typescript/tsconfig.json.tmpl":           "tsconfig.json",
 			},
 		},
 		{
@@ -148,7 +154,74 @@ func TestGetTemplateFiles(t *testing.T) {
 					t.Fatalf("GetTemplateFiles(%q)[%q] = %q, want %q", tt.language, wantPath, got[wantPath], wantDest)
 				}
 			}
+			manifestCount := 0
+			for _, destination := range got {
+				if destination == "agentfield-package.yaml" {
+					manifestCount++
+				}
+			}
+			if manifestCount != 1 {
+				t.Fatalf("GetTemplateFiles(%q) mapped %d manifests to the scaffold root, want 1", tt.language, manifestCount)
+			}
 		})
+	}
+}
+
+func TestRenderedGoScaffoldBuilds(t *testing.T) {
+	root := t.TempDir()
+	data := TemplateData{
+		ProjectName: "Buildable Go scaffold",
+		GoModule:    "example.com/buildable-go-scaffold",
+		NodeID:      "buildable-go-scaffold",
+		AuthorName:  "AgentField",
+		AgentPort:   8001,
+	}
+
+	files, err := GetTemplateFiles("go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for templatePath, destination := range files {
+		tmpl, err := GetTemplate(templatePath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var rendered bytes.Buffer
+		if err := tmpl.Execute(&rendered, data); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, destination), rendered.Bytes(), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	mainContents, err := os.ReadFile(filepath.Join(root, "main.go"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`envOrDefault("AGENTFIELD_SERVER", "http://localhost:8080")`,
+		`envOrDefault("PORT", "8001")`,
+	} {
+		if !strings.Contains(string(mainContents), want) {
+			t.Fatalf("rendered main.go missing %q:\n%s", want, mainContents)
+		}
+	}
+
+	sdkRoot, err := filepath.Abs("../../../sdk/go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	commands := [][]string{
+		{"mod", "edit", "-replace=github.com/Agent-Field/agentfield/sdk/go=" + sdkRoot},
+		{"build", "-mod=mod", "./..."},
+	}
+	for _, args := range commands {
+		cmd := exec.Command("go", args...)
+		cmd.Dir = root
+		cmd.Env = append(os.Environ(), "GOWORK=off")
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("go %s failed: %v\n%s", strings.Join(args, " "), err, output)
+		}
 	}
 }
 

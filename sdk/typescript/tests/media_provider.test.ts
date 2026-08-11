@@ -114,6 +114,26 @@ describe('OpenRouterMediaProvider', () => {
     expect(p.supportedModalities).toContain('video');
   });
 
+  it('includes OpenRouter attribution headers in fetch calls', async () => {
+    mockFetch.mockResolvedValueOnce({
+      ok: true,
+      json: async () => ({ choices: [] }),
+    });
+
+    const provider = new OpenRouterMediaProvider({ apiKey: 'test-key' });
+    await provider.generateImage({ prompt: 'test' });
+
+    const init = mockFetch.mock.calls[0][1];
+    expect(init.headers).toEqual(
+      expect.objectContaining({
+        Authorization: 'Bearer test-key',
+        'HTTP-Referer': 'https://agentfield.ai',
+        'X-OpenRouter-Title': 'AgentField AI',
+        'X-Title': 'AgentField AI',
+      })
+    );
+  });
+
   it('toJSON excludes API key (CR-03)', () => {
     const p = new OpenRouterMediaProvider({ apiKey: 'secret-key-123' });
     const json = JSON.parse(JSON.stringify(p));
@@ -409,6 +429,10 @@ describe('OpenRouterMediaProvider', () => {
   describe('generateAudio', () => {
     it('parses SSE stream and collects audio chunks', async () => {
       const provider = new OpenRouterMediaProvider({ apiKey: 'test-key' });
+      // Force chat-completions routing — without this, the provider would try
+      // GET /models/{id}/endpoints to discover routing and fall through to
+      // /audio/speech because mocks return undefined.
+      provider.seedModelMeta('openai/gpt-audio-mini', ['text', 'audio'], ['text']);
 
       const sseLines = [
         'data: {"choices":[{"delta":{"content":"Hello"}}]}\n\n',
@@ -435,15 +459,19 @@ describe('OpenRouterMediaProvider', () => {
         body: { getReader: () => mockReader },
       });
 
-      const resp = await provider.generateAudio({ text: 'say hello' });
+      // mp3 keeps chunks as raw base64 (no wav wrap).
+      const resp = await provider.generateAudio({
+        text: 'say hello', model: 'openai/gpt-audio-mini', format: 'mp3',
+      });
       expect(resp.text).toBe('Hello');
       expect(resp.audio).not.toBeNull();
       expect(resp.audio!.data).toBe('AAAABBBB');
-      expect(resp.audio!.format).toBe('wav');
+      expect(resp.audio!.format).toBe('mp3');
     });
 
     it('processes remaining buffer after stream ends (WR-02)', async () => {
       const provider = new OpenRouterMediaProvider({ apiKey: 'test-key' });
+      provider.seedModelMeta('openai/gpt-audio-mini', ['text', 'audio'], ['text']);
 
       // Send data without trailing newline so it stays in buffer
       const encoder = new TextEncoder();
@@ -469,12 +497,15 @@ describe('OpenRouterMediaProvider', () => {
         body: { getReader: () => mockReader },
       });
 
-      const resp = await provider.generateAudio({ text: 'test' });
+      const resp = await provider.generateAudio({
+        text: 'test', model: 'openai/gpt-audio-mini', format: 'mp3',
+      });
       expect(resp.text).toBe('AB');
     });
 
     it('throws on failure with context (WR-05)', async () => {
       const provider = new OpenRouterMediaProvider({ apiKey: 'test-key' });
+      provider.seedModelMeta('openai/gpt-audio-mini', ['text', 'audio'], ['text']);
 
       mockFetch.mockResolvedValueOnce({
         ok: false,
@@ -483,7 +514,9 @@ describe('OpenRouterMediaProvider', () => {
       });
 
       await expect(
-        provider.generateAudio({ text: 'test' })
+        provider.generateAudio({
+          text: 'test', model: 'openai/gpt-audio-mini', format: 'mp3',
+        })
       ).rejects.toThrow(MediaProviderError);
       // Reset mock for second assertion
       mockFetch.mockResolvedValueOnce({
@@ -492,12 +525,15 @@ describe('OpenRouterMediaProvider', () => {
         text: async () => 'Internal error',
       });
       await expect(
-        provider.generateAudio({ text: 'test' })
+        provider.generateAudio({
+          text: 'test', model: 'openai/gpt-audio-mini', format: 'mp3',
+        })
       ).rejects.toThrow('Audio generation failed');
     });
 
     it('throws after too many consecutive parse errors (WR-04)', async () => {
       const provider = new OpenRouterMediaProvider({ apiKey: 'test-key' });
+      provider.seedModelMeta('openai/gpt-audio-mini', ['text', 'audio'], ['text']);
 
       // Create 51+ malformed SSE lines in a single chunk
       const malformedLines = Array.from(
@@ -524,7 +560,9 @@ describe('OpenRouterMediaProvider', () => {
       });
 
       await expect(
-        provider.generateAudio({ text: 'test' })
+        provider.generateAudio({
+          text: 'test', model: 'openai/gpt-audio-mini', format: 'mp3',
+        })
       ).rejects.toThrow('consecutive SSE parse errors');
     });
   });

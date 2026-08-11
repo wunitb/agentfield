@@ -160,7 +160,7 @@ class AgentFieldClient:
         self._did_authenticator = DIDAuthenticator(did=did, private_key_jwk=private_key_jwk)
 
         # Async execution components
-        self.async_config = async_config or AsyncConfig()
+        self.async_config = async_config or AsyncConfig.from_environment()
         self._async_execution_manager: Optional[AsyncExecutionManager] = None
         self._async_http_client: Optional["httpx.AsyncClient"] = None
         self._async_http_client_lock: Optional[asyncio.Lock] = None
@@ -638,6 +638,7 @@ class AgentFieldClient:
         version: str = "1.0.0",
         agent_metadata: Optional[Dict[str, Any]] = None,
         tags: Optional[List[str]] = None,
+        instance_id: Optional[str] = None,
     ) -> Tuple[bool, Optional[Dict[str, Any]]]:
         """Register or update agent information with AgentField server."""
         try:
@@ -654,6 +655,10 @@ class AgentFieldClient:
                 "reasoners": reasoners,
                 "skills": skills,
                 "proposed_tags": agent_tags,
+                # instance_id distinguishes this OS process from any prior one.
+                # Empty string is the back-compat sentinel; the control plane
+                # treats empty as "no orphan-reap on this re-registration".
+                "instance_id": instance_id or "",
                 "communication_config": {
                     "protocols": ["http"],
                     "websocket_endpoint": "",
@@ -742,6 +747,63 @@ class AgentFieldClient:
             submission, status_payload, result_value, metadata
         )
 
+    async def restart_execution(
+        self,
+        execution_id: str,
+        *,
+        scope: str = "workflow",
+        reuse: str = "succeeded-before",
+        fork: bool = False,
+        reason: Optional[str] = None,
+        input_data: Optional[Dict[str, Any]] = None,
+        context: Optional[Dict[str, Any]] = None,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> Dict[str, Any]:
+        """Start a new run from an existing execution point.
+
+        The restarted workflow runs normally; matching successful downstream
+        app.call outputs from the source run are replayed by the control plane.
+        """
+
+        if not execution_id:
+            raise ValidationError("execution_id is required")
+
+        payload: Dict[str, Any] = {
+            "scope": scope,
+            "reuse": reuse,
+        }
+        if fork:
+            payload["fork"] = True
+        if reason:
+            payload["reason"] = reason
+        if input_data is not None:
+            payload["input"] = input_data
+        if context is not None:
+            payload["context"] = context
+
+        request_headers = self._get_headers_with_context(headers)
+        request_headers["Content-Type"] = "application/json"
+        sanitized_headers = self._sanitize_header_values(request_headers)
+
+        response = await self._async_request(
+            "POST",
+            f"{self.api_base}/executions/{execution_id}/restart",
+            json=payload,
+            headers=sanitized_headers,
+            timeout=self.async_config.polling_timeout,
+        )
+        if response.status_code >= 400:
+            try:
+                error_body = response.json()
+            except Exception:
+                error_body = None
+            body_msg = ""
+            if isinstance(error_body, dict):
+                body_msg = error_body.get("message") or error_body.get("error") or ""
+            msg = f"{response.status_code}, {body_msg}" if body_msg else str(response.status_code)
+            raise ExecuteError(response.status_code, msg, error_body)
+        return response.json()
+
     def execute_sync(
         self,
         target: str,
@@ -801,6 +863,23 @@ class AgentFieldClient:
         self._maybe_update_event_stream_headers(sanitized_headers)
         return sanitized_headers
 
+    @staticmethod
+    def _execution_payload(input_data: Dict[str, Any], headers: Dict[str, str]) -> Dict[str, Any]:
+        def value(name: str) -> Optional[str]:
+            return headers.get(name) or headers.get(name.lower())
+
+        home_id = value("X-AgentField-Authority-Home-ID")
+        run_id = value("X-AgentField-Authority-Run-ID")
+        lease_owner = value("X-AgentField-Authority-Lease-Owner")
+        payload: Dict[str, Any] = {"input": input_data}
+        if home_id and run_id and lease_owner:
+            payload["authority"] = {
+                "home_id": home_id,
+                "run_id": run_id,
+                "lease_owner": lease_owner,
+            }
+        return payload
+
     def _submit_execution_sync(
         self,
         target: str,
@@ -809,7 +888,7 @@ class AgentFieldClient:
     ) -> _Submission:
         import json as json_module
 
-        payload = {"input": input_data}
+        payload = self._execution_payload(input_data, headers)
         # Serialize once so the signed bytes are exactly what gets sent.
         body_bytes = json_module.dumps(payload, separators=(",", ":")).encode("utf-8")
 
@@ -850,7 +929,7 @@ class AgentFieldClient:
     ) -> _Submission:
         import json as json_module
 
-        payload = {"input": input_data}
+        payload = self._execution_payload(input_data, headers)
         # Serialize once so the signed bytes are exactly what gets sent.
         # httpx uses compact separators (',', ':') which differ from
         # json.dumps() defaults (', ', ': '), causing signature mismatch.
@@ -1195,6 +1274,7 @@ class AgentFieldClient:
         version: str = "1.0.0",
         agent_metadata: Optional[Dict[str, Any]] = None,
         tags: Optional[List[str]] = None,
+        instance_id: Optional[str] = None,
     ) -> Tuple[bool, Optional[Dict[str, Any]]]:
         """Register agent with immediate status reporting for fast lifecycle."""
         try:
@@ -1211,6 +1291,8 @@ class AgentFieldClient:
                 "reasoners": reasoners,
                 "skills": skills,
                 "proposed_tags": agent_tags,
+                # See register_agent for instance_id semantics.
+                "instance_id": instance_id or "",
                 "lifecycle_status": status.value,
                 "communication_config": {
                     "protocols": ["http"],
@@ -1495,7 +1577,12 @@ class AgentFieldClient:
             ) from e
 
     async def wait_for_execution_result(
-        self, execution_id: str, timeout: Optional[float] = None
+        self,
+        execution_id: str,
+        timeout: Optional[float] = None,
+        pause_clock: Optional[Any] = None,
+        on_child_waiting: Optional[Any] = None,
+        on_child_running: Optional[Any] = None,
     ) -> Any:
         """
         Wait for execution completion with polling.
@@ -1503,6 +1590,15 @@ class AgentFieldClient:
         Args:
             execution_id: Execution ID to wait for
             timeout: Optional timeout override (uses config default if None)
+            pause_clock: Optional ``PauseClock`` whose accumulated paused
+                seconds are subtracted from elapsed wall-clock when checking
+                ``timeout`` — used by ``Agent.call`` to keep the wait alive
+                across child pauses.
+            on_child_waiting / on_child_running: Optional async callables
+                fired when the awaited child transitions in/out of WAITING.
+                ``Agent.call`` wires these to push the AWAITER's own status
+                upstream so multi-hop pause propagation works (a child two+
+                hops below WAITING wouldn't pause anything otherwise).
 
         Returns:
             Any: Execution result
@@ -1516,7 +1612,13 @@ class AgentFieldClient:
 
         try:
             manager = await self._get_async_execution_manager()
-            result = await manager.wait_for_result(execution_id, timeout)
+            result = await manager.wait_for_result(
+                execution_id,
+                timeout,
+                pause_clock=pause_clock,
+                on_child_waiting=on_child_waiting,
+                on_child_running=on_child_running,
+            )
 
             logger.debug(f"Execution {execution_id[:8]}... completed successfully")
             return result
@@ -1755,6 +1857,65 @@ class AgentFieldClient:
             approval_request_id=data.get("approval_request_id", ""),
             approval_request_url=data.get("approval_request_url", ""),
         )
+
+    async def notify_awaiter_status(
+        self,
+        execution_id: str,
+        status: str,
+        reason: str = "",
+    ) -> None:
+        """Notify the control plane that this execution is now WAITING or
+        RUNNING because of its awaited child's state — propagation hook.
+
+        Calls ``POST /api/v1/agents/{node}/executions/{id}/awaiter-status``.
+        Distinct from ``request_approval``: there's no approval ID, no
+        webhook callback, no human in the loop. It exists only so that
+        ancestors watching this execution see WAITING transitively when
+        any descendant is paused. The control plane validates that the
+        execution is non-terminal and the transition is RUNNING<->WAITING.
+
+        Fire-and-forget from the caller's perspective: failures are swallowed
+        by the caller. We still want to know on the server side if a bad
+        transition was attempted, hence the response check here for logs.
+
+        Args:
+            execution_id: The awaiter's own execution_id (NOT the child's).
+            status: ``"waiting"`` or ``"running"``.
+            reason: Optional free-text reason for observability (e.g.
+                ``"awaiting child exec_abc"``).
+
+        Raises:
+            AgentFieldClientError: If the control plane returns 4xx/5xx.
+        """
+        if status not in {"waiting", "running"}:
+            raise AgentFieldClientError(
+                f"notify_awaiter_status: status must be 'waiting' or 'running', got {status!r}"
+            )
+
+        node_id = self.caller_agent_id or ""
+        body: Dict[str, Any] = {"status": status}
+        if reason:
+            body["reason"] = reason
+        url = f"{self.api_base}/agents/{node_id}/executions/{execution_id}/awaiter-status"
+
+        try:
+            client = await self.get_async_http_client()
+            response = await client.post(
+                url,
+                json=body,
+                headers=self._sanitize_header_values(self._get_headers_with_context(None)),
+                timeout=10,
+            )
+        except Exception as exc:
+            raise AgentFieldClientError(
+                f"Failed to notify awaiter status: {exc}"
+            ) from exc
+
+        if response.status_code >= 400:
+            raise AgentFieldClientError(
+                f"Awaiter-status update failed ({response.status_code}): "
+                f"{response.text[:500]}"
+            )
 
     async def get_approval_status(
         self,

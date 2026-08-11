@@ -1,3 +1,4 @@
+from typing import Coroutine
 import asyncio
 import inspect
 import os
@@ -23,6 +24,9 @@ from typing import (
     Type,
     Dict,
     Literal,
+    ParamSpec,
+    TypeVar,
+    overload,
 )
 from agentfield.agent_ai import AgentAI
 from agentfield.agent_cli import AgentCLI
@@ -45,7 +49,16 @@ from agentfield.memory_events import MemoryEventClient
 from agentfield.logger import log_debug, log_error, log_info, log_warn, set_cp_client
 from agentfield.router import AgentRouter
 from agentfield.connection_manager import ConnectionManager
-from agentfield.cost_tracker import CostTracker
+from agentfield.cost_tracker import (
+    USAGE_ENVELOPE_KEY,
+    CostTracker,
+    reset_current_cost_tracker,
+    set_current_cost_tracker,
+)
+from agentfield.decorator_metadata import (
+    resolve_reasoner_metadata,
+    split_direct_registration_arg,
+)
 from agentfield.types import (
     AgentStatus,
     AIConfig,
@@ -57,19 +70,49 @@ from agentfield.multimodal_response import MultimodalResponse
 from agentfield.async_config import AsyncConfig
 from agentfield.async_execution_manager import AsyncExecutionManager
 from agentfield.pydantic_utils import convert_function_args, should_convert_args
+from agentfield.sessions import (
+    RealtimeSession,
+    build_session_definition,
+)
 from fastapi import FastAPI, Request, HTTPException
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import JSONResponse
+from starlette.responses import Response as StarletteResponse
 from pydantic import BaseModel, ValidationError
 from dataclasses import dataclass, field
 import weakref
 
 if TYPE_CHECKING:
+    from agentfield.harness._doctor import ProviderHealth
     from agentfield.harness._result import HarnessResult
     from agentfield.harness._runner import HarnessRunner
 
+P = ParamSpec("P")
+T = TypeVar("T")
+
 # Use slots=True for memory efficiency on Python 3.10+, fallback for older versions
 _dataclass_kwargs = {"slots": True} if sys.version_info >= (3, 10) else {}
+
+
+class _HandlerInputError(ValueError):
+    """Reasoner input-validation error with a message safe to surface to HTTP clients.
+
+    All messages produced inside the SDK's validator are constructed by us
+    (not pulled from user payloads or underlying Python exceptions), so the
+    full text is safe to include in a 422 response body. We expose that
+    text via the explicit `safe_message` attribute rather than relying on
+    `str(self)` so the request handler can read a known-safe value without
+    tripping CodeQL's `py/stack-trace-exposure` rule.
+
+    Subclasses ValueError so existing `except ValueError` call sites still
+    catch validation failures unchanged.
+    """
+
+    __slots__ = ("safe_message",)
+
+    def __init__(self, message: str) -> None:
+        super().__init__(message)
+        self.safe_message = message
 
 
 # Memory-efficient handler entry classes using __slots__ (on Python 3.10+)
@@ -85,7 +128,16 @@ class ReasonerEntry:
     input_types: Dict[str, tuple]  # (type, default) tuples - not Pydantic model
     output_type: type
     tags: List[str] = field(default_factory=list)
+    # Human/agent-facing summary sent to the control plane and surfaced by
+    # discovery + `af ls`. Defaults to the function docstring's first paragraph.
+    description: str = ""
     vc_enabled: Optional[bool] = None
+    # Trigger bindings declared via @reasoner(triggers=[...]) or sugar
+    # decorators @on_event / @on_schedule. The control plane upserts a
+    # code-managed Trigger row per binding at registration.
+    triggers: List[Any] = field(default_factory=list)
+    # 3-state webhook flag: True (opt-in), False (opt-out), "warn" (default)
+    accepts_webhook: Union[bool, str] = "warn"
     # Note: input_schema and output_schema are generated on-demand via _get_handler_schema()
 
 
@@ -98,7 +150,21 @@ class SkillEntry:
     input_types: Dict[str, tuple]  # (type, default) tuples
     output_type: type
     tags: List[str] = field(default_factory=list)
+    # Same contract as ReasonerEntry.description.
+    description: str = ""
     vc_enabled: Optional[bool] = None
+
+
+def _docstring_summary(func: Callable) -> str:
+    """First paragraph of the function docstring, whitespace-collapsed.
+
+    Used as the default reasoner/skill description sent to the control plane —
+    a one-to-few-line summary reads well in discovery listings, while the rest
+    of the docstring (Args/Returns) stays local.
+    """
+    doc = inspect.getdoc(func) or ""
+    first_paragraph = doc.split("\n\n", 1)[0]
+    return " ".join(first_paragraph.split())
 
 
 # Import aiohttp for fire-and-forget HTTP calls
@@ -416,6 +482,116 @@ class _PauseManager:
             self._exec_to_request.clear()
 
 
+# Parameters the runtime injects by name into trigger/webhook-invoked reasoners.
+# They must never receive the event payload positionally — see
+# _bind_trigger_payload.
+_INJECTED_TRIGGER_PARAMS = frozenset({"trigger", "webhook", "execution_context"})
+
+
+def _bind_trigger_payload(
+    signature: inspect.Signature, payload: Any
+) -> tuple[tuple, dict]:
+    """Build (args, kwargs) for the event payload of a trigger-invoked reasoner.
+
+    For trigger/webhook invocations the event payload is the event object, and
+    the framework separately injects the ``trigger`` / ``webhook`` /
+    ``execution_context`` parameters by name (see _execute_reasoner_endpoint).
+    The payload therefore binds to the first parameter that is *not* one of
+    those injected slots.
+
+    When that parameter is an ordinary positional-or-keyword parameter we bind
+    it by **keyword**, so a leading injected parameter (e.g. ``def r(trigger,
+    event)``) can never shift the payload onto the wrong slot positionally. This
+    mirrors the test harness' ``_bind_reasoner_args`` so the runtime and
+    ``simulate_trigger`` invoke a reasoner identically.
+
+    A reasoner whose only parameter is an injected slot (e.g.
+    ``def r(trigger=None)``) has no home for the payload, so it is dropped and
+    the trigger context is delivered by keyword — instead of crashing with
+    "got multiple values for argument 'trigger'".
+    """
+    for name, param in signature.parameters.items():
+        if name in _INJECTED_TRIGGER_PARAMS:
+            continue
+        if param.kind in (
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.VAR_POSITIONAL,
+        ):
+            return (payload,), {}
+        if param.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD:
+            return (), {name: payload}
+        # KEYWORD_ONLY / VAR_KEYWORD have no positional home; the payload falls
+        # through to the parameter's default, matching _bind_reasoner_args.
+    return (), {}
+
+
+class _NotificationDispatcher:
+    _SHUTDOWN = object()
+
+    def __init__(self, dev_mode: bool):
+        self._queue: asyncio.Queue[Any] | None = None
+        self._dispatcher_task: asyncio.Task[Any] | None = None
+        self._dev_mode = dev_mode
+
+    def start(self):
+        if self._dispatcher_task is not None:
+            return
+        self._queue = asyncio.Queue()
+        self._dispatcher_task = asyncio.create_task(self._run())
+
+    def submit(self, coro_factory: Callable[[], Coroutine[Any, Any, None]]):
+        if self._queue is None:
+            # Lazily start on first submit so execution paths that never run
+            # the server lifespan (CLI `call` mode, direct ASGI mounts) still
+            # deliver notifications. submit() is always invoked from a
+            # coroutine, so the dispatcher task binds to the running loop
+            # (uvicorn's uvloop when serving).
+            try:
+                self.start()
+            except RuntimeError:
+                if self._dev_mode:
+                    log_error(
+                        "Notification dropped: no running event loop to start "
+                        "the notification dispatcher"
+                    )
+                return
+        self._queue.put_nowait(coro_factory)
+
+    async def _run(self):
+        if self._queue is None or self._dispatcher_task is None:
+            return
+        while True:
+            coro_factory = await self._queue.get()
+            if coro_factory is _NotificationDispatcher._SHUTDOWN:
+                self._queue.task_done()
+                break
+            try:
+                await coro_factory()
+            except Exception as e:
+                if self._dev_mode:
+                    log_error(f"Notification delivery failed: {e}")
+            finally:
+                self._queue.task_done()
+
+    async def shutdown(self, timeout: int = 5):
+        if self._dispatcher_task is None or self._queue is None:
+            return
+        self._queue.put_nowait(_NotificationDispatcher._SHUTDOWN)
+        try:
+            await asyncio.wait_for(self._dispatcher_task, timeout=timeout)
+        except asyncio.TimeoutError:
+            self._dispatcher_task.cancel()
+            try:
+                await self._dispatcher_task
+            except asyncio.CancelledError:
+                pass
+        except Exception as e:
+            if self._dev_mode:
+                log_error(f"Notification dispatcher shutdown failed: {e}")
+        finally:
+            self._dispatcher_task = None
+
+
 class Agent(FastAPI):
     """
     AgentField Agent - FastAPI subclass for creating AI agent nodes.
@@ -516,6 +692,7 @@ class Agent(FastAPI):
                                          and None defers entirely to platform defaults.
             api_key (str, optional): API key for authenticating with the AgentField control plane.
                                     When set, will be sent as X-API-Key header on all requests.
+                                    Defaults to the AGENTFIELD_API_KEY environment variable.
             **kwargs: Additional keyword arguments passed to FastAPI constructor.
 
         Example:
@@ -567,10 +744,21 @@ class Agent(FastAPI):
         self.agent_tags = tags or []
         self.author = author
 
+        # Per-process identifier sent in registration and heartbeats. The control
+        # plane uses a change in this value across re-registrations to detect a
+        # mid-flight redeploy and fail every in-flight execution that was
+        # awaiting a result inside the previous OS process. A fresh UUID per
+        # __init__ is exactly what we want — every Python process gets a unique
+        # one, and a re-import in the same process keeps the same one (since the
+        # same Agent instance is being used).
+        import uuid as _uuid
+        self.agent_instance_id = _uuid.uuid4().hex
+
         # Memory-efficient handler registries (replaces old list-based storage)
         # Using Dict[str, Entry] with __slots__ dataclasses for minimal footprint
         self._reasoner_registry: Dict[str, ReasonerEntry] = {}
         self._skill_registry: Dict[str, SkillEntry] = {}
+        self._session_registry: Dict[str, Dict[str, Any]] = {}
 
         # VC override tracking (still needed for _effective_component_vc_setting)
         self._reasoner_vc_overrides: Dict[str, bool] = {}
@@ -599,7 +787,11 @@ class Agent(FastAPI):
         # Initialize async configuration
         self.async_config = async_config or AsyncConfig.from_environment()
 
-        # Store API key for authentication
+        # Store API key for authentication. `af run` exports AGENTFIELD_API_KEY
+        # for agents it starts, so an agent registers against a control plane
+        # that has authentication enabled without needing the key in its code.
+        if api_key is None:
+            api_key = os.environ.get("AGENTFIELD_API_KEY") or None
         self.api_key = api_key
 
         # Initialize AgentFieldClient with async configuration and API key
@@ -615,6 +807,34 @@ class Agent(FastAPI):
 
         # prevent GC of fire-and-forget async execution tasks
         self._background_tasks: set[asyncio.Task] = set()
+
+        # Manage background notifications in order
+        self._notification_dispatcher = _NotificationDispatcher(dev_mode=self.dev_mode)
+
+        # Cooperative cancel registry. The control plane's cancel dispatcher
+        # POSTs /_internal/executions/{id}/cancel to signal that the user's
+        # reasoner code should stop. We track the active asyncio.Task per
+        # execution_id so the cancel handler can call task.cancel() — that
+        # raises CancelledError into the user's coroutine, which any
+        # well-behaved async I/O (httpx, anthropic, openai) honors.
+        self._cancel_tasks: Dict[str, asyncio.Task] = {}
+        self._cancel_lock = asyncio.Lock()
+
+        # Per-execution pause clock. Populated by _execute_async_with_callback
+        # before the reasoner task starts, consumed by Agent.pause() /
+        # Agent.wait_for_resume() to record paused intervals, and read by the
+        # watchdog to subtract paused time from elapsed wall-clock. Lifecycle
+        # is bounded by a single execution (single asyncio.Task), so no lock
+        # is required for the dict access.
+        from .agent_pause import PauseClock
+
+        self._pause_clocks: Dict[str, PauseClock] = {}
+
+        # Install the /_internal/executions/{execution_id}/cancel route
+        # before any user-defined reasoners are registered so the path is
+        # always available for the control-plane callback.
+        from .cancel import install_cancel_route
+        install_cancel_route(self)
 
         # Initialize async execution manager (will be lazily created when needed)
         self._async_execution_manager: Optional[AsyncExecutionManager] = None
@@ -721,6 +941,52 @@ class Agent(FastAPI):
         """Get the current execution's cost summary."""
         return self.cost_tracker.summary()
 
+    @staticmethod
+    def _usage_summary_or_none(tracker: Optional[CostTracker]) -> Optional[dict]:
+        """Return the transport ``usage`` object, or None when there's nothing.
+
+        Omitting the key entirely when there are no entries is part of the
+        usage contract, so callers should skip attaching ``usage`` on None.
+        """
+        if tracker is None or not tracker.has_entries:
+            return None
+        usage = tracker.serialize()
+        if not usage.get("entries"):
+            return None
+        return usage
+
+    def _wrap_sync_result_with_usage(
+        self, result: Any, tracker: Optional[CostTracker]
+    ) -> Any:
+        """Attach usage to the synchronous 200 body.
+
+        The control plane stores the whole sync body as the result and pulls
+        usage back out by stripping the reserved ``__agentfield_usage__`` key
+        (see the Go ``extractUsageFromResult``). The key is namespaced so a
+        user result that legitimately contains its own ``usage`` key is never
+        touched; ``__agentfield_``-prefixed keys are reserved for transport.
+        Usage is merged as a sibling key into the result *object* — NOT
+        wrapped in a ``{"result": ...}`` envelope, which would double-nest the
+        stored result.
+
+        Only dict results can carry usage this way; non-dict results (lists,
+        scalars) are returned unchanged and their usage flows via the async
+        status-callback path instead (the production path). No-usage results
+        are also returned unchanged (backward compatible). Response objects
+        (e.g. cancellation JSONResponse) pass through untouched.
+        """
+        usage = self._usage_summary_or_none(tracker)
+        if usage is None or isinstance(result, StarletteResponse):
+            return result
+        encoded = jsonable_encoder(result)
+        if isinstance(encoded, dict):
+            merged = dict(encoded)
+            merged[USAGE_ENVELOPE_KEY] = usage
+            return merged
+        # Non-dict result: cannot merge a top-level usage key without changing
+        # the result's type/shape. Leave it to the async callback path.
+        return result
+
     @property
     def harness_runner(self) -> "HarnessRunner":
         if self._harness_runner is None:
@@ -790,6 +1056,27 @@ class Agent(FastAPI):
             if entry.vc_enabled is not None
             else self._agent_vc_enabled,
         }
+        description = getattr(entry, "description", "")
+        if description:
+            metadata["description"] = description
+        triggers = getattr(entry, "triggers", None)
+        accepts_webhook = getattr(entry, "accepts_webhook", "warn")
+        if kind == "reasoner":
+            # Normalize the 3-state value to one of "true" / "false" / "warn"
+            # before serialization. The control plane's ReasonerDefinition
+            # types AcceptsWebhook as *string and rejects bool literals.
+            if accepts_webhook is True:
+                metadata["accepts_webhook"] = "true"
+            elif accepts_webhook is False:
+                metadata["accepts_webhook"] = "false"
+            elif isinstance(accepts_webhook, str) and accepts_webhook in ("true", "false", "warn"):
+                metadata["accepts_webhook"] = accepts_webhook
+            else:
+                metadata["accepts_webhook"] = "warn"
+        if kind == "reasoner" and triggers:
+            from .triggers import trigger_to_payload  # local import to avoid cycle
+
+            metadata["triggers"] = [trigger_to_payload(t) for t in triggers]
         return metadata
 
     def _types_to_json_schema(self, input_types: Dict[str, tuple]) -> Dict:
@@ -880,7 +1167,7 @@ class Agent(FastAPI):
             # Check if field is present
             if name not in data:
                 if default is ...:  # Required field (no default)
-                    raise ValueError(f"Missing required field: {name}")
+                    raise _HandlerInputError(f"Missing required field: {name}")
                 result[name] = default
                 continue
 
@@ -899,7 +1186,7 @@ class Agent(FastAPI):
                 if default is not ...:
                     result[name] = default
                     continue
-                raise ValueError(f"Field '{name}' cannot be None")
+                raise _HandlerInputError(f"Field '{name}' cannot be None")
 
             # Type coercion for basic types
             try:
@@ -931,14 +1218,14 @@ class Agent(FastAPI):
                     or getattr(actual_type, "__origin__", None) is dict
                 ):
                     if not isinstance(value, dict):
-                        raise ValueError(f"Field '{name}' must be a dict")
+                        raise _HandlerInputError(f"Field '{name}' must be a dict")
                     result[name] = dict(value)
                 elif (
                     actual_type is list
                     or getattr(actual_type, "__origin__", None) is list
                 ):
                     if not isinstance(value, list):
-                        raise ValueError(f"Field '{name}' must be a list")
+                        raise _HandlerInputError(f"Field '{name}' must be a list")
                     result[name] = list(value)
                 elif hasattr(actual_type, "model_validate"):
                     # Pydantic model - use its validation
@@ -946,8 +1233,14 @@ class Agent(FastAPI):
                 else:
                     # Pass through for complex/unknown types
                     result[name] = value
-            except (ValueError, TypeError) as e:
-                raise ValueError(f"Invalid value for field '{name}': {e}")
+            except _HandlerInputError:
+                raise
+            except (ValueError, TypeError):
+                # Underlying coercion failure (e.g. int("not a number")). The
+                # inner exception's text can carry Python-runtime detail, so
+                # we deliberately drop it from the message we surface to the
+                # client and just say which field failed.
+                raise _HandlerInputError(f"Invalid value for field '{name}'")
 
         return result
 
@@ -1065,6 +1358,7 @@ class Agent(FastAPI):
         if not run_id:
             run_id = f"wf_{int(time.time() * 1000)}"
         workflow_id = execution_context_data.get("workflow_id", run_id)
+        authority = execution_context_data.get("run_authority") or execution_context_data.get("runAuthority") or {}
 
         execution_context = ExecutionContext(
             run_id=run_id,
@@ -1083,6 +1377,9 @@ class Agent(FastAPI):
             workflow_id=workflow_id,
             parent_workflow_id=execution_context_data.get("parent_workflow_id"),
             root_workflow_id=execution_context_data.get("root_workflow_id"),
+            authority_home_id=authority.get("home_id") or authority.get("homeId"),
+            authority_run_id=authority.get("run_id") or authority.get("runId"),
+            authority_lease_owner=authority.get("lease_owner") or authority.get("leaseOwner"),
         )
 
         # Set execution context
@@ -1405,7 +1702,60 @@ class Agent(FastAPI):
             metadata["tags"] = self.agent_tags
         if self.author:
             metadata["author"] = self.author
+        if self._session_registry:
+            metadata["sessions"] = [
+                entry["definition"].to_dict()
+                for entry in self._session_registry.values()
+            ]
         return metadata if metadata else None
+
+    @property
+    def sessions(self) -> List[Dict[str, Any]]:
+        return [
+            entry["definition"].to_dict()
+            for entry in self._session_registry.values()
+        ]
+
+    def session(
+        self,
+        name: str,
+        *,
+        provider: str,
+        transport: str,
+        model: Optional[str] = None,
+        modalities: Optional[List[str]] = None,
+        voice: Optional[str] = None,
+        tools: Optional[List[str]] = None,
+        tags: Optional[List[str]] = None,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> Callable[[Callable[[RealtimeSession], Awaitable[Any]]], Callable[[RealtimeSession], Awaitable[Any]]]:
+        """Register a realtime/voice session endpoint.
+
+        Provider and transport are both explicit; AgentField does not infer or
+        switch them. Unsupported combinations fail at declaration time and again
+        at control-plane session start.
+        """
+
+        definition = build_session_definition(
+            name,
+            provider=provider,
+            transport=transport,
+            model=model,
+            modalities=modalities,
+            voice=voice,
+            tools=tools,
+            tags=tags,
+            metadata=metadata,
+        )
+
+        def decorator(
+            func: Callable[[RealtimeSession], Awaitable[Any]]
+        ) -> Callable[[RealtimeSession], Awaitable[Any]]:
+            self._session_registry[name] = {"definition": definition, "handler": func}
+            setattr(func, "_agentfield_session", definition)
+            return func
+
+        return decorator
 
     def _build_vc_metadata(self) -> Dict[str, Any]:
         """Produce a serializable VC policy snapshot for control-plane visibility."""
@@ -1612,14 +1962,45 @@ class Agent(FastAPI):
         """Delegate to server handler for route setup"""
         return self.server_handler.setup_agentfield_routes()
 
+    @overload
+    def reasoner(
+        self,
+        path: Callable[P, Awaitable[T]],
+        name: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        *,
+        description: Optional[str] = None,
+        vc_enabled: Optional[bool] = None,
+        require_realtime_validation: bool = False,
+        triggers: Optional[List[Any]] = None,
+        accepts_webhook: Optional[Any] = None,
+    ) -> Callable[P, Awaitable[T]]: ...
+
+    @overload
     def reasoner(
         self,
         path: Optional[str] = None,
         name: Optional[str] = None,
         tags: Optional[List[str]] = None,
         *,
+        description: Optional[str] = None,
         vc_enabled: Optional[bool] = None,
         require_realtime_validation: bool = False,
+        triggers: Optional[List[Any]] = None,
+        accepts_webhook: Optional[Any] = None,
+    ) -> Callable[[Callable[P, Awaitable[T]]], Callable[P, Awaitable[T]]]: ...
+
+    def reasoner(
+        self,
+        path: Any = None,
+        name: Optional[str] = None,
+        tags: Optional[List[str]] = None,
+        *,
+        description: Optional[str] = None,
+        vc_enabled: Optional[bool] = None,
+        require_realtime_validation: bool = False,
+        triggers: Optional[List[Any]] = None,
+        accepts_webhook: Optional[Any] = None,
     ):
         """
         Decorator to register a reasoner function.
@@ -1631,22 +2012,32 @@ class Agent(FastAPI):
             path (str, optional): The API endpoint path for this reasoner. Defaults to /reasoners/{function_name}.
             name (str, optional): Explicit AgentField registration ID. Defaults to the function name.
             tags (List[str] | None, optional): Organizational tags that travel with the reasoner metadata.
+                The "entrypoint" tag marks a reasoner as an intended external entry point; discovery
+                and `af ls` surface those first.
+            description (str, optional): Caller-facing summary registered with the control plane and
+                shown by discovery / `af ls` — say what the reasoner does and when to call it.
+                Defaults to the first paragraph of the function docstring.
             vc_enabled (bool | None, optional): Override VC generation for this reasoner. True forces VC creation,
                 False disables it, and None inherits the agent-level policy.
+            triggers (list, optional): EventTrigger / ScheduleTrigger declarations. Same shape as the
+                module-level @reasoner kwarg. Stamps each as a code-managed trigger at registration time.
+            accepts_webhook (bool | "warn" | None, optional): 3-state UI guardrail flag.
         """
 
-        direct_registration: Optional[Callable] = None
-        decorator_path = path
+        direct_registration, decorator_path = split_direct_registration_arg(path)
         decorator_name = name
         decorator_tags = tags
-
-        if decorator_path and (
-            inspect.isfunction(decorator_path) or inspect.ismethod(decorator_path)
-        ):
-            direct_registration = decorator_path
-            decorator_path = None
+        decorator_description = description
+        kwarg_triggers = list(triggers) if triggers else None
+        kwarg_accepts_webhook = accepts_webhook
 
         def decorator(func: Callable) -> Callable:
+            merged_triggers, resolved_accepts_webhook = resolve_reasoner_metadata(
+                func,
+                triggers=kwarg_triggers,
+                accepts_webhook=kwarg_accepts_webhook,
+            )
+
             # Extract function metadata
             func_name = func.__name__
             reasoner_id = decorator_name or func_name
@@ -1689,6 +2080,15 @@ class Agent(FastAPI):
             # Store input_fields for runtime validation (captured by closure)
             handler_input_fields = input_fields
 
+            # Capture the merged trigger bindings for the runtime invocation path.
+            # These are threaded through _execute_reasoner_endpoint (rather than
+            # stamped onto `func` via setattr) so an EventTrigger's declared
+            # transform is applied at dispatch time. Stamping the handler is
+            # unsafe: bound methods reject setattr, and the same function object
+            # registered on two agents would leak triggers across them (see
+            # resolve_reasoner_metadata, which reads _reasoner_triggers back).
+            handler_trigger_bindings = list(merged_triggers or [])
+
             # Create FastAPI endpoint with generic dict input (runtime validation)
             @self.post(endpoint_path)
             async def endpoint(request: Request):
@@ -1701,16 +2101,34 @@ class Agent(FastAPI):
                         content={"detail": "Invalid JSON body"},
                     )
 
-                # Validate input at runtime (replaces Pydantic validation)
-                try:
-                    validated_input = self._validate_handler_input(
-                        body, handler_input_fields
-                    )
-                except ValueError as e:
-                    return JSONResponse(
-                        status_code=422,
-                        content={"detail": str(e)},
-                    )
+                # Validate input at runtime (replaces Pydantic validation).
+                # When the body is the dispatcher's webhook envelope shape
+                # ({"event": ..., "_meta": ...}), skip field-level validation
+                # — the envelope is unwrapped further down and the reasoner's
+                # first positional gets the unwrapped (or transformed) value
+                # by way of _execute_reasoner_endpoint.
+                is_trigger_envelope = (
+                    isinstance(body, dict)
+                    and "event" in body
+                    and "_meta" in body
+                    and isinstance(body.get("_meta"), dict)
+                )
+                if is_trigger_envelope:
+                    validated_input = body
+                else:
+                    try:
+                        validated_input = self._validate_handler_input(
+                            body, handler_input_fields
+                        )
+                    except _HandlerInputError as e:
+                        # `safe_message` is a known-safe SDK-constructed
+                        # string. Reading the explicit attribute (rather
+                        # than `str(e)`) keeps the response out of CodeQL's
+                        # py/stack-trace-exposure taint flow.
+                        return JSONResponse(
+                            status_code=422,
+                            content={"detail": e.safe_message},
+                        )
 
                 async def run_reasoner() -> Any:
                     return await self._execute_reasoner_endpoint(
@@ -1719,6 +2137,7 @@ class Agent(FastAPI):
                         signature=sig,
                         input_data=validated_input,
                         request=request,
+                        trigger_bindings=handler_trigger_bindings,
                     )
 
                 execution_id_header = request.headers.get("X-Execution-ID")
@@ -1733,6 +2152,12 @@ class Agent(FastAPI):
                     # prevent GC of fire-and-forget tasks
                     self._background_tasks.add(task)
                     task.add_done_callback(self._background_tasks.discard)
+                    # Register so the cancel callback can short-circuit
+                    # the still-running reasoner. The async path's
+                    # execute_async_with_callback handles its own
+                    # cancellation accounting on top of this.
+                    from .cancel import register_execution_task
+                    await register_execution_task(self, execution_id_header, task)
                     return JSONResponse(
                         status_code=202,
                         content={
@@ -1741,7 +2166,48 @@ class Agent(FastAPI):
                         },
                     )
 
-                return await run_reasoner()
+                # Sync path: bind a fresh per-execution cost tracker so LLM /
+                # harness usage recorded during the reasoner is isolated to this
+                # request (concurrent requests each get their own tracker) and
+                # can be attached to the 200 body afterward.
+                sync_tracker = CostTracker()
+                usage_token = set_current_cost_tracker(sync_tracker)
+                try:
+                    # Wrap the coroutine in a Task so the cancel callback can
+                    # call task.cancel() and have CancelledError propagate into
+                    # the reasoner. Without this wrapping the await happens
+                    # inside the FastAPI request handler frame directly and
+                    # there's no Task handle to cancel.
+                    if execution_id_header:
+                        from .cancel import (
+                            register_execution_task,
+                            deregister_execution,
+                        )
+                        sync_task = asyncio.create_task(run_reasoner())
+                        await register_execution_task(
+                            self, execution_id_header, sync_task
+                        )
+                        try:
+                            result = await sync_task
+                            return self._wrap_sync_result_with_usage(
+                                result, sync_tracker
+                            )
+                        except asyncio.CancelledError:
+                            return JSONResponse(
+                                status_code=499,
+                                content={
+                                    "status": "cancelled",
+                                    "execution_id": execution_id_header,
+                                    "reason": "cancelled_by_control_plane",
+                                },
+                            )
+                        finally:
+                            await deregister_execution(self, execution_id_header)
+
+                    result = await run_reasoner()
+                    return self._wrap_sync_result_with_usage(result, sync_tracker)
+                finally:
+                    reset_current_cost_tracker(usage_token)
 
             # 🔥 ENHANCED: Comprehensive function replacement for unified tracking
             # Use weakref to avoid circular reference: Agent → tracked_func → Agent
@@ -1795,13 +2261,18 @@ class Agent(FastAPI):
             vc_setting = self._effective_component_vc_setting(
                 reasoner_id, self._reasoner_vc_overrides
             )
+            
             self._reasoner_registry[reasoner_id] = ReasonerEntry(
                 id=reasoner_id,
                 func=func,
                 input_types=input_fields,  # Store (type, default) tuples, not Pydantic model
                 output_type=return_type,
                 tags=resolved_tags,
+                description=(decorator_description or "").strip()
+                or _docstring_summary(func),
                 vc_enabled=vc_setting,
+                triggers=list(merged_triggers or []),
+                accepts_webhook=resolved_accepts_webhook,
             )
 
             # NOTE: Legacy storage removed - reasoners property generates list on-demand
@@ -1823,10 +2294,109 @@ class Agent(FastAPI):
 
         if direct_registration:
             return decorator(direct_registration)
-        if direct_registration:
-            return decorator(direct_registration)
 
         return decorator
+
+    def _detect_and_unwrap_trigger_envelope(self, payload_dict: Dict[str, Any]) -> tuple[Dict[str, Any], Optional[Any]]:
+        """
+        Detect dispatcher webhook envelope {event: ..., _meta: ...} and unwrap it.
+        Returns (unwrapped_input, trigger_context_or_none).
+        If not an envelope, returns (payload_dict, None) for backward compat.
+        """
+        # Check if this looks like a dispatcher envelope
+        if not isinstance(payload_dict, dict):
+            return payload_dict, None
+        
+        if "event" in payload_dict and "_meta" in payload_dict:
+            # This is a dispatcher envelope
+            event_data = payload_dict.get("event", {})
+            meta_data = payload_dict.get("_meta", {})
+            
+            # Parse metadata into TriggerContext
+            try:
+                from datetime import datetime
+                from .triggers import TriggerContext
+                
+                received_at_str = meta_data.get("received_at", "")
+                if received_at_str:
+                    received_at = datetime.fromisoformat(received_at_str.replace('Z', '+00:00'))
+                else:
+                    received_at = datetime.utcnow()
+                
+                trigger_ctx = TriggerContext(
+                    trigger_id=meta_data.get("trigger_id", ""),
+                    source=meta_data.get("source", ""),
+                    event_type=meta_data.get("event_type", ""),
+                    event_id=meta_data.get("event_id", ""),
+                    idempotency_key=meta_data.get("idempotency_key", ""),
+                    received_at=received_at,
+                    vc_id=meta_data.get("vc_id"),
+                )
+                return event_data, trigger_ctx
+            except Exception:
+                # If parsing fails, return raw envelope for compatibility
+                return payload_dict, None
+        
+        # Not an envelope
+        return payload_dict, None
+
+    def _apply_trigger_transform(self, trigger_ctx, bindings: list, input_data: dict) -> dict:
+        """
+        Match trigger context against reasoner bindings and apply transform if found.
+        Returns transformed input or original input if no match.
+        
+        Matching logic:
+        1. Find bindings where binding.source == trigger_ctx.source
+        2. Check event_type: binding.types empty OR trigger_ctx.event_type matches (exact or prefix)
+        3. If multiple match, prefer most specific (non-empty types)
+        4. Apply transform if binding has one
+        """
+        from .triggers import EventTrigger
+        
+        if not bindings or not trigger_ctx:
+            return input_data
+        
+        # Find best-matching binding
+        best_match = None
+        best_specificity = -1  # -1 = no match, 0 = broad (empty types), 1+ = specific
+        
+        for binding in bindings:
+            if not isinstance(binding, EventTrigger):
+                continue
+            
+            if binding.source != trigger_ctx.source:
+                continue
+            
+            # Check event_type match
+            if binding.types:
+                # binding has specific types — check for match
+                matched = False
+                for btype in binding.types:
+                    if trigger_ctx.event_type.startswith(btype):
+                        matched = True
+                        break
+                if not matched:
+                    continue
+                specificity = 1
+            else:
+                # binding accepts all types
+                specificity = 0
+            
+            # This binding matches; is it better than current best?
+            if specificity > best_specificity:
+                best_match = binding
+                best_specificity = specificity
+        
+        # Apply transform if found
+        if best_match and best_match.transform:
+            try:
+                return best_match.transform(input_data)
+            except Exception as e:
+                if self.dev_mode:
+                    log_warn(f"Transform failed for {trigger_ctx.source}/{trigger_ctx.event_type}: {e}; using raw input")
+                return input_data
+        
+        return input_data
 
     async def _execute_reasoner_endpoint(
         self,
@@ -1836,12 +2406,17 @@ class Agent(FastAPI):
         signature: inspect.Signature,
         input_data: Dict[str, Any],
         request: Request,
+        trigger_bindings: Optional[list] = None,
     ) -> Any:
         import asyncio
         import time
 
         execution_context = ExecutionContext.from_request(request, self.node_id)
         payload_dict = input_data  # Already a dict from runtime validation
+        # Unwrap dispatcher envelope if present (Phase 5 webhook DX)
+        payload_dict, trigger_context = self._detect_and_unwrap_trigger_envelope(payload_dict)
+        if trigger_context:
+            execution_context.trigger = trigger_context
 
         self._current_execution_context = execution_context
         context_token = set_execution_context(execution_context)
@@ -1849,12 +2424,15 @@ class Agent(FastAPI):
 
         if hasattr(self, "workflow_handler") and self.workflow_handler:
             execution_context.reasoner_name = reasoner_id
-            await self.workflow_handler.notify_call_start(
-                execution_context.execution_id,
-                execution_context,
-                reasoner_id,
-                payload_dict,
-                parent_execution_id=execution_context.parent_execution_id,
+
+            self._notification_dispatcher.submit(
+                lambda: self.workflow_handler.notify_call_start(
+                    execution_context.execution_id,
+                    execution_context,
+                    reasoner_id,
+                    payload_dict,
+                    parent_execution_id=execution_context.parent_execution_id,
+                )
             )
 
         start_time = time.time()
@@ -1870,35 +2448,68 @@ class Agent(FastAPI):
                 session_identifier,
                 "agent",
                 reasoner_id,
+                parent_vc_id=execution_context.parent_vc_id,
             )
             self._populate_execution_context_with_did(
                 execution_context, did_execution_context
             )
 
         try:
-            try:
-                if should_convert_args(func):
-                    converted_args, converted_kwargs = convert_function_args(
-                        func, (), payload_dict
-                    )
-                    args = converted_args
-                    kwargs = converted_kwargs
-                else:
+            # Phase 5: Apply trigger transform if applicable.
+            # Prefer the bindings the registration decorator threaded in
+            # (agent-local, no cross-agent leakage); fall back to the function
+            # attr for any legacy caller that doesn't pass them.
+            if trigger_bindings is None:
+                trigger_bindings = getattr(func, "_reasoner_triggers", [])
+            if execution_context.trigger and trigger_bindings:
+                payload_dict = self._apply_trigger_transform(
+                    execution_context.trigger,
+                    trigger_bindings,
+                    payload_dict
+                )
+
+            # When invoked via an inbound trigger, the (possibly transformed)
+            # payload IS the event object — it binds to the first parameter that
+            # the framework does not itself inject (trigger / webhook /
+            # execution_context). Binding through _bind_trigger_payload (rather
+            # than blindly passing it as the first positional) is what prevents
+            # `def r(trigger=None)` from receiving the payload positionally AND
+            # the trigger by keyword — the "got multiple values for argument
+            # 'trigger'" crash. Direct app.call() invocations keep the
+            # historical kwargs-from-dict shape.
+            if execution_context.trigger is not None:
+                args, kwargs = _bind_trigger_payload(signature, payload_dict)
+            else:
+                try:
+                    if should_convert_args(func):
+                        converted_args, converted_kwargs = convert_function_args(
+                            func, (), payload_dict
+                        )
+                        args = converted_args
+                        kwargs = converted_kwargs
+                    else:
+                        args, kwargs = (), payload_dict
+                except ValidationError as exc:
+                    # Convert Pydantic validation error to safe _HandlerInputError
+                    # to prevent potential stack trace exposure in 422 responses.
+                    raise _HandlerInputError(
+                        f"Pydantic validation failed for reasoner '{reasoner_id}'"
+                    ) from exc
+                except Exception as exc:  # pragma: no cover - best effort log
+                    if self.dev_mode:
+                        log_debug(
+                            f"⚠️ Warning: Failed to convert arguments for {reasoner_id}: {exc}"
+                        )
                     args, kwargs = (), payload_dict
-            except ValidationError as exc:
-                raise ValidationError(
-                    f"Pydantic validation failed for reasoner '{reasoner_id}': {exc}",
-                    model=getattr(exc, "model", None),
-                ) from exc
-            except Exception as exc:  # pragma: no cover - best effort log
-                if self.dev_mode:
-                    log_debug(
-                        f"⚠️ Warning: Failed to convert arguments for {reasoner_id}: {exc}"
-                    )
-                args, kwargs = (), payload_dict
 
             if "execution_context" in signature.parameters:
                 kwargs["execution_context"] = execution_context
+
+            # Phase 5: Inject trigger context (webhook metadata)
+            if "trigger" in signature.parameters:
+                kwargs["trigger"] = execution_context.trigger
+            if "webhook" in signature.parameters:
+                kwargs["webhook"] = execution_context.trigger
 
             if asyncio.iscoroutinefunction(func):
                 result = await func(*args, **kwargs)
@@ -1929,29 +2540,36 @@ class Agent(FastAPI):
 
             if hasattr(self, "workflow_handler") and self.workflow_handler:
                 end_time = time.time()
-                await self.workflow_handler.notify_call_complete(
-                    execution_context.execution_id,
-                    execution_context.workflow_id,
-                    result,
-                    int((end_time - start_time) * 1000),
-                    execution_context,
-                    input_data=payload_dict,
-                    parent_execution_id=execution_context.parent_execution_id,
+
+                self._notification_dispatcher.submit(
+                    lambda: self.workflow_handler.notify_call_complete(
+                        execution_context.execution_id,
+                        execution_context.workflow_id,
+                        result,
+                        int((end_time - start_time) * 1000),
+                        execution_context,
+                        input_data=payload_dict,
+                        parent_execution_id=execution_context.parent_execution_id,
+                    )
                 )
 
             return result
         except asyncio.CancelledError as cancel_err:
             if hasattr(self, "workflow_handler") and self.workflow_handler:
                 end_time = time.time()
-                await self.workflow_handler.notify_call_error(
-                    execution_context.execution_id,
-                    execution_context.workflow_id,
-                    "Execution cancelled by upstream client",
-                    int((end_time - start_time) * 1000),
-                    execution_context,
-                    input_data=payload_dict,
-                    parent_execution_id=execution_context.parent_execution_id,
+
+                self._notification_dispatcher.submit(
+                    lambda: self.workflow_handler.notify_call_error(
+                        execution_context.execution_id,
+                        execution_context.workflow_id,
+                        "Execution cancelled by upstream client",
+                        int((end_time - start_time) * 1000),
+                        execution_context,
+                        input_data=payload_dict,
+                        parent_execution_id=execution_context.parent_execution_id,
+                    )
                 )
+
             raise cancel_err
         except ExecuteError as exec_err:
             # Propagate upstream HTTP status codes from cross-agent calls.
@@ -1959,15 +2577,20 @@ class Agent(FastAPI):
             # (unhandled exception) and then 502 at the outer control plane.
             if hasattr(self, "workflow_handler") and self.workflow_handler:
                 end_time = time.time()
-                await self.workflow_handler.notify_call_error(
-                    execution_context.execution_id,
-                    execution_context.workflow_id,
-                    str(exec_err),
-                    int((end_time - start_time) * 1000),
-                    execution_context,
-                    input_data=payload_dict,
-                    parent_execution_id=execution_context.parent_execution_id,
+                error_msg = str(exec_err)
+
+                self._notification_dispatcher.submit(
+                    lambda: self.workflow_handler.notify_call_error(
+                        execution_context.execution_id,
+                        execution_context.workflow_id,
+                        error_msg,
+                        int((end_time - start_time) * 1000),
+                        execution_context,
+                        input_data=payload_dict,
+                        parent_execution_id=execution_context.parent_execution_id,
+                    )
                 )
+
             detail = {"error": str(exec_err)}
             if exec_err.error_details:
                 detail["error_details"] = exec_err.error_details
@@ -1979,28 +2602,37 @@ class Agent(FastAPI):
             if hasattr(self, "workflow_handler") and self.workflow_handler:
                 end_time = time.time()
                 detail = getattr(http_exc, "detail", None) or str(http_exc)
-                await self.workflow_handler.notify_call_error(
-                    execution_context.execution_id,
-                    execution_context.workflow_id,
-                    detail,
-                    int((end_time - start_time) * 1000),
-                    execution_context,
-                    input_data=payload_dict,
-                    parent_execution_id=execution_context.parent_execution_id,
+
+                self._notification_dispatcher.submit(
+                    lambda: self.workflow_handler.notify_call_error(
+                        execution_context.execution_id,
+                        execution_context.workflow_id,
+                        detail,
+                        int((end_time - start_time) * 1000),
+                        execution_context,
+                        input_data=payload_dict,
+                        parent_execution_id=execution_context.parent_execution_id,
+                    )
                 )
+
             raise
         except Exception as exc:
             if hasattr(self, "workflow_handler") and self.workflow_handler:
                 end_time = time.time()
-                await self.workflow_handler.notify_call_error(
-                    execution_context.execution_id,
-                    execution_context.workflow_id,
-                    str(exc),
-                    int((end_time - start_time) * 1000),
-                    execution_context,
-                    input_data=payload_dict,
-                    parent_execution_id=execution_context.parent_execution_id,
+                error_msg = str(exc)
+
+                self._notification_dispatcher.submit(
+                    lambda: self.workflow_handler.notify_call_error(
+                        execution_context.execution_id,
+                        execution_context.workflow_id,
+                        error_msg,
+                        int((end_time - start_time) * 1000),
+                        execution_context,
+                        input_data=payload_dict,
+                        parent_execution_id=execution_context.parent_execution_id,
+                    )
                 )
+
             raise
         finally:
             reset_execution_context(context_token)
@@ -2021,16 +2653,74 @@ class Agent(FastAPI):
             log_warn("Unable to construct callback URL for execution updates")
             return
 
-        # Wall-clock timeout to guarantee the callback always fires.
+        # Wall-clock budget to guarantee the callback always fires.
         # Without this, a hung reasoner blocks the execution forever and the
-        # control plane never sees a terminal status.
+        # control plane never sees a terminal status. The budget applies to
+        # *active* time only — intervals spent inside ``Agent.pause()`` or
+        # ``Agent.wait_for_resume()`` are subtracted by the watchdog so the
+        # ``expires_in_hours`` argument to ``pause()`` actually means what it
+        # says rather than being silently capped at this timeout.
         reasoner_timeout = getattr(
             self.async_config, "default_execution_timeout", 7200.0
         )
 
+        from .agent_pause import PauseClock
+
+        pause_clock = PauseClock()
+        self._pause_clocks[execution_id] = pause_clock
+        log_info(
+            f"pause_cascade: registered pause_clock id={id(pause_clock)} "
+            f"for execution_id={execution_id} reasoner={reasoner_name}"
+        )
+
         start_time = time.time()
+        # Bind a fresh per-execution cost tracker BEFORE spawning the reasoner
+        # task so the task's copied context inherits it. LLM / harness calls in
+        # the reasoner record into this tracker; we read it back to attach usage
+        # to the status callback. Concurrent executions each run in their own
+        # task context, so trackers never cross-contaminate.
+        usage_tracker = CostTracker()
+        usage_token = set_current_cost_tracker(usage_tracker)
         try:
-            result = await asyncio.wait_for(reasoner_coro(), timeout=reasoner_timeout)
+            reasoner_task = asyncio.create_task(reasoner_coro())
+        finally:
+            reset_current_cost_tracker(usage_token)
+
+        async def _watchdog() -> None:
+            # Poll active-elapsed time and cancel the reasoner if the active
+            # budget is exceeded. ``check_interval`` is a small fraction of
+            # the timeout so we don't oversleep our own deadline by much.
+            check_interval = min(5.0, max(0.1, reasoner_timeout / 4.0))
+            while not reasoner_task.done():
+                try:
+                    await asyncio.sleep(check_interval)
+                except asyncio.CancelledError:
+                    return
+                active_elapsed = (time.time() - start_time) - pause_clock.total_paused()
+                if active_elapsed > reasoner_timeout:
+                    # Capture pause_clock state at the moment of timeout so
+                    # we can tell "watchdog fired with non-zero pause time
+                    # (legitimate long-running work)" apart from "watchdog
+                    # fired with zero pause time (cascade never ran even
+                    # though a descendant was clearly paused)" — the latter
+                    # is the production bug we're hunting.
+                    log_error(
+                        f"pause_cascade: WATCHDOG_FIRING execution_id={execution_id} "
+                        f"reasoner={reasoner_name} "
+                        f"wall_elapsed={time.time() - start_time:.1f}s "
+                        f"total_paused={pause_clock.total_paused():.1f}s "
+                        f"active_elapsed={active_elapsed:.1f}s "
+                        f"budget={reasoner_timeout:.1f}s "
+                        f"pause_clock_id={id(pause_clock)}"
+                    )
+                    pause_clock.timed_out = True
+                    reasoner_task.cancel()
+                    return
+
+        watchdog_task = asyncio.create_task(_watchdog())
+
+        try:
+            result = await reasoner_task
             payload = {
                 "status": "succeeded",
                 "result": jsonable_encoder(result),
@@ -2039,20 +2729,42 @@ class Agent(FastAPI):
                 "execution_id": execution_id,
                 "reasoner": reasoner_name,
             }
+            usage_summary = self._usage_summary_or_none(usage_tracker)
+            if usage_summary is not None:
+                payload["usage"] = usage_summary
             log_info(f"Execution {execution_id} completed asynchronously")
-        except asyncio.TimeoutError:
-            payload = {
-                "status": "failed",
-                "error": (
-                    f"Reasoner '{reasoner_name}' timed out after {reasoner_timeout}s"
-                ),
-                "error_details": {"reason": "reasoner_timeout"},
-                "duration_ms": int((time.time() - start_time) * 1000),
-                "completed_at": datetime.now(timezone.utc).isoformat(),
-                "execution_id": execution_id,
-                "reasoner": reasoner_name,
-            }
-            log_error(f"Execution {execution_id} timed out after {reasoner_timeout}s")
+        except asyncio.CancelledError:
+            if pause_clock.timed_out:
+                payload = {
+                    "status": "failed",
+                    "error": (
+                        f"Reasoner '{reasoner_name}' timed out after "
+                        f"{reasoner_timeout}s of active time"
+                    ),
+                    "error_details": {"reason": "reasoner_timeout"},
+                    "duration_ms": int((time.time() - start_time) * 1000),
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "execution_id": execution_id,
+                    "reasoner": reasoner_name,
+                }
+                log_error(
+                    f"Execution {execution_id} timed out after "
+                    f"{reasoner_timeout}s of active time"
+                )
+            else:
+                # External cooperative cancel arrived (cancel dispatcher or
+                # outer task cancellation). Report cancelled status so the
+                # control plane sees a clean terminal transition.
+                payload = {
+                    "status": "cancelled",
+                    "error": "cancelled_by_control_plane",
+                    "error_details": {"reason": "cancelled"},
+                    "duration_ms": int((time.time() - start_time) * 1000),
+                    "completed_at": datetime.now(timezone.utc).isoformat(),
+                    "execution_id": execution_id,
+                    "reasoner": reasoner_name,
+                }
+                log_info(f"Execution {execution_id} cancelled cooperatively")
         except Exception as exc:
             error_details = getattr(exc, "error_details", None)
             payload = {
@@ -2064,7 +2776,40 @@ class Agent(FastAPI):
                 "execution_id": execution_id,
                 "reasoner": reasoner_name,
             }
+            # A reasoner that ran, determined its own work failed, and wants its
+            # structured outcome preserved raises ReasonerFailed(result=...).
+            # Carry that result onto the failed-status payload so the control
+            # plane records status=failed WITHOUT discarding the rich result
+            # (it stores the result payload regardless of terminal status).
+            from .exceptions import ReasonerFailed
+            if isinstance(exc, ReasonerFailed) and exc.result is not None:
+                payload["result"] = jsonable_encoder(exc.result)
             log_error(f"Execution {execution_id} failed asynchronously: {exc}")
+        finally:
+            # If we landed here without the reasoner finishing (e.g. our own
+            # task was cancelled mid-await), make sure the user code stops
+            # too so it doesn't keep running detached.
+            if not reasoner_task.done():
+                reasoner_task.cancel()
+                try:
+                    await reasoner_task
+                except BaseException:
+                    pass
+            watchdog_task.cancel()
+            try:
+                await watchdog_task
+            except BaseException:
+                pass
+            self._pause_clocks.pop(execution_id, None)
+            # Deregister the cancel hook regardless of outcome.
+            from .cancel import deregister_execution
+            await deregister_execution(self, execution_id)
+        # Attach usage on non-success terminal states too — a reasoner that
+        # failed or was cancelled may still have consumed tokens before ending.
+        if "usage" not in payload:
+            usage_summary = self._usage_summary_or_none(usage_tracker)
+            if usage_summary is not None:
+                payload["usage"] = usage_summary
         await self._post_execution_status(callback_url, payload, execution_id)
 
     async def _post_execution_status(
@@ -2113,7 +2858,7 @@ class Agent(FastAPI):
             + f"/api/v1/executions/{execution_id}/status"
         )
 
-    def on_change(self, pattern: Union[str, List[str]]):
+    def on_change(self, pattern: Union[str, List[str]]) -> Callable[[Callable[P, Awaitable[T]]], Callable[P, Awaitable[T]]]:
         """
         Decorator to mark a function as a memory event listener.
 
@@ -2180,12 +2925,37 @@ class Agent(FastAPI):
 
         return decorator
 
+    @overload
+    def skill(
+        self,
+        tags: Callable[P, T],
+        path: Optional[str] = None,
+        name: Optional[str] = None,
+        *,
+        description: Optional[str] = None,
+        vc_enabled: Optional[bool] = None,
+        require_realtime_validation: bool = False,
+    ) -> Callable[P, T]: ...
+
+    @overload
     def skill(
         self,
         tags: Optional[List[str]] = None,
         path: Optional[str] = None,
         name: Optional[str] = None,
         *,
+        description: Optional[str] = None,
+        vc_enabled: Optional[bool] = None,
+        require_realtime_validation: bool = False,
+    ) -> Callable[[Callable[P, T]], Callable[P, T]]: ...
+
+    def skill(
+        self,
+        tags: Any = None,
+        path: Optional[str] = None,
+        name: Optional[str] = None,
+        *,
+        description: Optional[str] = None,
         vc_enabled: Optional[bool] = None,
         require_realtime_validation: bool = False,
     ):
@@ -2209,6 +2979,8 @@ class Agent(FastAPI):
             path (str, optional): Custom API endpoint path for this skill.
                                 Defaults to "/skills/{function_name}".
             name (str, optional): Explicit AgentField registration ID. Defaults to the function name.
+            description (str, optional): Caller-facing summary registered with the control plane and
+                shown by discovery. Defaults to the first paragraph of the function docstring.
             vc_enabled (bool | None, optional): Override VC generation for this skill. True forces VC creation,
                 False disables it, and None inherits the agent-level policy.
 
@@ -2285,16 +3057,10 @@ class Agent(FastAPI):
             - Use skills for reliable, repeatable operations
         """
 
-        direct_registration: Optional[Callable] = None
-        decorator_tags = tags
+        direct_registration, decorator_tags = split_direct_registration_arg(tags)
         decorator_path = path
         decorator_name = name
-
-        if decorator_tags and (
-            inspect.isfunction(decorator_tags) or inspect.ismethod(decorator_tags)
-        ):
-            direct_registration = decorator_tags
-            decorator_tags = None
+        decorator_description = description
 
         def decorator(func: Callable) -> Callable:
             # Extract function metadata
@@ -2340,16 +3106,34 @@ class Agent(FastAPI):
                         content={"detail": "Invalid JSON body"},
                     )
 
-                # Validate input at runtime (replaces Pydantic validation)
-                try:
-                    validated_input = self._validate_handler_input(
-                        body, handler_input_fields
-                    )
-                except ValueError as e:
-                    return JSONResponse(
-                        status_code=422,
-                        content={"detail": str(e)},
-                    )
+                # Validate input at runtime (replaces Pydantic validation).
+                # When the body is the dispatcher's webhook envelope shape
+                # ({"event": ..., "_meta": ...}), skip field-level validation
+                # — the envelope is unwrapped further down and the reasoner's
+                # first positional gets the unwrapped (or transformed) value
+                # by way of _execute_reasoner_endpoint.
+                is_trigger_envelope = (
+                    isinstance(body, dict)
+                    and "event" in body
+                    and "_meta" in body
+                    and isinstance(body.get("_meta"), dict)
+                )
+                if is_trigger_envelope:
+                    validated_input = body
+                else:
+                    try:
+                        validated_input = self._validate_handler_input(
+                            body, handler_input_fields
+                        )
+                    except _HandlerInputError as e:
+                        # `safe_message` is a known-safe SDK-constructed
+                        # string. Reading the explicit attribute (rather
+                        # than `str(e)`) keeps the response out of CodeQL's
+                        # py/stack-trace-exposure taint flow.
+                        return JSONResponse(
+                            status_code=422,
+                            content={"detail": e.safe_message},
+                        )
 
                 # Extract execution context from request headers
                 execution_context = ExecutionContext.from_request(request, self.node_id)
@@ -2372,6 +3156,7 @@ class Agent(FastAPI):
                         session_identifier,
                         "agent",  # caller function
                         skill_id,  # target function
+                        parent_vc_id=execution_context.parent_vc_id,
                     )
                     # Populate execution context with DID information
                     self._populate_execution_context_with_did(
@@ -2393,10 +3178,10 @@ class Agent(FastAPI):
                     else:
                         kwargs = dict(input_payload)
                 except ValidationError as e:
-                    # Re-raise validation errors with context
-                    raise ValidationError(
-                        f"Pydantic validation failed for skill '{skill_id}': {e}",
-                        model=getattr(e, "model", None),
+                    # Convert Pydantic validation error to safe _HandlerInputError
+                    # to prevent potential stack trace exposure in 422 responses.
+                    raise _HandlerInputError(
+                        f"Pydantic validation failed for skill '{skill_id}'"
                     ) from e
                 except Exception as e:
                     # Log conversion errors but continue with original args for backward compatibility
@@ -2535,6 +3320,8 @@ class Agent(FastAPI):
                 input_types=input_fields,  # Store (type, default) tuples, not Pydantic model
                 output_type=return_type,
                 tags=resolved_tags,
+                description=(decorator_description or "").strip()
+                or _docstring_summary(func),
                 vc_enabled=vc_setting,
             )
             # NOTE: Legacy self.skills.append() removed - skills property generates list on-demand
@@ -2554,39 +3341,50 @@ class Agent(FastAPI):
                 self._current_execution_context = child_context
                 input_payload = _build_invocation_payload(args, kwargs)
 
-                await self.workflow_handler.notify_call_start(
-                    child_context.execution_id,
-                    child_context,
-                    skill_id,
-                    input_payload,
-                    parent_execution_id=current_context.execution_id,
+                self._notification_dispatcher.submit(
+                    lambda: self.workflow_handler.notify_call_start(
+                        child_context.execution_id,
+                        child_context,
+                        skill_id,
+                        input_payload,
+                        parent_execution_id=current_context.execution_id,
+                    )
                 )
 
                 start_time = time.time()
                 try:
                     result = await original_func(*args, **kwargs)
                     duration_ms = int((time.time() - start_time) * 1000)
-                    await self.workflow_handler.notify_call_complete(
-                        child_context.execution_id,
-                        child_context.workflow_id,
-                        result,
-                        duration_ms,
-                        child_context,
-                        input_data=input_payload,
-                        parent_execution_id=current_context.execution_id,
+
+                    self._notification_dispatcher.submit(
+                        lambda: self.workflow_handler.notify_call_complete(
+                            child_context.execution_id,
+                            child_context.workflow_id,
+                            result,
+                            duration_ms,
+                            child_context,
+                            input_data=input_payload,
+                            parent_execution_id=current_context.execution_id,
+                        )
                     )
+
                     return result
                 except Exception as exc:
                     duration_ms = int((time.time() - start_time) * 1000)
-                    await self.workflow_handler.notify_call_error(
-                        child_context.execution_id,
-                        child_context.workflow_id,
-                        str(exc),
-                        duration_ms,
-                        child_context,
-                        input_data=input_payload,
-                        parent_execution_id=current_context.execution_id,
+                    error_msg = str(exc)
+
+                    self._notification_dispatcher.submit(
+                        lambda: self.workflow_handler.notify_call_error(
+                            child_context.execution_id,
+                            child_context.workflow_id,
+                            error_msg,
+                            duration_ms,
+                            child_context,
+                            input_data=input_payload,
+                            parent_execution_id=current_context.execution_id,
+                        )
                     )
+
                     raise
                 finally:
                     reset_execution_context(token)
@@ -2926,6 +3724,8 @@ class Agent(FastAPI):
         system_prompt: Optional[str] = None,
         env: Optional[Dict[str, str]] = None,
         cwd: Optional[str] = None,
+        project_dir: Optional[str] = None,
+        schema_mode: Optional[str] = None,
         **kwargs,
     ) -> "HarnessResult":
         """
@@ -2945,13 +3745,27 @@ class Agent(FastAPI):
             permission_mode: Permission mode ("plan", "auto", None).
             system_prompt: System prompt for the agent.
             env: Environment variables for the agent.
-            cwd: Working directory for the agent.
+            cwd: Working directory for the agent process. When ``project_dir`` is
+                not set, this is also the agent's root and where the schema output
+                file is placed.
+            project_dir: Root directory the agent may read and write (maps to the
+                provider's project-root flag, e.g. opencode ``--dir``, codex
+                ``-C``, or the process cwd for gemini/claude). Set this when the
+                agent must read files across a shared repo while ``cwd`` points at
+                a nested task directory. The schema output file is then placed in
+                an isolated temp dir *under* ``project_dir`` so the provider never
+                rejects it as an external-directory write.
+            schema_mode: How schema output is produced. "single" (default) asks
+                for one Write of the whole object. "incremental" builds it one
+                top-level field at a time and recovers by patching only the
+                failing fields — more robust for large or deeply nested schemas.
+                "auto" uses incremental only when the schema is large.
             **kwargs: Additional provider-specific options.
 
         Returns:
             HarnessResult with .result (text), .parsed (validated schema), .text property.
         """
-        return await self.harness_runner.run(
+        result = await self.harness_runner.run(
             prompt,
             schema=schema,
             provider=provider,
@@ -2963,8 +3777,101 @@ class Agent(FastAPI):
             system_prompt=system_prompt,
             env=env,
             cwd=cwd,
+            project_dir=project_dir,
+            schema_mode=schema_mode,
             **kwargs,
         )
+        # Record harness usage into the current execution's cost tracker so the
+        # per-reasoner usage rollup includes coding-agent runs alongside plain
+        # LLM calls. The runner call above executes within the reasoner's async
+        # context, so the tracker bound by the endpoint is still current here.
+        self._record_harness_usage(result, provider=provider, model=model)
+        return result
+
+    def _record_harness_usage(
+        self,
+        result: "HarnessResult",
+        *,
+        provider: Optional[str] = None,
+        model: Optional[str] = None,
+    ) -> None:
+        """Record a harness run's token/cost usage into the current tracker.
+
+        No-op when the harness reported neither tokens nor cost (the common
+        case for providers that don't expose usage) so we don't emit empty
+        entries. Cost is threaded even when tokens are unknown, and vice versa.
+        """
+        try:
+            from agentfield.cost_tracker import (
+                derive_provider,
+                get_current_cost_tracker,
+            )
+
+            input_tokens = getattr(result, "input_tokens", 0) or 0
+            output_tokens = getattr(result, "output_tokens", 0) or 0
+            cache_read = getattr(result, "cache_read_tokens", 0) or 0
+            cache_creation = getattr(result, "cache_creation_tokens", 0) or 0
+            cost = getattr(result, "cost_usd", None)
+
+            if not any(
+                (input_tokens, output_tokens, cache_read, cache_creation)
+            ) and cost is None:
+                return
+
+            tracker = get_current_cost_tracker()
+            if tracker is None:
+                tracker = getattr(self, "cost_tracker", None)
+            if tracker is None:
+                return
+
+            resolved_provider = (
+                str(provider) if provider else self._harness_provider_name()
+            )
+            harness_name = (
+                resolved_provider.replace("-", "_") if resolved_provider else None
+            )
+            model_name = (
+                getattr(result, "model", None)
+                or model
+                or self._harness_model_name()
+                or (resolved_provider or "harness")
+            )
+            total = getattr(result, "total_tokens", 0) or (
+                input_tokens + output_tokens
+            )
+            ctx = self._get_current_execution_context()
+            tracker.record(
+                model=str(model_name),
+                prompt_tokens=input_tokens,
+                completion_tokens=output_tokens,
+                total_tokens=total,
+                cost_usd=cost,
+                reasoner_name=getattr(ctx, "reasoner_name", None) if ctx else None,
+                source="harness",
+                provider=derive_provider(str(model_name)),
+                harness=harness_name,
+                cache_read_tokens=cache_read,
+                cache_creation_tokens=cache_creation,
+                cost_source="provider" if cost is not None else None,
+            )
+        except Exception as exc:  # pragma: no cover - best effort, never fatal
+            log_debug(f"Failed to record harness usage: {exc}")
+
+    def _harness_provider_name(self) -> Optional[str]:
+        cfg = getattr(self, "harness_config", None)
+        return getattr(cfg, "provider", None) if cfg else None
+
+    def _harness_model_name(self) -> Optional[str]:
+        cfg = getattr(self, "harness_config", None)
+        return getattr(cfg, "model", None) if cfg else None
+
+    async def harness_doctor(
+        self, providers: Optional[List[str]] = None
+    ) -> List["ProviderHealth"]:
+        """Check harness provider dependencies without starting an agent run."""
+        from agentfield.harness import harness_doctor
+
+        return await harness_doctor(providers=providers)
 
     def _ensure_call_semaphore(self) -> asyncio.Semaphore:
         semaphore = getattr(self, "_call_semaphore", None)
@@ -3171,7 +4078,7 @@ class Agent(FastAPI):
 
         Supported Providers:
         - LiteLLM: DALL-E models like "dall-e-3", "dall-e-2"
-        - OpenRouter: Models like "openrouter/google/gemini-2.5-flash-image-preview"
+        - OpenRouter: Models like "openrouter/google/gemini-3.1-flash-image-preview"
 
         Args:
             prompt (str): Text description of the image to generate.
@@ -3195,7 +4102,7 @@ class Agent(FastAPI):
             # OpenRouter with Gemini
             result = await app.ai_generate_image(
                 "A futuristic cityscape",
-                model="openrouter/google/gemini-2.5-flash-image-preview"
+                model="openrouter/google/gemini-3.1-flash-image-preview"
             )
             ```
         """
@@ -3368,7 +4275,12 @@ class Agent(FastAPI):
                 if node_id == self.node_id and hasattr(self, function_name):
                     try:
                         func = getattr(self, function_name)
-                        sig = inspect.signature(func)
+                        # Unwrap tracked wrappers (e.g. _run_async_skill,
+                        # tracked_func) to recover the original function's
+                        # typed signature instead of the generic (*args, **kwargs)
+                        # that the wrapper carries.
+                        raw_func = getattr(func, "_original_func", func)
+                        sig = inspect.signature(raw_func)
                         param_names = [
                             name
                             for name, param in sig.parameters.items()
@@ -3401,8 +4313,32 @@ class Agent(FastAPI):
                 for i, arg in enumerate(args):
                     final_kwargs[f"arg_{i}"] = arg
 
-        # Get current execution context
-        current_context = self._get_current_execution_context()
+        # Resolve the parent execution for this call from the TASK-LOCAL
+        # context ONLY — not via _get_current_execution_context(), which falls
+        # back to the process-global self._current_execution_context.
+        #
+        # That shared attribute holds whichever reasoner was most recently
+        # dispatched in this process. When a call originates OUTSIDE any
+        # execution — e.g. a webhook handler's fire-and-forget asyncio task,
+        # which has no task-local context of its own — the fallback would
+        # attribute this independent call to whatever unrelated reasoner
+        # happens to be in flight (possibly paused on a human-in-the-loop
+        # approval for hours). That chains unrelated runs into one bogus
+        # workflow DAG and cross-wires the pause-clock / budget cascades that
+        # key off parent_execution_id.
+        #
+        # The contextvar is the only concurrency-safe source: asyncio.create_task
+        # copies it, so genuine sub-calls made from within a reasoner still
+        # nest correctly. When it is absent we mint a fresh root so the call
+        # starts its own workflow (matching cold-process behavior).
+        from agentfield.execution_context import get_current_context
+
+        current_context = get_current_context()
+        if current_context is None:
+            current_context = ExecutionContext.create_new(
+                agent_node_id=self.node_id,
+                workflow_name=f"{self.node_id}_workflow",
+            )
 
         # 🔧 DEBUG: Validate context before creating child
         if self.dev_mode:
@@ -3424,6 +4360,8 @@ class Agent(FastAPI):
         # Ensure the current execution is the parent for sub-calls (not the inherited parent)
         # This fixes workflow graph attribution for local skill calls
         headers["X-Parent-Execution-ID"] = current_context.execution_id
+        if current_context.parent_vc_id:
+            headers["X-Parent-VC-ID"] = current_context.parent_vc_id
 
         # DISABLED: Same-agent call detection - Force all calls through AgentField server
         # This ensures all app.call() requests go through the AgentField server for proper
@@ -3440,6 +4378,7 @@ class Agent(FastAPI):
                 f"AgentField server unavailable - cannot make cross-agent call to {target}"
             )
             from agentfield.exceptions import AgentFieldClientError
+
             raise AgentFieldClientError(
                 f"Cross-agent call to {target} failed: AgentField server unavailable. Agent is running in local mode."
             )
@@ -3505,9 +4444,101 @@ class Agent(FastAPI):
                             timeout=execution_timeout,
                         )
 
+                        # Cross-reasoner pause propagation: when this call is
+                        # made from inside a reasoner that has a tracked
+                        # pause-clock, hand it to ``wait_for_execution_result``
+                        # so the wait loop can pause the clock while the awaited
+                        # child sits in ``WAITING`` (e.g. on a hax-sdk human
+                        # approval). Without this, the parent's active-time
+                        # budget would burn through the child's wait and
+                        # spuriously trip the watchdog at the wallclock budget.
+                        parent_execution_id = (
+                            current_context.execution_id if current_context else None
+                        )
+                        # ``_pause_clocks`` is set in __init__; getattr keeps
+                        # bypass-init test fixtures from AttributeErroring here.
+                        _all_pause_clocks = getattr(self, "_pause_clocks", None) or {}
+                        parent_pause_clock = (
+                            _all_pause_clocks.get(parent_execution_id)
+                            if parent_execution_id
+                            else None
+                        )
+                        # INFO-level so this fires in production (dev_mode-gated
+                        # logs were silent during the run that motivated this
+                        # diagnostic). The three values together pinpoint the
+                        # cascade-disabled case: a missing parent_execution_id
+                        # (no current_context) vs. a missing _pause_clocks entry
+                        # (reasoner not invoked via _execute_async_with_callback)
+                        # are different failure modes that need different fixes.
+                        log_info(
+                            f"pause_cascade: target={target} "
+                            f"parent_execution_id={parent_execution_id} "
+                            f"parent_pause_clock_id="
+                            f"{id(parent_pause_clock) if parent_pause_clock else 'None'} "
+                            f"pause_clocks_keys="
+                            f"{list(_all_pause_clocks.keys())[:5]}"
+                            f"{'...' if len(_all_pause_clocks) > 5 else ''}"
+                        )
+
+                        # Only pass the pause_clock kwarg when we actually have
+                        # one — keeps the call shape backward-compatible with
+                        # mocks / older clients that don't yet accept the kwarg.
+                        _wait_kwargs: Dict[str, Any] = {
+                            "execution_id": execution_id,
+                            "timeout": execution_timeout,
+                        }
+                        if parent_pause_clock is not None:
+                            _wait_kwargs["pause_clock"] = parent_pause_clock
+
+                            # Multi-hop pause propagation: when our awaited
+                            # child enters WAITING, push OUR OWN execution
+                            # status to WAITING so anyone awaiting us sees
+                            # WAITING too (and transitively up the chain).
+                            # Fire-and-forget; the wait loop swallows
+                            # exceptions so a transient control-plane blip
+                            # can't break the call graph. See run
+                            # run_1778429268006_76e417b7 — implement_from_issue
+                            # timed out at 7200s wallclock because two-or-more
+                            # hops up from a paused descendant, no clock pause
+                            # ever fired without this.
+                            _self_exec_id = parent_execution_id
+                            _client = self.client
+                            if _self_exec_id and _client is not None:
+                                _waiting_reason = f"awaiting child {execution_id}"
+
+                                async def _push_self_waiting() -> None:
+                                    try:
+                                        await _client.notify_awaiter_status(
+                                            execution_id=_self_exec_id,
+                                            status="waiting",
+                                            reason=_waiting_reason,
+                                        )
+                                    except Exception as exc:
+                                        if self.dev_mode:
+                                            log_debug(
+                                                f"notify_awaiter_status(waiting) "
+                                                f"failed (swallowed): {exc}"
+                                            )
+
+                                async def _push_self_running() -> None:
+                                    try:
+                                        await _client.notify_awaiter_status(
+                                            execution_id=_self_exec_id,
+                                            status="running",
+                                            reason=_waiting_reason,
+                                        )
+                                    except Exception as exc:
+                                        if self.dev_mode:
+                                            log_debug(
+                                                f"notify_awaiter_status(running) "
+                                                f"failed (swallowed): {exc}"
+                                            )
+
+                                _wait_kwargs["on_child_waiting"] = _push_self_waiting
+                                _wait_kwargs["on_child_running"] = _push_self_running
+
                         result = await self.client.wait_for_execution_result(
-                            execution_id=execution_id,
-                            timeout=execution_timeout,
+                            **_wait_kwargs
                         )
 
                         elapsed_time = time.time() - start_time
@@ -3530,6 +4561,38 @@ class Agent(FastAPI):
                         # these are permanent failures that retrying won't fix.
                         _err_status = getattr(async_error, "status", None)
                         if _err_status in (401, 403):
+                            raise async_error
+
+                        # Never fall back when the failure happened AFTER the
+                        # reasoner already ran, OR when the user explicitly
+                        # cancelled. ExecutionFailedError means the call
+                        # reached the reasoner, the work executed, and the
+                        # reasoner returned an error — retrying via sync
+                        # would burn the same budget for the same outcome.
+                        # ExecutionTimeoutError means the work has already
+                        # used (or exceeded) its timeout budget on the agent
+                        # side; firing the same call again wastes another
+                        # full budget. ExecutionCancelledError means the user
+                        # told us to stop — silently re-issuing the call via
+                        # sync fallback would defeat the cancellation.
+                        from agentfield.exceptions import (
+                            ExecutionCancelledError,
+                            ExecutionFailedError,
+                            ExecutionTimeoutError,
+                        )
+                        if isinstance(
+                            async_error,
+                            (
+                                ExecutionFailedError,
+                                ExecutionTimeoutError,
+                                ExecutionCancelledError,
+                            ),
+                        ):
+                            if self.dev_mode:
+                                log_debug(
+                                    f"Skipping sync fallback for {type(async_error).__name__}: "
+                                    f"reasoner already ran or was cancelled by user"
+                                )
                             raise async_error
 
                         if not self.async_config.fallback_to_sync:
@@ -3576,6 +4639,7 @@ class Agent(FastAPI):
                     f"Execute call timed out after {elapsed_time:.2f} seconds (limit {execution_timeout:.0f}s)"
                 )
                 from agentfield.exceptions import ExecutionTimeoutError
+
                 raise ExecutionTimeoutError(
                     f"Cross-agent call to {target} timed out after {int(execution_timeout)} seconds"
                 )
@@ -3641,6 +4705,29 @@ class Agent(FastAPI):
                 if self.dev_mode:
                     log_debug(f"Error cleaning up AsyncExecutionManager: {e}")
 
+        if self._background_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*self._background_tasks, return_exceptions=True),
+                    timeout=5,
+                )
+                if self.dev_mode:
+                    log_debug("Background tasks are cleaned up")
+            except Exception as e:
+                if self.dev_mode:
+                    log_error(f"Error cleaning up background tasks: {e}")
+            finally:
+                self._background_tasks.clear()
+        try:
+            await self._notification_dispatcher.shutdown()
+            if self.dev_mode:
+                log_debug(
+                    "Notification dispatcher queue cleared and dispatcher shutdown"
+                )
+        except Exception as e:
+            if self.dev_mode:
+                log_error(f"Error while shutdown notification dispatcher: {e}")
+
         if getattr(self, "client", None) is not None:
             try:
                 await self.client.aclose()
@@ -3704,31 +4791,26 @@ class Agent(FastAPI):
                     "agent_node_id": self.node_id,
                 }
 
-                # Make async HTTP request to backend - use UI API endpoint to match frontend
                 try:
                     import aiohttp
 
                     timeout = aiohttp.ClientTimeout(total=5.0)  # 5 second timeout
-                    # Use UI API base URL to match where frontend fetches notes from
-                    # Replace the last occurrence of /api/v1 with /api/ui/v1
-                    ui_api_base = self.client.api_base.replace("/api/v1", "/api/ui/v1")
 
                     if self.dev_mode:
                         from agentfield.logger import log_debug
 
                         log_debug(
-                            f"NOTE DEBUG: Original api_base: {self.client.api_base}"
+                            f"NOTE DEBUG: api_base: {self.client.api_base}"
                         )
-                        log_debug(f"NOTE DEBUG: UI api_base: {ui_api_base}")
                         log_debug(
-                            f"NOTE DEBUG: Full URL: {ui_api_base}/executions/note"
+                            f"NOTE DEBUG: Full URL: {self.client.api_base}/executions/note"
                         )
                         log_debug(f"NOTE DEBUG: Payload: {payload}")
                         log_debug(f"NOTE DEBUG: Headers: {headers}")
 
                     async with aiohttp.ClientSession(timeout=timeout) as session:
                         async with session.post(
-                            f"{ui_api_base}/executions/note",
+                            f"{self.client.api_base}/executions/note",
                             json=payload,
                             headers=headers,
                         ) as response:
@@ -3742,7 +4824,7 @@ class Agent(FastAPI):
                                 log_debug(f"NOTE DEBUG: Response text: {response_text}")
                                 if response.status == 200:
                                     log_debug(
-                                        f"✅ Note successfully sent to {ui_api_base}/executions/note"
+                                        f"✅ Note successfully sent to {self.client.api_base}/executions/note"
                                     )
                                 else:
                                     log_debug(
@@ -3753,26 +4835,18 @@ class Agent(FastAPI):
                     import requests
 
                     try:
-                        # Use UI API base URL to match where frontend fetches notes from
-                        ui_api_base = self.client.api_base.replace(
-                            "/api/v1", "/api/ui/v1"
-                        )
-
                         if self.dev_mode:
                             from agentfield.logger import log_debug
 
                             log_debug(
-                                f"NOTE DEBUG (requests): Original api_base: {self.client.api_base}"
+                                f"NOTE DEBUG (requests): api_base: {self.client.api_base}"
                             )
                             log_debug(
-                                f"NOTE DEBUG (requests): UI api_base: {ui_api_base}"
-                            )
-                            log_debug(
-                                f"NOTE DEBUG (requests): Full URL: {ui_api_base}/executions/note"
+                                f"NOTE DEBUG (requests): Full URL: {self.client.api_base}/executions/note"
                             )
 
                         response = requests.post(
-                            f"{ui_api_base}/executions/note",
+                            f"{self.client.api_base}/executions/note",
                             json=payload,
                             headers=headers,
                             timeout=5.0,
@@ -3788,7 +4862,7 @@ class Agent(FastAPI):
                             )
                             if response.status_code == 200:
                                 log_debug(
-                                    f"✅ Note successfully sent to {ui_api_base}/executions/note"
+                                    f"✅ Note successfully sent to {self.client.api_base}/executions/note"
                                 )
                             else:
                                 log_debug(
@@ -3914,6 +4988,12 @@ class Agent(FastAPI):
         effective_timeout = (
             timeout if timeout is not None else expires_in_hours * 3600.0
         )
+        # Tell the reasoner-level watchdog to discount this wait from the
+        # active-time budget. ``end_pause`` runs on every exit path (including
+        # the timeout branch) so the clock never gets stuck open.
+        pause_clock = self._pause_clocks.get(execution_id)
+        if pause_clock is not None:
+            pause_clock.start_pause()
         try:
             result = await asyncio.wait_for(future, timeout=effective_timeout)
         except asyncio.TimeoutError:
@@ -3926,6 +5006,9 @@ class Agent(FastAPI):
             )
             await self._pause_manager.resolve(approval_request_id, expired_result)
             return expired_result
+        finally:
+            if pause_clock is not None:
+                pause_clock.end_pause()
 
         return result
 
@@ -3963,11 +5046,17 @@ class Agent(FastAPI):
         )
 
         effective_timeout = timeout if timeout is not None else 72 * 3600.0
+        pause_clock = self._pause_clocks.get(execution_id or "")
+        if pause_clock is not None:
+            pause_clock.start_pause()
         try:
             result = await asyncio.wait_for(future, timeout=effective_timeout)
             return result
         except asyncio.TimeoutError:
             pass
+        finally:
+            if pause_clock is not None:
+                pause_clock.end_pause()
 
         # Fallback: poll CP once
         try:
@@ -4329,6 +5418,7 @@ class Agent(FastAPI):
 
         if not self.client:
             from agentfield.exceptions import AgentFieldClientError
+
             raise AgentFieldClientError("AgentField client is not configured")
 
         return self.client.discover_capabilities(
