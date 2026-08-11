@@ -384,28 +384,62 @@ func sourceTreeManifestDigest(entries []sourceTreeEntry) string {
 	return "sha256:" + hex.EncodeToString(digest.Sum(nil))
 }
 
+func hasShellLineContinuation(line string) bool {
+	trailingBackslashes := 0
+	for index := len(line) - 1; index >= 0 && line[index] == '\\'; index-- {
+		trailingBackslashes++
+	}
+	return trailingBackslashes%2 == 1
+}
+
 func scanSecurityFile(name string, contents string) ([]securityTriageFinding, error) {
 	findings := []securityTriageFinding{}
 	scanner := bufio.NewScanner(strings.NewReader(contents))
 	scanner.Buffer(make([]byte, 64*1024), 1<<20)
+	var logicalLine strings.Builder
+	logicalStartLine := 0
 	lineNumber := 0
-	for scanner.Scan() {
-		lineNumber++
-		line := scanner.Text()
+
+	scanLogicalLine := func() {
+		line := logicalLine.String()
 		for _, rule := range securityRules {
 			if rule.match(name, line) {
 				findings = append(findings, securityTriageFinding{
 					RuleID:      rule.id,
 					Severity:    rule.severity,
 					Path:        name,
-					Line:        lineNumber,
+					Line:        logicalStartLine,
 					Description: rule.description,
 				})
 			}
 		}
+		logicalLine.Reset()
+		logicalStartLine = 0
+	}
+
+	for scanner.Scan() {
+		lineNumber++
+		line := scanner.Text()
+		if logicalStartLine == 0 {
+			logicalStartLine = lineNumber
+		}
+		continued := hasShellLineContinuation(line)
+		if continued {
+			line = line[:len(line)-1]
+		}
+		if logicalLine.Len()+len(line) > 1<<20 {
+			return nil, errors.New("security triage logical line rejected")
+		}
+		_, _ = logicalLine.WriteString(line)
+		if !continued {
+			scanLogicalLine()
+		}
 	}
 	if err := scanner.Err(); err != nil {
 		return nil, fmt.Errorf("security triage line rejected: %w", err)
+	}
+	if logicalStartLine != 0 {
+		scanLogicalLine()
 	}
 	return findings, nil
 }
