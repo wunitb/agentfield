@@ -135,6 +135,12 @@ func main() {
 		}),
 	)
 
+	hello.RegisterReasoner("security_triage", func(_ context.Context, input map[string]any) (any, error) {
+		return runSecurityTriage(input, securityTriageArchivePath)
+	},
+		agent.WithDescription("Runs bounded deterministic security triage over one digest-bound tracked-source archive"),
+	)
+
 	go func() {
 		t := time.NewTicker(3 * time.Second)
 		defer t.Stop()
