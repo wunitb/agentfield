@@ -115,6 +115,40 @@ func TestHandleInternalCancel_CancelsActiveExecution(t *testing.T) {
 	}
 }
 
+func TestHandleInternalCancel_BindsCancellationToPathIdentity(t *testing.T) {
+	a := newCancelAgent()
+	requestedCtx, releaseRequested := a.registerCancellableExecution(context.Background(), "exec-requested")
+	defer releaseRequested()
+	otherCtx, releaseOther := a.registerCancellableExecution(context.Background(), "exec-other")
+	defer releaseOther()
+
+	req := httptest.NewRequest(
+		http.MethodPost,
+		"/_internal/executions/exec-requested/cancel",
+		strings.NewReader(`{"execution_id":"exec-other"}`),
+	)
+	rr := httptest.NewRecorder()
+	a.handleInternalCancel(rr, req)
+
+	if rr.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rr.Code)
+	}
+	body := decodeJSON(t, rr.Body)
+	if body["execution_id"] != "exec-requested" {
+		t.Fatalf("body execution_id = %v, want exec-requested", body["execution_id"])
+	}
+	select {
+	case <-requestedCtx.Done():
+	case <-time.After(time.Second):
+		t.Fatal("path-bound execution was not cancelled")
+	}
+	select {
+	case <-otherCtx.Done():
+		t.Fatal("request-body execution identity cancelled a different execution")
+	default:
+	}
+}
+
 func TestHandleInternalCancel_UnknownExecutionReturns200WithReason(t *testing.T) {
 	a := newCancelAgent()
 	req := httptest.NewRequest(http.MethodPost, "/_internal/executions/exec-missing/cancel", nil)
