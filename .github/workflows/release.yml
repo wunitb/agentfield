@@ -63,6 +63,7 @@ env:
 jobs:
   prepare:
     runs-on: ubuntu-latest
+    if: github.repository == 'Agent-Field/agentfield'
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag_name: ${{ steps.version.outputs.tag_name }}

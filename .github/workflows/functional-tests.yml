@@ -42,12 +42,11 @@ jobs:
           - postgres
     
     env:
-      # Only provide OpenRouter API key for push events and internal PRs (not from forks)
-      OPENROUTER_API_KEY: ${{ ((github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false)) && secrets.OPENROUTER_API_KEY) || '' }}
+      # Provider-backed tests run only in the canonical upstream repository.
+      OPENROUTER_API_KEY: ${{ (github.repository == 'Agent-Field/agentfield' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == false)) && secrets.OPENROUTER_API_KEY) || '' }}
       OPENROUTER_MODEL: ${{ (github.event_name == 'workflow_dispatch' && github.event.inputs.openrouter_model) || 'openrouter/google/gemini-2.5-flash-lite' }}
-      # For fork PRs, skip OpenRouter-dependent tests via a quoted marker expression.
-      # NOTE: quotes inside a single env var like PYTEST_ARGS do NOT survive shell word-splitting.
-      PYTEST_MARK_EXPR: ${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == true && 'not openrouter') || '' }}
+      # Fork repositories and external PRs must remain credentialless.
+      PYTEST_MARK_EXPR: ${{ ((github.repository != 'Agent-Field/agentfield' || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork == true)) && 'not openrouter') || '' }}
       PYTEST_ARGS: -v
       DOCKER_BUILDKIT: 1
       COMPOSE_DOCKER_CLI_BUILD: 1
@@ -65,7 +64,7 @@ jobs:
         uses: docker/setup-buildx-action@v3
       
       - name: Cache Docker layers
-        uses: actions/cache@v3
+        uses: actions/cache@v4
         with:
           path: /tmp/.buildx-cache
           key: ${{ runner.os }}-buildx-${{ github.sha }}
@@ -76,10 +75,11 @@ jobs:
         run: |
           EVENT_NAME="${{ github.event_name }}"
           IS_FORK="${{ (github.event_name == 'pull_request' && github.event.pull_request.head.repo.fork) || 'false' }}"
+          IS_UPSTREAM="${{ github.repository == 'Agent-Field/agentfield' }}"
 
-          if [ "$IS_FORK" = "true" ]; then
-            echo "ℹ️  External contributor PR detected"
-            echo "✓ Running 24/26 functional tests (skipping 2 OpenRouter-dependent tests)"
+          if [ "$IS_UPSTREAM" != "true" ] || [ "$IS_FORK" = "true" ]; then
+            echo "ℹ️  Credentialless repository or external contributor PR detected"
+            echo "✓ Running functional tests without OpenRouter-dependent cases"
             echo "✓ Tests requiring OpenRouter will be skipped: -m \"not openrouter\""
           elif [ "$EVENT_NAME" = "push" ] || [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             if [ -z "$OPENROUTER_API_KEY" ]; then
