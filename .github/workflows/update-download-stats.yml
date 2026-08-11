@@ -16,6 +16,7 @@ permissions:
 jobs:
   update-stats:
     runs-on: ubuntu-latest
+    if: github.repository == 'Agent-Field/agentfield'
     steps:
       - name: Fetch and Update Stats
         uses: actions/github-script@v7
